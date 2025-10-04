@@ -1,0 +1,57 @@
+cmake_minimum_required(VERSION 3.25)
+project(learnudp LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Windows-specific Asio definitions
+if(WIN32)
+    add_compile_definitions(_WIN32_WINNT=0x0A00)  # Windows 10
+    add_compile_definitions(ASIO_STANDALONE)
+    add_compile_definitions(ASIO_HAS_STD_ADDRESSOF)
+    add_compile_definitions(ASIO_HAS_STD_ARRAY)
+    add_compile_definitions(ASIO_HAS_CSTDINT)
+    add_compile_definitions(ASIO_HAS_STD_SHARED_PTR)
+    add_compile_definitions(ASIO_HAS_STD_TYPE_TRAITS)
+endif()
+
+include(FetchContent)
+
+# Fetch Asio
+FetchContent_Declare(
+  asio
+  GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+  GIT_TAG        asio-1-36-0
+)
+# Fetch PortAudio
+FetchContent_Declare(
+  portaudio
+  GIT_REPOSITORY https://github.com/PortAudio/portaudio.git
+  GIT_TAG        b0cc303e95fdb7c6c953337051378071c9043e88
+)
+# Fetch Opus
+FetchContent_Declare(
+  opus
+  GIT_REPOSITORY https://github.com/xiph/opus.git
+  GIT_TAG        v1.5.2
+)
+
+# Fetch readerwriterqueue
+FetchContent_Declare(
+  concurrentqueue
+  GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+  GIT_TAG        v1.0.4   # or a specific commit/tag
+)
+
+
+FetchContent_MakeAvailable(asio portaudio opus concurrentqueue)
+
+# --- Targets ---
+add_executable(app main.cpp)
+target_include_directories(app PRIVATE
+  ${asio_SOURCE_DIR}/asio/include
+  ${portaudio_SOURCE_DIR}/include
+  ${opus_SOURCE_DIR}/include
+  ${concurrentqueue_SOURCE_DIR}/include
+)
+target_link_libraries(app PRIVATE portaudio opus concurrentqueue)

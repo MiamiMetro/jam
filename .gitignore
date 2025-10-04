@@ -1,0 +1,5 @@
+build
+.vscode
+.vscode-test
+.idea
+node_modules
