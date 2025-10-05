@@ -47,11 +47,20 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(asio portaudio opus concurrentqueue)
 
 # --- Targets ---
-add_executable(app main.cpp)
-target_include_directories(app PRIVATE
+add_executable(server server.cpp)
+target_include_directories(server PRIVATE
   ${asio_SOURCE_DIR}/asio/include
   ${portaudio_SOURCE_DIR}/include
   ${opus_SOURCE_DIR}/include
   ${concurrentqueue_SOURCE_DIR}/include
 )
-target_link_libraries(app PRIVATE portaudio opus concurrentqueue)
+target_link_libraries(server PRIVATE portaudio opus concurrentqueue)
+
+add_executable(client client.cpp)
+target_include_directories(client PRIVATE
+  ${asio_SOURCE_DIR}/asio/include
+  ${portaudio_SOURCE_DIR}/include
+  ${opus_SOURCE_DIR}/include
+  ${concurrentqueue_SOURCE_DIR}/include
+)
+target_link_libraries(client PRIVATE portaudio opus concurrentqueue)
