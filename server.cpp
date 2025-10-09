@@ -1,7 +1,7 @@
 #include <array>
 #include <asio.hpp>
 #include <iostream>
-#include <map>
+#include <unordered_map>
 
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
@@ -13,12 +13,31 @@ class server {
   private:
     udp::socket _socket;
 
+    struct endpoint_hash {
+        size_t operator()(const udp::endpoint &ep) const {
+            // Avoid string allocations - hash IP bytes + port directly
+            size_t h1 = 0;
+            if (ep.address().is_v4()) {
+                h1 = std::hash<uint32_t>{}(ep.address().to_v4().to_uint());
+            } else {
+                auto bytes = ep.address().to_v6().to_bytes();
+                h1 = std::hash<std::string_view>{}(
+                    std::string_view(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
+            }
+            size_t h2 = std::hash<unsigned short>{}(ep.port());
+            return h1 ^ (h2 << 1); // Combine hashes
+        }
+    };
+
     struct client_info {
         std::chrono::steady_clock::time_point last_alive;
     };
 
-    std::map<udp::endpoint, client_info> _clients;
+    std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
     periodic_timer _alive_check_timer;
+
+    std::array<char, 1024> _recv_buf;
+    udp::endpoint _remote_endpoint;
 
   public:
     server(asio::io_context &io, short port)
@@ -33,19 +52,17 @@ class server {
                       ++it;
                   }
               }
-          }) {}
+          }) {
 
-    void do_receive() {
-        auto buf = std::make_shared<std::array<char, 1024>>();
-        auto remote = std::make_shared<udp::endpoint>();
-
-        _socket.async_receive_from(
-            asio::buffer(*buf), *remote,
-            [buf, remote, this](std::error_code ec, std::size_t bytes) { on_receive(ec, bytes, buf, remote); });
+        do_receive();
     }
 
-    void on_receive(std::error_code ec, std::size_t bytes, std::shared_ptr<std::array<char, 1024>> buf,
-                    std::shared_ptr<udp::endpoint> remote) {
+    void do_receive() {
+        _socket.async_receive_from(asio::buffer(_recv_buf), _remote_endpoint,
+                                   [this](std::error_code ec, std::size_t bytes) { on_receive(ec, bytes); });
+    }
+
+    void on_receive(std::error_code ec, std::size_t bytes) {
         if (ec) {
             std::cerr << "receive error: " << ec.message() << "\n";
             do_receive(); // keep listening
@@ -57,44 +74,45 @@ class server {
 
         if (bytes >= sizeof(MsgHdr)) {
             MsgHdr hdr{};
-            std::memcpy(&hdr, buf->data(), sizeof(MsgHdr));
+            std::memcpy(&hdr, _recv_buf.data(), sizeof(MsgHdr));
 
             if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
+                if (_clients.find(_remote_endpoint) == _clients.end()) {
+                    do_receive();
+                    return;
+                }
                 SyncHdr shdr{};
-                std::memcpy(&shdr, buf->data(), sizeof(SyncHdr));
+                std::memcpy(&shdr, _recv_buf.data(), sizeof(SyncHdr));
                 auto now = std::chrono::steady_clock::now();
                 auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
                 shdr.t2_server_recv = ns;
                 shdr.t3_server_send = ns;
-                std::memcpy(buf->data(), &shdr, sizeof(SyncHdr));
+                std::memcpy(_recv_buf.data(), &shdr, sizeof(SyncHdr));
 
-                _socket.async_send_to(asio::buffer(*buf, bytes), *remote,
-                                      [buf, remote](std::error_code ec, std::size_t) {
-                                          if (ec)
-                                              std::cerr << "send error: " << ec.message() << "\n";
-                                      });
+                send(_recv_buf.data(), sizeof(SyncHdr), _remote_endpoint);
             }
 
             if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
-                std::cout << "CTRL msg from " << remote->address().to_string() << ":" << remote->port() << "\n";
+                std::cout << "CTRL msg from " << _remote_endpoint.address().to_string() << ":"
+                          << _remote_endpoint.port() << "\n";
 
                 CtrlHdr chdr{};
-                std::memcpy(&chdr, buf->data(), sizeof(CtrlHdr));
+                std::memcpy(&chdr, _recv_buf.data(), sizeof(CtrlHdr));
 
                 auto now = std::chrono::steady_clock::now();
 
                 switch (chdr.type) {
                 case CtrlHdr::Cmd::JOIN:
                     std::cout << "  JOIN\n";
-                    _clients[*remote].last_alive = now;
+                    _clients[_remote_endpoint].last_alive = now;
                     break;
                 case CtrlHdr::Cmd::LEAVE:
                     std::cout << "  LEAVE\n";
-                    _clients.erase(*remote);
+                    _clients.erase(_remote_endpoint);
                     break;
                 case CtrlHdr::Cmd::ALIVE:
                     std::cout << "  ALIVE\n";
-                    _clients[*remote].last_alive = now;
+                    _clients[_remote_endpoint].last_alive = now;
                     break;
                 default:
                     std::cout << "  Unknown CTRL cmd: " << static_cast<int>(chdr.type) << "\n";
@@ -105,6 +123,13 @@ class server {
 
         do_receive(); // start next receive immediately
     }
+
+    void send(void *data, std::size_t len, const udp::endpoint &target) {
+        _socket.async_send_to(asio::buffer(data, len), target, [](std::error_code ec, std::size_t) {
+            if (ec)
+                std::cerr << "send error: " << ec.message() << "\n";
+        });
+    }
 };
 
 int main() {
@@ -113,7 +138,6 @@ int main() {
         server srv(io, 9999);
 
         std::cout << "Echo server listening on 127.0.0.1:9999\n";
-        srv.do_receive();
         io.run();
     } catch (std::exception &e) {
         std::cerr << "ERR: " << e.what() << "\n";
