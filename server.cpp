@@ -65,6 +65,9 @@ class server {
     void on_receive(std::error_code ec, std::size_t bytes) {
         if (ec) {
             std::cerr << "receive error: " << ec.message() << "\n";
+            _clients.erase(_remote_endpoint);
+            std::cout << "Client " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port()
+                      << " removed due to receive error\n";
             do_receive(); // keep listening
             return;
         }
@@ -92,7 +95,7 @@ class server {
                 send(_recv_buf.data(), sizeof(SyncHdr), _remote_endpoint);
             }
 
-            if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
+            else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
                 std::cout << "CTRL msg from " << _remote_endpoint.address().to_string() << ":"
                           << _remote_endpoint.port() << "\n";
 
@@ -118,6 +121,24 @@ class server {
                     std::cout << "  Unknown CTRL cmd: " << static_cast<int>(chdr.type) << "\n";
                     break;
                 }
+            } else if (hdr.magic == ECHO_MAGIC && bytes >= sizeof(EchoHdr)) {
+                if (_clients.find(_remote_endpoint) == _clients.end()) {
+                    do_receive();
+                    return;
+                }
+                // Echo back the received message
+                send(_recv_buf.data(), bytes, _remote_endpoint);
+            } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(AudioHdr)) {
+                if (_clients.find(_remote_endpoint) == _clients.end()) {
+                    do_receive();
+                    return;
+                }
+                AudioHdr ahdr{};
+                std::memcpy(&ahdr, _recv_buf.data(), sizeof(AudioHdr));
+                std::cout << "Received AUDIO packet with " << static_cast<int>(ahdr.encoded_bytes)
+                          << " encoded bytes from " << _remote_endpoint.address().to_string() << ":"
+                          << _remote_endpoint.port() << "\n";
+                // Here you could process the audio data in ahdr.buf of size ahdr.encoded_bytes
             }
         }
 
