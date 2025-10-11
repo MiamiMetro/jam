@@ -1,6 +1,8 @@
 #include <array>
 #include <asio.hpp>
+#include <concurrentqueue.h>
 #include <iostream>
+#include <opus.h>
 #include <unordered_map>
 
 #include "periodic_timer.hpp"
@@ -8,6 +10,97 @@
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
+
+// class for both opus encode and decode
+class audio_codec {
+  private:
+    OpusEncoder *_encoder = nullptr;
+    OpusDecoder *_decoder = nullptr;
+    int _application;
+    int _bitrate;
+    int _complexity;
+    int _frame_size; // in samples
+    int _max_data_bytes;
+
+  public:
+    audio_codec(int sample_rate = 48000, int channels = 2, int application = OPUS_APPLICATION_AUDIO,
+                int bitrate = 96000, int complexity = 5, int frame_size = 120, int max_data_bytes = 128)
+        : _application(application), _bitrate(bitrate), _complexity(complexity), _frame_size(frame_size),
+          _max_data_bytes(max_data_bytes) {
+        int err;
+        _encoder = opus_encoder_create(sample_rate, channels, application, &err);
+        if (err != OPUS_OK) {
+            std::cerr << "Failed to create Opus encoder: " << opus_strerror(err) << "\n";
+            _encoder = nullptr;
+        } else {
+            // Set encoder options for low-latency music streaming
+            opus_encoder_ctl(_encoder, OPUS_SET_COMPLEXITY(complexity));
+            opus_encoder_ctl(_encoder, OPUS_SET_BITRATE(bitrate));
+            opus_encoder_ctl(_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
+            opus_encoder_ctl(_encoder, OPUS_SET_VBR(1));              // Variable bitrate for better quality
+            opus_encoder_ctl(_encoder, OPUS_SET_VBR_CONSTRAINT(0));   // Unconstrained VBR for music
+            opus_encoder_ctl(_encoder, OPUS_SET_INBAND_FEC(1));       // Forward error correction for UDP
+            opus_encoder_ctl(_encoder, OPUS_SET_PACKET_LOSS_PERC(5)); // Expect some packet loss
+            opus_encoder_ctl(_encoder, OPUS_SET_DTX(0));              // Disable DTX for music (no silence detection)
+        }
+
+        _decoder = opus_decoder_create(sample_rate, channels, &err);
+        if (err != OPUS_OK) {
+            std::cerr << "Failed to create Opus decoder: " << opus_strerror(err) << "\n";
+            opus_encoder_destroy(_encoder);
+            _encoder = nullptr;
+            _decoder = nullptr;
+        }
+    }
+
+    ~audio_codec() {
+        if (_encoder)
+            opus_encoder_destroy(_encoder);
+        if (_decoder)
+            opus_decoder_destroy(_decoder);
+    }
+
+    // Encode raw PCM samples to Opus
+    // in: pointer to input PCM samples (int16_t)
+    // frame_count: number of samples per channel
+    // sample_rate: sample rate of input PCM (e.g., 48000)
+    // out: vector to store encoded Opus data
+    // Returns: number of bytes written to out, or -1 on error
+    int encode_opus(const int16_t *in, int frame_count, int sample_rate, std::vector<uint8_t> &out) {
+        if (!_encoder)
+            return -1;
+
+        out.resize(_max_data_bytes);
+        int bytes_encoded = opus_encode(_encoder, in, frame_count, out.data(), static_cast<opus_int32>(out.size()));
+        if (bytes_encoded < 0) {
+            std::cerr << "Opus encoding failed: " << opus_strerror(bytes_encoded) << "\n";
+            out.clear();
+            return -1;
+        }
+        out.resize(bytes_encoded);
+        return bytes_encoded;
+    }
+    // Decode Opus data to raw PCM samples
+    // in: pointer to input Opus data
+    // in_bytes: size of input Opus data in bytes
+    // out: vector to store decoded PCM samples (int16_t)
+    // Returns: number of samples decoded per channel, or -1 on error
+    int decode_opus(const uint8_t *in, int in_bytes, std::vector<int16_t> &out) {
+        if (!_decoder)
+            return -1;
+
+        out.resize(_frame_size * 2); // Allocate enough space for stereo
+        int samples_decoded =
+            opus_decode(_decoder, in, in_bytes, out.data(), static_cast<opus_int32>(out.size() / sizeof(int16_t)), 0);
+        if (samples_decoded < 0) {
+            std::cerr << "Opus decoding failed: " << opus_strerror(samples_decoded) << "\n";
+            out.clear();
+            return -1;
+        }
+        out.resize(samples_decoded); // Resize to actual number of samples decoded
+        return samples_decoded;
+    }
+};
 
 class server {
   private:
@@ -38,6 +131,8 @@ class server {
 
     std::array<char, 1024> _recv_buf;
     udp::endpoint _remote_endpoint;
+
+    audio_codec _audio_codec;
 
   public:
     server(asio::io_context &io, short port)
@@ -72,7 +167,8 @@ class server {
             return;
         }
 
-        // std::cout << "Got " << bytes << " bytes from " << remote->address().to_string() << ":" << remote->port()
+        // std::cout << "Got " << bytes << " bytes from " << remote->address().to_string() << ":" <<
+        // remote->port()
         //           << " -> " << std::string(buf->data(), bytes) << "\n";
 
         if (bytes >= sizeof(MsgHdr)) {
@@ -93,9 +189,7 @@ class server {
                 std::memcpy(_recv_buf.data(), &shdr, sizeof(SyncHdr));
 
                 send(_recv_buf.data(), sizeof(SyncHdr), _remote_endpoint);
-            }
-
-            else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
+            } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
                 std::cout << "CTRL msg from " << _remote_endpoint.address().to_string() << ":"
                           << _remote_endpoint.port() << "\n";
 
@@ -128,17 +222,28 @@ class server {
                 }
                 // Echo back the received message
                 send(_recv_buf.data(), bytes, _remote_endpoint);
-            } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(AudioHdr)) {
+            } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint8_t)) {
                 if (_clients.find(_remote_endpoint) == _clients.end()) {
                     do_receive();
                     return;
                 }
-                AudioHdr ahdr{};
-                std::memcpy(&ahdr, _recv_buf.data(), sizeof(AudioHdr));
-                std::cout << "Received AUDIO packet with " << static_cast<int>(ahdr.encoded_bytes)
-                          << " encoded bytes from " << _remote_endpoint.address().to_string() << ":"
-                          << _remote_endpoint.port() << "\n";
-                // Here you could process the audio data in ahdr.buf of size ahdr.encoded_bytes
+                // Read only the header fields we need
+                uint8_t encoded_bytes;
+                std::memcpy(&encoded_bytes, _recv_buf.data() + sizeof(MsgHdr), sizeof(uint8_t));
+
+                // Verify we received all the data
+                size_t expected_size = sizeof(MsgHdr) + sizeof(uint8_t) + encoded_bytes;
+                if (bytes < expected_size) {
+                    std::cerr << "Incomplete audio packet: got " << bytes << ", expected " << expected_size << "\n";
+                    do_receive();
+                    return;
+                }
+
+                // Extract audio data (starts after magic + encoded_bytes field)
+                const unsigned char *audio_data =
+                    reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint8_t));
+
+                send(_recv_buf.data(), bytes, _remote_endpoint);
             }
         }
 

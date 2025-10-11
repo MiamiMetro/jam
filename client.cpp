@@ -1,6 +1,7 @@
 #include <array>
 #include <asio.hpp>
 #include <chrono>
+#include <concurrentqueue.h>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -111,13 +112,13 @@ class audio_stream {
         init_opus(static_cast<int>(inputInfo->defaultSampleRate), _channel_count);
     }
 
-    void encode_opus(const float *input, int frameSize, int sampleRate, std::vector<unsigned char> &output) {
+    void encode_opus(const float *input, int frameSize, std::vector<unsigned char> &output) {
         if (!opus_encoder) {
             std::cerr << "Opus encoder not initialized.\n";
             output.clear();
             return;
         }
-        output.resize(256); // Allocate enough space for encoded data
+        output.resize(128); // Allocate enough space for encoded data
         int encodedBytes = opus_encode_float(opus_encoder, input, frameSize, output.data(), output.size());
         if (encodedBytes < 0) {
             std::cerr << "Opus encoding failed: " << opus_strerror(encodedBytes) << "\n";
@@ -261,6 +262,28 @@ class client {
                 EchoHdr ehdr{};
                 std::memcpy(&ehdr, _recv_buf.data(), sizeof(EchoHdr));
                 std::cout << "Echo from server: " << std::string(ehdr.data) << "\n";
+            } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint8_t)) {
+                uint8_t encoded_bytes;
+                std::memcpy(&encoded_bytes, _recv_buf.data() + sizeof(MsgHdr), sizeof(uint8_t));
+                size_t expected_size = sizeof(MsgHdr) + sizeof(uint8_t) + encoded_bytes;
+                if (bytes < expected_size) {
+                    std::cerr << "Incomplete audio packet: got " << bytes << ", expected " << expected_size << "\n";
+                    do_receive();
+                    return;
+                }
+                const unsigned char *audio_data =
+                    reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint8_t));
+
+                std::vector<float> decodedData;
+                if (encoded_bytes > 0) {
+                    // Decode the received Opus data
+                    _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_channel_count(), decodedData);
+                }
+                if (!decodedData.empty()) {
+                    // Play the decoded PCM data
+                    _audio_recv_queue.enqueue(std::move(decodedData));
+                }
+
             } else {
                 std::cout << "Unknown message: " << std::string(_recv_buf.data(), bytes) << "\n";
             }
@@ -286,13 +309,10 @@ class client {
 
         const float *in = static_cast<const float *>(input);
         float *out = static_cast<float *>(output);
-
-        client *cl = static_cast<client *>(userData);
-        if (!cl)
-            return paContinue;
-
         if (!out)
             return paContinue;
+
+        client *cl = static_cast<client *>(userData);
 
         if (cl->_audio.get_input_channel_count() < 2) {
             // duplicate mono to stereo
@@ -308,37 +328,22 @@ class client {
 
         size_t bytesToCopy = frameCount * cl->_audio.get_channel_count() * sizeof(float);
 
-
-        std::vector<unsigned char> encodedData;
-        cl->_audio.encode_opus(in, frameCount, 48000, encodedData);
-
         std::vector<float> decodedData;
-        if (!encodedData.empty()) {
-            cl->_audio.decode_opus(encodedData.data(), encodedData.size(), frameCount, cl->_audio.get_channel_count(),
-                                   decodedData);
-        }
-
-        if (!decodedData.empty()) {
+        if (cl->_audio_recv_queue.try_dequeue(decodedData)) {
             std::memcpy(out, decodedData.data(), bytesToCopy);
         } else {
             std::memset(out, 0, bytesToCopy);
         }
 
+        std::vector<unsigned char> encodedData;
+        cl->_audio.encode_opus(in, frameCount, encodedData);
         AudioHdr ahdr{};
         ahdr.magic = AUDIO_MAGIC;
         ahdr.encoded_bytes = static_cast<uint8_t>(encodedData.size());
         std::memcpy(ahdr.buf, encodedData.data(), std::min(encodedData.size(), sizeof(ahdr.buf)));
-        // cl->send(&ahdr, sizeof(MsgHdr) + 1 + ahdr.encoded_bytes);
-        cl->send(&ahdr, sizeof(AudioHdr));
-
-        // if (!in)
-        //     std::memset(out, 0, bytesToCopy);
-        // else
-        //     std::memcpy(out, in, bytesToCopy);
-
-        // static size_t totalKB = 0;
-        // totalKB += bytesToCopy / 1024;
-        // std::cout << bytesToCopy << " bytes (" << totalKB << " KB)\r" << std::flush;
+        // Send only: magic (4) + encoded_bytes (1) + actual encoded data
+        size_t packetSize = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
+        cl->send(&ahdr, packetSize);
 
         return paContinue;
     }
@@ -352,6 +357,7 @@ class client {
     std::array<unsigned char, 128> _ctrl_tx_buf;
 
     audio_stream _audio;
+    moodycamel::ConcurrentQueue<std::vector<float>> _audio_recv_queue;
 
     periodic_timer _ping_timer;
     void _ping_timer_callback() {
