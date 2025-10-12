@@ -145,12 +145,18 @@ class audio_stream {
 class client {
 
   public:
-    client(asio::io_context &io, const std::string &server_ip, short server_port)
+    client(asio::io_context &io, const std::string &server_address, short server_port)
         : _socket(io, udp::endpoint(udp::v4(), 0)), _ping_timer(io, 100ms, [this]() { _ping_timer_callback(); }),
           _alive_timer(io, 5s, [this]() { _alive_timer_callback(); }) {
 
         std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
-        _server_endpoint = udp::endpoint(asio::ip::make_address(server_ip), server_port);
+        
+        // Resolve hostname or IP address
+        udp::resolver resolver(io);
+        udp::resolver::results_type endpoints = resolver.resolve(udp::v4(), server_address, std::to_string(server_port));
+        _server_endpoint = *endpoints.begin();
+        
+        std::cout << "Connecting to: " << _server_endpoint.address().to_string() << ":" << _server_endpoint.port() << "\n";
 
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
@@ -187,8 +193,8 @@ class client {
                 double offset_ms = offset / 1e6;
 
                 // print live stats
-                // std::cout << "seq " << hdr.seq << " RTT " << rtt_ms << " ms"
-                //           << " | offset " << offset_ms << " ms" << std::string(20, ' ') << "\r" << std::flush;
+                std::cout << "seq " << hdr.seq << " RTT " << rtt_ms << " ms"
+                          << " | offset " << offset_ms << " ms" << std::string(20, ' ') << "\r" << std::flush;
             } else if (hdr.magic == ECHO_MAGIC && bytes >= sizeof(EchoHdr)) {
                 EchoHdr ehdr{};
                 std::memcpy(&ehdr, _recv_buf.data(), sizeof(EchoHdr));
