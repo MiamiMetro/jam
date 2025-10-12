@@ -32,11 +32,7 @@ jobs:
       - name: Sync source files to VPS
         uses: burnett01/rsync-deployments@5.2
         with:
-          switches: -avz --delete \
-            --exclude 'build/' \
-            --exclude '.git/' \
-            --exclude '.github/' \
-            --exclude '.gitignore'
+          switches: -avz --delete --exclude 'build/' --exclude '.git/' --exclude '.github/' --exclude '.gitignore'
           path: ./
           remote_path: /root/jam
           remote_host: ${{ secrets.VPS_HOST }}
