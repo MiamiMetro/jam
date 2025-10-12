@@ -233,34 +233,45 @@ class client {
         });
     }
 
-    static int audio_callback(const void *input, void *output, unsigned long frameCount,
-                              const PaStreamCallbackTimeInfo *, PaStreamCallbackFlags, void *userData) {
+    static int audio_callback(const void *input, void *output, unsigned long frame_count,
+                              const PaStreamCallbackTimeInfo *, PaStreamCallbackFlags, void *user_data) {
 
         const float *in = static_cast<const float *>(input);
         float *out = static_cast<float *>(output);
         if (!out)
             return paContinue;
 
-        client *cl = static_cast<client *>(userData);
+        client *cl = static_cast<client *>(user_data);
 
-        size_t bytesToCopy = frameCount * cl->_audio.get_output_channel_count() * sizeof(float);
+        size_t bytes_to_copy = frame_count * cl->_audio.get_output_channel_count() * sizeof(float);
 
-        std::vector<float> decodedData;
-        if (cl->_audio_recv_queue.try_dequeue(decodedData)) {
-            std::memcpy(out, decodedData.data(), bytesToCopy);
+        // play the received audio
+        std::vector<float> decoded_data;
+        if (cl->_audio_recv_queue.try_dequeue(decoded_data)) {
+            std::memcpy(out, decoded_data.data(), bytes_to_copy);
         } else {
-            std::memset(out, 0, bytesToCopy);
+            std::memset(out, 0, bytes_to_copy);
         }
 
-        std::vector<unsigned char> encodedData;
-        cl->_audio.encode_opus(in, frameCount, encodedData);
+        // 2. Mix in your own live instrument (local monitor)
+        size_t out_channels = cl->_audio.get_output_channel_count(); // 2
+        float self_gain = 1.0f;                                      // Adjust to taste (0.0–1.0)
+        if (in) {
+            for (size_t i = 0; i < frame_count; ++i) {
+                float sample = in[i] * self_gain;
+                out[i * out_channels + 0] += sample; // Left
+                out[i * out_channels + 1] += sample; // Right
+            }
+        }
+
+        std::vector<unsigned char> encoded_data;
+        cl->_audio.encode_opus(in, frame_count, encoded_data);
         AudioHdr ahdr{};
         ahdr.magic = AUDIO_MAGIC;
-        ahdr.encoded_bytes = static_cast<uint8_t>(encodedData.size());
-        std::memcpy(ahdr.buf, encodedData.data(), std::min(encodedData.size(), sizeof(ahdr.buf)));
+        ahdr.encoded_bytes = static_cast<uint8_t>(encoded_data.size());
+        std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
         // Send only: magic (4) + encoded_bytes (1) + actual encoded data
         size_t packetSize = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
-        std::cout << "Encoded " << encodedData.size() << " bytes, sending packet of size " << packetSize << "\n";
         cl->send(&ahdr, packetSize);
 
         return paContinue;

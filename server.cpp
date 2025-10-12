@@ -20,7 +20,8 @@ class server {
   public:
     server(asio::io_context &io, short port)
         : _socket(io, udp::endpoint(udp::v4(), port)),
-          _alive_check_timer(io, 5s, [this]() { _alive_check_timer_callback(); }) {
+          _alive_check_timer(io, 5s, [this]() { _alive_check_timer_callback(); }),
+          _broadcast_timer(io, 2500us, [this]() { _broadcast_timer_callback(); }) {
 
         do_receive();
         // Decoder receives mono from clients (1 ch), Encoder sends stereo to clients (2 ch)
@@ -145,7 +146,7 @@ class server {
                 std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
                 // Send only: magic (4) + encoded_bytes (1) + actual encoded data
                 size_t packet_size = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
-                send(&ahdr, packet_size, _remote_endpoint);
+                // send(&ahdr, packet_size, _remote_endpoint);
             }
         }
 
@@ -184,7 +185,10 @@ class server {
     };
 
     std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
+
     periodic_timer _alive_check_timer;
+    periodic_timer _broadcast_timer;
+
     void _alive_check_timer_callback() {
         auto now = std::chrono::steady_clock::now();
         for (auto it = _clients.begin(); it != _clients.end();) {
@@ -194,6 +198,26 @@ class server {
             } else {
                 ++it;
             }
+        }
+    }
+
+    void _broadcast_timer_callback() {
+        static int count = 0;
+        static auto start_time = std::chrono::steady_clock::now();
+        
+        count++;
+        
+        // Print every 1000 ticks (every 2.5 seconds)
+        if (count % 1000 == 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+            double expected_ms = count * 2.5;
+            double drift_ms = elapsed_ms - expected_ms;
+            
+            std::cout << "Ticks: " << count 
+                      << " | Elapsed: " << elapsed_ms << "ms"
+                      << " | Expected: " << expected_ms << "ms"
+                      << " | Drift: " << drift_ms << "ms (" << (drift_ms / expected_ms * 100.0) << "%)\n";
         }
     }
 
@@ -209,23 +233,10 @@ int main() {
         asio::io_context io;
         server srv(io, 9999);
         std::cout << "Echo server listening on 127.0.0.1:9999\n";
+        std::cout << "Broadcast timer running at 2.5ms intervals (48kHz, 120 frames)\n";
 
-        std::thread net_thread([&] { io.run(); });
-
-        const int sample_rate = 48000;
-        const int frames_per_packet = 120;
-        const auto packet_period =
-            std::chrono::microseconds(static_cast<int64_t>(1'000'000.0 * frames_per_packet / sample_rate));
-
-        auto next = std::chrono::steady_clock::now();
-        while (true) {
-            // srv.mix_and_broadcast_audio();
-            next += packet_period;
-            std::this_thread::sleep_until(next);
-        }
-
-        io.stop();
-        net_thread.join();
+        // Just run the io_context - timers handle everything!
+        io.run();
     } catch (std::exception &e) {
         std::cerr << "ERR: " << e.what() << "\n";
     }
