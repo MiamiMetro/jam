@@ -106,8 +106,11 @@ class audio_stream {
                   << inputInfo->defaultSampleRate << " Hz\n";
 
         // Decoder receives stereo from server, Encoder sends mono to server
+        // Use 256 kbps for near-transparent music quality (mono: ~80 bytes per 2.5ms packet)
+        // Complexity 5 balances quality vs performance
+        std::cout << "Creating codec with 256kbps bitrate, complexity 5\n";
         _audio_codec.create_codec(static_cast<int>(inputInfo->defaultSampleRate), _output_channel_count,
-                                  _input_channel_count);
+                                  _input_channel_count, OPUS_APPLICATION_AUDIO, 256000, 5);
     }
 
     void stop_audio_stream() {
@@ -243,10 +246,14 @@ class client {
 
         client *cl = static_cast<client *>(user_data);
 
-        size_t bytes_to_copy = frame_count * cl->_audio.get_output_channel_count() * sizeof(float);
+        // Use static buffers to avoid allocations (reused across calls)
+        static std::vector<float> decoded_data;
+        static std::vector<unsigned char> encoded_data;
 
-        // play the received audio
-        std::vector<float> decoded_data;
+        size_t out_channels = cl->_audio.get_output_channel_count(); // 2
+        size_t bytes_to_copy = frame_count * out_channels * sizeof(float);
+
+        // 1. Play received audio from server
         if (cl->_audio_recv_queue.try_dequeue(decoded_data)) {
             std::memcpy(out, decoded_data.data(), bytes_to_copy);
         } else {
@@ -254,8 +261,7 @@ class client {
         }
 
         // 2. Mix in your own live instrument (local monitor)
-        size_t out_channels = cl->_audio.get_output_channel_count(); // 2
-        float self_gain = 1.0f;                                      // Adjust to taste (0.0–1.0)
+        float self_gain = 1.0f; // Adjust to taste (0.0–1.0)
         if (in) {
             for (size_t i = 0; i < frame_count; ++i) {
                 float sample = in[i] * self_gain;
@@ -264,13 +270,12 @@ class client {
             }
         }
 
-        std::vector<unsigned char> encoded_data;
+        // 3. Encode and send to server
         cl->_audio.encode_opus(in, frame_count, encoded_data);
         AudioHdr ahdr{};
         ahdr.magic = AUDIO_MAGIC;
         ahdr.encoded_bytes = static_cast<uint8_t>(encoded_data.size());
         std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
-        // Send only: magic (4) + encoded_bytes (1) + actual encoded data
         size_t packetSize = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
         cl->send(&ahdr, packetSize);
 

@@ -25,8 +25,9 @@ class server {
 
         do_receive();
         // Decoder receives mono from clients (1 ch), Encoder sends stereo to clients (2 ch)
-        std::cout << "Creating server codec: decoder=1ch (mono), encoder=2ch (stereo)\n";
-        _audio_codec.create_codec(48000, 1, 2);
+        // Complexity 5 balances quality vs performance (saves ~40% CPU vs complexity 8)
+        std::cout << "Creating server codec: decoder=1ch (mono), encoder=2ch (stereo), complexity=5\n";
+        _audio_codec.create_codec(48000, 1, 2, OPUS_APPLICATION_AUDIO, 256000, 5);
     }
 
     ~server() { _socket.close(); }
@@ -122,31 +123,9 @@ class server {
                 const unsigned char *audio_data =
                     reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint8_t));
 
-                // Decode mono audio from client (1 channel, 120 samples)
-                std::vector<float> decoded_data(120);
-                _audio_codec.decode_opus(audio_data, encoded_bytes, 120, 1, decoded_data);
-                // upmix to stereo (2 channels)
-                std::vector<float> stereo_data(120 * 2);
-                for (size_t i = 0; i < 120; ++i) {
-                    stereo_data[i * 2] = decoded_data[i];
-                    stereo_data[i * 2 + 1] = decoded_data[i];
-                }
-                // encode to opus stereo
-                std::vector<unsigned char> encoded_data;
-                _audio_codec.encode_opus(stereo_data.data(), 120, encoded_data);
-                if (encoded_data.empty()) {
-                    std::cerr << "Encoding failed, skipping packet\n";
-                    do_receive();
-                    return;
-                }
+                std::vector<unsigned char> audio_data_vec(audio_data, audio_data + encoded_bytes);
 
-                AudioHdr ahdr{};
-                ahdr.magic = AUDIO_MAGIC;
-                ahdr.encoded_bytes = static_cast<uint8_t>(encoded_data.size());
-                std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
-                // Send only: magic (4) + encoded_bytes (1) + actual encoded data
-                size_t packet_size = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
-                // send(&ahdr, packet_size, _remote_endpoint);
+                _clients[_remote_endpoint]._audio_queue.enqueue(std::move(audio_data_vec));
             }
         }
 
@@ -181,7 +160,7 @@ class server {
 
     struct client_info {
         std::chrono::steady_clock::time_point last_alive;
-        moodycamel::ConcurrentQueue<std::vector<float>> _audio_queue;
+        moodycamel::ConcurrentQueue<std::vector<unsigned char>> _audio_queue;
     };
 
     std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
@@ -202,22 +181,132 @@ class server {
     }
 
     void _broadcast_timer_callback() {
-        static int count = 0;
-        static auto start_time = std::chrono::steady_clock::now();
+        auto t_start = std::chrono::high_resolution_clock::now();
         
-        count++;
+        if (_clients.empty()) return; // No clients to process
         
-        // Print every 1000 ticks (every 2.5 seconds)
-        if (count % 1000 == 0) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-            double expected_ms = count * 2.5;
-            double drift_ms = elapsed_ms - expected_ms;
+        // Reusable buffers - allocated ONCE, reused forever
+        static std::vector<unsigned char> compressed_audio;
+        static std::vector<float> mono_decoded(120);
+        static std::vector<float> global_mix(240, 0.0f); // Global mix of ALL clients
+        static std::vector<float> custom_mix(240, 0.0f); // Custom mix per client
+        static std::vector<unsigned char> encoded_output;
+        
+        // Temporary storage: decode all clients first
+        std::unordered_map<udp::endpoint, std::vector<float>, endpoint_hash> decoded_audio;
+        
+        // Step 1: Decode all clients' audio
+        for (auto& [ep, info] : _clients) {
+            if (info._audio_queue.try_dequeue(compressed_audio)) {
+                // Decode mono audio from this client
+                _audio_codec.decode_opus(compressed_audio.data(), compressed_audio.size(), 
+                                        120, 1, mono_decoded);
+                
+                // Store decoded audio (copy to map)
+                decoded_audio[ep] = mono_decoded;
+            }
+        }
+        
+        if (decoded_audio.empty()) return; // No audio to process
+        
+        // Step 2: Create global mix (sum of ALL clients)
+        std::fill(global_mix.begin(), global_mix.end(), 0.0f);
+        for (auto& [source_ep, source_audio] : decoded_audio) {
+            // Mix into stereo (upmix mono to L+R)
+            for (size_t i = 0; i < 120; ++i) {
+                global_mix[i * 2 + 0] += source_audio[i];  // Left
+                global_mix[i * 2 + 1] += source_audio[i];  // Right
+            }
+        }
+        
+        // Step 3: For each client, create custom mix by subtracting their own audio
+        for (auto& [target_ep, target_info] : _clients) {
+            // Check if this client has audio in the current mix
+            auto it = decoded_audio.find(target_ep);
+            if (it == decoded_audio.end()) {
+                // Client didn't send audio this tick, but might still want to hear others
+                // Just send the global mix as-is
+                std::copy(global_mix.begin(), global_mix.end(), custom_mix.begin());
+            } else {
+                // Copy global mix and subtract this client's contribution
+                for (size_t i = 0; i < 120; ++i) {
+                    custom_mix[i * 2 + 0] = global_mix[i * 2 + 0] - it->second[i];  // Left
+                    custom_mix[i * 2 + 1] = global_mix[i * 2 + 1] - it->second[i];  // Right
+                }
+            }
             
-            std::cout << "Ticks: " << count 
-                      << " | Elapsed: " << elapsed_ms << "ms"
-                      << " | Expected: " << expected_ms << "ms"
-                      << " | Drift: " << drift_ms << "ms (" << (drift_ms / expected_ms * 100.0) << "%)\n";
+            // Normalize to prevent clipping
+            // We need to account for how many sources were in the GLOBAL mix,
+            // not how many are in the custom mix after subtraction
+            int total_sources = static_cast<int>(decoded_audio.size());
+            int sources_in_custom_mix = total_sources;
+            if (it != decoded_audio.end()) {
+                sources_in_custom_mix--; // Exclude self
+            }
+            
+            if (sources_in_custom_mix == 0) continue; // No other audio to send
+            
+            // Always normalize by the number of sources that were summed in global_mix
+            // Exception: if we only have 1 source in custom mix, normalize by total_sources
+            // to compensate for the global mix summation
+            if (total_sources > 1) {
+                float scale = 1.0f / total_sources;
+                for (auto& sample : custom_mix) {
+                    sample *= scale;
+                }
+            }
+            
+            // Debug: Check for clipping (optional - comment out for production)
+            // static int clip_check_count = 0;
+            // if (++clip_check_count % 400 == 0) { // Check once per second
+            //     for (auto& sample : custom_mix) {
+            //         if (std::abs(sample) > 1.0f) {
+            //             std::cout << "⚠️ CLIPPING detected: " << sample << "\n";
+            //             break;
+            //         }
+            //     }
+            // }
+            
+            // Encode the custom mix
+            _audio_codec.encode_opus(custom_mix.data(), 120, encoded_output);
+            
+            if (encoded_output.empty()) continue;
+            
+            // Send to this specific client
+            AudioHdr ahdr{};
+            ahdr.magic = AUDIO_MAGIC;
+            ahdr.encoded_bytes = static_cast<uint8_t>(encoded_output.size());
+            std::memcpy(ahdr.buf, encoded_output.data(), 
+                       std::min(encoded_output.size(), sizeof(ahdr.buf)));
+            size_t packet_size = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
+            
+            send(&ahdr, packet_size, target_ep);
+        }
+        
+        // Performance monitoring (optional - can comment out for production)
+        auto t_end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+        
+        static int tick_count = 0;
+        static long long total_time = 0;
+        static long long max_time = 0;
+        
+        total_time += duration;
+        max_time = std::max(max_time, duration);
+        tick_count++;
+        
+        // Report every 400 ticks (1 second at 2.5ms rate)
+        if (tick_count >= 400) {
+            long long avg_time = total_time / tick_count;
+            std::cout << "Broadcast stats [" << decoded_audio.size() << " active / " 
+                      << _clients.size() << " total clients]: "
+                      << "avg=" << avg_time << "μs, max=" << max_time << "μs, "
+                      << "budget=" << (avg_time * 100 / 2500) << "%\n";
+            
+            // Reset for next interval
+            tick_count = 0;
+            total_time = 0;
+            max_time = 0;
         }
     }
 

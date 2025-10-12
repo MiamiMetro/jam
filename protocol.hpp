@@ -35,7 +35,7 @@ struct EchoHdr : MsgHdr {
 
 struct AudioHdr : MsgHdr {
     uint8_t encoded_bytes; // size of the encoded Opus data
-    char buf[128];
+    char buf[512];  // Increased for music (was 128)
 };
 
 #pragma pack(pop)

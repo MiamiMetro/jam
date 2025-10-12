@@ -24,7 +24,7 @@ class audio_codec {
     }
 
     void create_codec(int sample_rate, int decoder_channels, int encoder_channels,
-                      int application = OPUS_APPLICATION_AUDIO, int bitrate = 96000, int complexity = 5) {
+                      int application = OPUS_APPLICATION_AUDIO, int bitrate = 256000, int complexity = 8) {
         if (_encoder) {
             opus_encoder_destroy(_encoder);
             _encoder = nullptr;
@@ -61,6 +61,12 @@ class audio_codec {
         opus_encoder_ctl(_encoder, OPUS_SET_INBAND_FEC(1));       // Forward error correction for UDP
         opus_encoder_ctl(_encoder, OPUS_SET_PACKET_LOSS_PERC(5)); // Expect some packet loss
         opus_encoder_ctl(_encoder, OPUS_SET_DTX(0));              // Disable DTX for music (no silence detection)
+
+        // Verify settings were applied
+        int32_t actual_bitrate;
+        opus_encoder_ctl(_encoder, OPUS_GET_BITRATE(&actual_bitrate));
+        std::cout << "Opus encoder initialized: target=" << bitrate << " bps, actual=" << actual_bitrate
+                  << " bps, complexity=" << complexity << "\n";
     }
 
     void destroy_codec() {
@@ -80,7 +86,7 @@ class audio_codec {
             output.clear();
             return;
         }
-        output.resize(128); // Allocate enough space for encoded data
+        output.resize(512); // Larger buffer for high-quality music (was 128)
         int encodedBytes = opus_encode_float(_encoder, input, frameSize, output.data(), output.size());
         if (encodedBytes < 0) {
             std::cerr << "Opus encoding failed: " << opus_strerror(encodedBytes) << "\n";
