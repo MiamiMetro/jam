@@ -1,0 +1,78 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform (build, start, stop, restart)"
+        required: true
+        default: "restart"
+        type: choice
+        options:
+          - build
+          - start
+          - stop
+          - restart
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync files to VPS
+        uses: burnett01/rsync-deployments@5.2
+        with:
+          switches: -avz --delete
+          path: ./
+          remote_path: /root/jam
+          remote_host: ${{ secrets.VPS_HOST }}
+          remote_user: ${{ secrets.VPS_USER }}
+          remote_key: ${{ secrets.VPS_KEY }}
+
+      - name: Execute command on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_KEY }}
+          script: |
+            set -e
+            cd /root/jam
+
+            case "${{ github.event.inputs.action || 'restart' }}" in
+              stop)
+                echo "🛑 Stopping jam_server.service..."
+                systemctl stop jam_server.service || true
+                ;;
+              start)
+                echo "🚀 Starting jam_server.service..."
+                systemctl start jam_server.service
+                ;;
+              build)
+                echo "🔧 Building project..."
+                cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                cmake --build build --parallel
+                ;;
+              restart)
+                echo "♻️ Restarting jam_server.service with rebuild..."
+                systemctl stop jam_server.service || true
+                cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                cmake --build build --parallel
+                systemctl start jam_server.service
+                ;;
+              *)
+                echo "❌ Unknown action"
+                exit 1
+                ;;
+            esac
+
+            echo "📜 Last logs:"
+            journalctl -u jam_server.service -n 20 --no-pager
