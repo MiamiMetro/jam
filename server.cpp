@@ -23,6 +23,9 @@ class server {
           _alive_check_timer(io, 5s, [this]() { _alive_check_timer_callback(); }) {
 
         do_receive();
+        // Decoder receives mono from clients (1 ch), Encoder sends stereo to clients (2 ch)
+        std::cout << "Creating server codec: decoder=1ch (mono), encoder=2ch (stereo)\n";
+        _audio_codec.create_codec(48000, 1, 2);
     }
 
     ~server() { _socket.close(); }
@@ -117,6 +120,32 @@ class server {
                 // Extract audio data (starts after magic + encoded_bytes field)
                 const unsigned char *audio_data =
                     reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint8_t));
+
+                // Decode mono audio from client (1 channel, 120 samples)
+                std::vector<float> decoded_data(120);
+                _audio_codec.decode_opus(audio_data, encoded_bytes, 120, 1, decoded_data);
+                // upmix to stereo (2 channels)
+                std::vector<float> stereo_data(120 * 2);
+                for (size_t i = 0; i < 120; ++i) {
+                    stereo_data[i * 2] = decoded_data[i];
+                    stereo_data[i * 2 + 1] = decoded_data[i];
+                }
+                // encode to opus stereo
+                std::vector<unsigned char> encoded_data;
+                _audio_codec.encode_opus(stereo_data.data(), 120, encoded_data);
+                if (encoded_data.empty()) {
+                    std::cerr << "Encoding failed, skipping packet\n";
+                    do_receive();
+                    return;
+                }
+
+                AudioHdr ahdr{};
+                ahdr.magic = AUDIO_MAGIC;
+                ahdr.encoded_bytes = static_cast<uint8_t>(encoded_data.size());
+                std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
+                // Send only: magic (4) + encoded_bytes (1) + actual encoded data
+                size_t packet_size = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
+                send(&ahdr, packet_size, _remote_endpoint);
             }
         }
 
@@ -129,8 +158,6 @@ class server {
                 std::cerr << "send error: " << ec.message() << "\n";
         });
     }
-
-    void mix_and_broadcast_audio() {}
 
   private:
     udp::socket _socket;
@@ -171,6 +198,7 @@ class server {
     }
 
     std::array<char, 1024> _recv_buf;
+    std::array<char, 1024> _audio_tx_buf;
     udp::endpoint _remote_endpoint;
 
     audio_codec _audio_codec;
@@ -191,7 +219,7 @@ int main() {
 
         auto next = std::chrono::steady_clock::now();
         while (true) {
-            srv.mix_and_broadcast_audio();
+            // srv.mix_and_broadcast_audio();
             next += packet_period;
             std::this_thread::sleep_until(next);
         }

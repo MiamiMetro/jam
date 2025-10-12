@@ -34,7 +34,7 @@ class audio_codec {
             _decoder = nullptr;
         }
 
-        std::cout << "Re-initializing Opus encoder/decoder...\n";
+        std::cout << "Initializing Opus encoder/decoder...\n";
 
         int err;
         _encoder = opus_encoder_create(sample_rate, encoder_channels, application, &err);

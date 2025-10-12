@@ -105,8 +105,9 @@ class audio_stream {
         std::cout << _input_channel_count << " input channel(s), " << _output_channel_count << " output channel(s) at "
                   << inputInfo->defaultSampleRate << " Hz\n";
 
-        _audio_codec.create_codec(static_cast<int>(inputInfo->defaultSampleRate), _input_channel_count,
-                                  _output_channel_count);
+        // Decoder receives stereo from server, Encoder sends mono to server
+        _audio_codec.create_codec(static_cast<int>(inputInfo->defaultSampleRate), _output_channel_count,
+                                  _input_channel_count);
     }
 
     void stop_audio_stream() {
@@ -161,7 +162,7 @@ class client {
 
     void on_receive(std::error_code ec, std::size_t bytes) {
         if (ec) {
-            std::cerr << "receive error: " << ec.message() << "\n";
+            // std::cerr << "receive error: " << ec.message() << "\n";
             do_receive(); // keep listening
             return;
         }
@@ -259,6 +260,7 @@ class client {
         std::memcpy(ahdr.buf, encodedData.data(), std::min(encodedData.size(), sizeof(ahdr.buf)));
         // Send only: magic (4) + encoded_bytes (1) + actual encoded data
         size_t packetSize = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
+        std::cout << "Encoded " << encodedData.size() << " bytes, sending packet of size " << packetSize << "\n";
         cl->send(&ahdr, packetSize);
 
         return paContinue;
