@@ -223,7 +223,7 @@ class server {
         static std::vector<unsigned char> encoded_output;
 
         const size_t frame_size = 120; // TODO: Get from _audio_codec.frame_size() eventually
-        const float M_PI_2f = static_cast<float>(M_PI_2);
+        const float pi_over_2 = static_cast<float>(M_PI_2); // Can't use M_PI_2f as variable name (conflicts with macro)
 
         // Step 1: Decode all clients and build their stereo contributions with panning
         std::fill(global_mix.begin(), global_mix.end(), 0.0f);
@@ -237,7 +237,7 @@ class server {
 
                 // Apply panning to create stereo contribution
                 // Equal-power panning: maintains perceived loudness
-                float pan_angle = (info.pan + 1.0f) * 0.5f * M_PI_2f; // Map -1..1 to 0..π/2
+                float pan_angle = (info.pan + 1.0f) * 0.5f * pi_over_2; // Map -1..1 to 0..π/2
                 float pan_left = std::cos(pan_angle) * info.gain;
                 float pan_right = std::sin(pan_angle) * info.gain;
 
@@ -316,7 +316,7 @@ class server {
         static long long max_time = 0;
 
         total_time += duration;
-        max_time = std::max(max_time, duration);
+        max_time = std::max(max_time, static_cast<long long>(duration)); // Cast to match types
         tick_count++;
 
         // Report every 400 ticks (1 second at 2.5ms rate)
