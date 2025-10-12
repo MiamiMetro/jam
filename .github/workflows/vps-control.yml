@@ -78,7 +78,7 @@ jobs:
                 if [ ! -f CMakeCache.txt ]; then
                   cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
                 fi
-                cmake --build . --parallel $(nproc)
+                cmake --build . --target server --parallel $(nproc)
                 ;;
 
               rebuild)
@@ -88,7 +88,7 @@ jobs:
                 if [ ! -f CMakeCache.txt ]; then
                   cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
                 fi
-                cmake --build . --parallel $(nproc)
+                cmake --build . --target server --parallel $(nproc)
                 cd ..
                 systemctl start jam_server.service
                 systemctl status jam_server.service --no-pager || true
@@ -100,7 +100,7 @@ jobs:
                 mkdir -p build
                 cd build
                 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
-                cmake --build . --parallel $(nproc)
+                cmake --build . --target server --parallel $(nproc)
                 cd ..
                 systemctl start jam_server.service
                 systemctl status jam_server.service --no-pager || true
