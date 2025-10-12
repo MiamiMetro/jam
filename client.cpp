@@ -194,17 +194,17 @@ class client {
                 std::memcpy(&ehdr, _recv_buf.data(), sizeof(EchoHdr));
                 static int echo_count = 0;
                 std::cout << "Echo " << ++echo_count << " from server: " << std::string(ehdr.data) << "\n";
-            } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint8_t)) {
-                uint8_t encoded_bytes;
-                std::memcpy(&encoded_bytes, _recv_buf.data() + sizeof(MsgHdr), sizeof(uint8_t));
-                size_t expected_size = sizeof(MsgHdr) + sizeof(uint8_t) + encoded_bytes;
+            } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint16_t)) {
+                uint16_t encoded_bytes;
+                std::memcpy(&encoded_bytes, _recv_buf.data() + sizeof(MsgHdr), sizeof(uint16_t));
+                size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
                 if (bytes < expected_size) {
                     std::cerr << "Incomplete audio packet: got " << bytes << ", expected " << expected_size << "\n";
                     do_receive();
                     return;
                 }
                 const unsigned char *audio_data =
-                    reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint8_t));
+                    reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint16_t));
 
                 std::vector<float> decodedData;
                 if (encoded_bytes > 0) {
@@ -261,22 +261,22 @@ class client {
         }
 
         // 2. Mix in your own live instrument (local monitor)
-        float self_gain = 1.0f; // Adjust to taste (0.0–1.0)
-        if (in) {
-            for (size_t i = 0; i < frame_count; ++i) {
-                float sample = in[i] * self_gain;
-                out[i * out_channels + 0] += sample; // Left
-                out[i * out_channels + 1] += sample; // Right
-            }
-        }
+        // float self_gain = 1.0f; // Adjust to taste (0.0–1.0)
+        // if (in) {
+        //     for (size_t i = 0; i < frame_count; ++i) {
+        //         float sample = in[i] * self_gain;
+        //         out[i * out_channels + 0] += sample; // Left
+        //         out[i * out_channels + 1] += sample; // Right
+        //     }
+        // }
 
         // 3. Encode and send to server
         cl->_audio.encode_opus(in, frame_count, encoded_data);
         AudioHdr ahdr{};
         ahdr.magic = AUDIO_MAGIC;
-        ahdr.encoded_bytes = static_cast<uint8_t>(encoded_data.size());
+        ahdr.encoded_bytes = static_cast<uint16_t>(encoded_data.size());
         std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
-        size_t packetSize = sizeof(MsgHdr) + sizeof(uint8_t) + ahdr.encoded_bytes;
+        size_t packetSize = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
         cl->send(&ahdr, packetSize);
 
         return paContinue;
