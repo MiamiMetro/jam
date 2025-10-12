@@ -1,156 +1,31 @@
 #include <array>
 #include <asio.hpp>
+#include <cmath>
 #include <concurrentqueue.h>
 #include <iostream>
 #include <opus.h>
 #include <unordered_map>
 
+#include "audio_codec.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
+
+#define M_PI 3.14159265358979323846   // pi
+#define M_PI_2 1.57079632679489661923 // pi/2
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
-// class for both opus encode and decode
-class audio_codec {
-  private:
-    OpusEncoder *_encoder = nullptr;
-    OpusDecoder *_decoder = nullptr;
-    int _application;
-    int _bitrate;
-    int _complexity;
-    int _frame_size; // in samples
-    int _max_data_bytes;
-
-  public:
-    audio_codec(int sample_rate = 48000, int channels = 2, int application = OPUS_APPLICATION_AUDIO,
-                int bitrate = 96000, int complexity = 5, int frame_size = 120, int max_data_bytes = 128)
-        : _application(application), _bitrate(bitrate), _complexity(complexity), _frame_size(frame_size),
-          _max_data_bytes(max_data_bytes) {
-        int err;
-        _encoder = opus_encoder_create(sample_rate, channels, application, &err);
-        if (err != OPUS_OK) {
-            std::cerr << "Failed to create Opus encoder: " << opus_strerror(err) << "\n";
-            _encoder = nullptr;
-        } else {
-            // Set encoder options for low-latency music streaming
-            opus_encoder_ctl(_encoder, OPUS_SET_COMPLEXITY(complexity));
-            opus_encoder_ctl(_encoder, OPUS_SET_BITRATE(bitrate));
-            opus_encoder_ctl(_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
-            opus_encoder_ctl(_encoder, OPUS_SET_VBR(1));              // Variable bitrate for better quality
-            opus_encoder_ctl(_encoder, OPUS_SET_VBR_CONSTRAINT(0));   // Unconstrained VBR for music
-            opus_encoder_ctl(_encoder, OPUS_SET_INBAND_FEC(1));       // Forward error correction for UDP
-            opus_encoder_ctl(_encoder, OPUS_SET_PACKET_LOSS_PERC(5)); // Expect some packet loss
-            opus_encoder_ctl(_encoder, OPUS_SET_DTX(0));              // Disable DTX for music (no silence detection)
-        }
-
-        _decoder = opus_decoder_create(sample_rate, channels, &err);
-        if (err != OPUS_OK) {
-            std::cerr << "Failed to create Opus decoder: " << opus_strerror(err) << "\n";
-            opus_encoder_destroy(_encoder);
-            _encoder = nullptr;
-            _decoder = nullptr;
-        }
-    }
-
-    ~audio_codec() {
-        if (_encoder)
-            opus_encoder_destroy(_encoder);
-        if (_decoder)
-            opus_decoder_destroy(_decoder);
-    }
-
-    // Encode raw PCM samples to Opus
-    // in: pointer to input PCM samples (int16_t)
-    // frame_count: number of samples per channel
-    // sample_rate: sample rate of input PCM (e.g., 48000)
-    // out: vector to store encoded Opus data
-    // Returns: number of bytes written to out, or -1 on error
-    int encode_opus(const int16_t *in, int frame_count, int sample_rate, std::vector<uint8_t> &out) {
-        if (!_encoder)
-            return -1;
-
-        out.resize(_max_data_bytes);
-        int bytes_encoded = opus_encode(_encoder, in, frame_count, out.data(), static_cast<opus_int32>(out.size()));
-        if (bytes_encoded < 0) {
-            std::cerr << "Opus encoding failed: " << opus_strerror(bytes_encoded) << "\n";
-            out.clear();
-            return -1;
-        }
-        out.resize(bytes_encoded);
-        return bytes_encoded;
-    }
-    // Decode Opus data to raw PCM samples
-    // in: pointer to input Opus data
-    // in_bytes: size of input Opus data in bytes
-    // out: vector to store decoded PCM samples (int16_t)
-    // Returns: number of samples decoded per channel, or -1 on error
-    int decode_opus(const uint8_t *in, int in_bytes, std::vector<int16_t> &out) {
-        if (!_decoder)
-            return -1;
-
-        out.resize(_frame_size * 2); // Allocate enough space for stereo
-        int samples_decoded =
-            opus_decode(_decoder, in, in_bytes, out.data(), static_cast<opus_int32>(out.size() / sizeof(int16_t)), 0);
-        if (samples_decoded < 0) {
-            std::cerr << "Opus decoding failed: " << opus_strerror(samples_decoded) << "\n";
-            out.clear();
-            return -1;
-        }
-        out.resize(samples_decoded); // Resize to actual number of samples decoded
-        return samples_decoded;
-    }
-};
-
 class server {
-  private:
-    udp::socket _socket;
-
-    struct endpoint_hash {
-        size_t operator()(const udp::endpoint &ep) const {
-            // Avoid string allocations - hash IP bytes + port directly
-            size_t h1 = 0;
-            if (ep.address().is_v4()) {
-                h1 = std::hash<uint32_t>{}(ep.address().to_v4().to_uint());
-            } else {
-                auto bytes = ep.address().to_v6().to_bytes();
-                h1 = std::hash<std::string_view>{}(
-                    std::string_view(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
-            }
-            size_t h2 = std::hash<unsigned short>{}(ep.port());
-            return h1 ^ (h2 << 1); // Combine hashes
-        }
-    };
-
-    struct client_info {
-        std::chrono::steady_clock::time_point last_alive;
-    };
-
-    std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
-    periodic_timer _alive_check_timer;
-
-    std::array<char, 1024> _recv_buf;
-    udp::endpoint _remote_endpoint;
-
-    audio_codec _audio_codec;
-
   public:
     server(asio::io_context &io, short port)
-        : _socket(io, udp::endpoint(udp::v4(), port)), _alive_check_timer(io, 5s, [this]() {
-              auto now = std::chrono::steady_clock::now();
-              for (auto it = _clients.begin(); it != _clients.end();) {
-                  if (now - it->second.last_alive > 15s) {
-                      std::cout << "Client " << it->first.address().to_string() << ":" << it->first.port()
-                                << " timed out\n";
-                      it = _clients.erase(it);
-                  } else {
-                      ++it;
-                  }
-              }
-          }) {
+        : _socket(io, udp::endpoint(udp::v4(), port)),
+          _alive_check_timer(io, 5s, [this]() { _alive_check_timer_callback(); }) {
 
         do_receive();
     }
+
+    ~server() { _socket.close(); }
 
     void do_receive() {
         _socket.async_receive_from(asio::buffer(_recv_buf), _remote_endpoint,
@@ -242,8 +117,6 @@ class server {
                 // Extract audio data (starts after magic + encoded_bytes field)
                 const unsigned char *audio_data =
                     reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint8_t));
-
-                send(_recv_buf.data(), bytes, _remote_endpoint);
             }
         }
 
@@ -256,15 +129,75 @@ class server {
                 std::cerr << "send error: " << ec.message() << "\n";
         });
     }
+
+    void mix_and_broadcast_audio() {}
+
+  private:
+    udp::socket _socket;
+
+    struct endpoint_hash {
+        size_t operator()(const udp::endpoint &ep) const {
+            // Avoid string allocations - hash IP bytes + port directly
+            size_t h1 = 0;
+            if (ep.address().is_v4()) {
+                h1 = std::hash<uint32_t>{}(ep.address().to_v4().to_uint());
+            } else {
+                auto bytes = ep.address().to_v6().to_bytes();
+                h1 = std::hash<std::string_view>{}(
+                    std::string_view(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
+            }
+            size_t h2 = std::hash<unsigned short>{}(ep.port());
+            return h1 ^ (h2 << 1); // Combine hashes
+        }
+    };
+
+    struct client_info {
+        std::chrono::steady_clock::time_point last_alive;
+        moodycamel::ConcurrentQueue<std::vector<float>> _audio_queue;
+    };
+
+    std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
+    periodic_timer _alive_check_timer;
+    void _alive_check_timer_callback() {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = _clients.begin(); it != _clients.end();) {
+            if (now - it->second.last_alive > 15s) {
+                std::cout << "Client " << it->first.address().to_string() << ":" << it->first.port() << " timed out\n";
+                it = _clients.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::array<char, 1024> _recv_buf;
+    udp::endpoint _remote_endpoint;
+
+    audio_codec _audio_codec;
 };
 
 int main() {
     try {
         asio::io_context io;
         server srv(io, 9999);
-
         std::cout << "Echo server listening on 127.0.0.1:9999\n";
-        io.run();
+
+        std::thread net_thread([&] { io.run(); });
+
+        const int sample_rate = 48000;
+        const int frames_per_packet = 120;
+        const auto packet_period =
+            std::chrono::microseconds(static_cast<int64_t>(1'000'000.0 * frames_per_packet / sample_rate));
+
+        auto next = std::chrono::steady_clock::now();
+        while (true) {
+            srv.mix_and_broadcast_audio();
+            next += packet_period;
+            std::this_thread::sleep_until(next);
+        }
+
+        io.stop();
+        net_thread.join();
     } catch (std::exception &e) {
         std::cerr << "ERR: " << e.what() << "\n";
     }

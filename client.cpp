@@ -9,6 +9,7 @@
 #include <portaudio.h>
 #include <unordered_map>
 
+#include "audio_codec.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
 
@@ -24,14 +25,7 @@ class audio_stream {
             Pa_StopStream(_stream);
             Pa_CloseStream(_stream);
         }
-        if (opus_encoder) {
-            opus_encoder_destroy(opus_encoder);
-            opus_encoder = nullptr;
-        }
-        if (opus_decoder) {
-            opus_decoder_destroy(opus_decoder);
-            opus_decoder = nullptr;
-        }
+
         Pa_Terminate();
     }
 
@@ -84,7 +78,7 @@ class audio_stream {
             return;
         }
 
-        PaStreamParameters inputParameters = {inputDevice, std::min(inputInfo->maxInputChannels, 2), paFloat32,
+        PaStreamParameters inputParameters = {inputDevice, std::min(inputInfo->maxInputChannels, 1), paFloat32,
                                               inputInfo->defaultLowInputLatency, nullptr};
 
         PaStreamParameters outputParameters = {outputDevice, std::min(outputInfo->maxOutputChannels, 2), paFloat32,
@@ -92,7 +86,6 @@ class audio_stream {
 
         _input_channel_count = inputParameters.channelCount;
         _output_channel_count = outputParameters.channelCount;
-        _channel_count = 2;
 
         print_device_info(inputInfo, outputInfo);
         std::cout << "Frames per buffer: " << framesPerBuffer << "\n";
@@ -109,104 +102,38 @@ class audio_stream {
             std::cerr << "Pa_StartStream failed: " << Pa_GetErrorText(err) << "\n";
         }
 
-        init_opus(static_cast<int>(inputInfo->defaultSampleRate), _channel_count);
+        std::cout << _input_channel_count << " input channel(s), " << _output_channel_count << " output channel(s) at "
+                  << inputInfo->defaultSampleRate << " Hz\n";
+
+        _audio_codec.create_codec(static_cast<int>(inputInfo->defaultSampleRate), _input_channel_count,
+                                  _output_channel_count);
+    }
+
+    void stop_audio_stream() {
+        if (_stream) {
+            Pa_StopStream(_stream);
+            Pa_CloseStream(_stream);
+            _stream = nullptr;
+        }
+        _audio_codec.destroy_codec();
     }
 
     void encode_opus(const float *input, int frameSize, std::vector<unsigned char> &output) {
-        if (!opus_encoder) {
-            std::cerr << "Opus encoder not initialized.\n";
-            output.clear();
-            return;
-        }
-        output.resize(128); // Allocate enough space for encoded data
-        int encodedBytes = opus_encode_float(opus_encoder, input, frameSize, output.data(), output.size());
-        if (encodedBytes < 0) {
-            std::cerr << "Opus encoding failed: " << opus_strerror(encodedBytes) << "\n";
-            output.clear();
-        } else {
-            output.resize(encodedBytes); // Resize to actual encoded size
-        }
+        _audio_codec.encode_opus(input, frameSize, output);
     }
 
     void decode_opus(const unsigned char *input, int inputSize, int frameSize, int channelCount,
                      std::vector<float> &output) {
-        if (!opus_decoder) {
-            std::cerr << "Opus decoder not initialized.\n";
-            output.clear();
-            return;
-        }
-        output.resize(frameSize * channelCount); // Allocate space for decoded PCM (frameSize is samples per channel)
-        // opus_decode_float returns samples per channel decoded
-        int decodedSamplesPerChannel = opus_decode_float(opus_decoder, input, inputSize, output.data(), frameSize, 0);
-        if (decodedSamplesPerChannel < 0) {
-            std::cerr << "Opus decoding failed: " << opus_strerror(decodedSamplesPerChannel) << "\n";
-            output.clear();
-        } else {
-            // The output buffer now contains decodedSamplesPerChannel * channelCount total samples
-            output.resize(decodedSamplesPerChannel * channelCount);
-        }
+        _audio_codec.decode_opus(input, inputSize, frameSize, channelCount, output);
     }
 
-    void init_opus(int sampleRate = 48000, int channels = 2, int application = OPUS_APPLICATION_AUDIO,
-                   int complexity = 5, int bitrate = 96000) {
-        if (opus_encoder) {
-            opus_encoder_destroy(opus_encoder);
-            opus_encoder = nullptr;
-        }
-        if (opus_decoder) {
-            opus_decoder_destroy(opus_decoder);
-            opus_decoder = nullptr;
-        }
-
-        std::cout << "Initializing Opus encoder/decoder...\n";
-
-        int err;
-        opus_encoder = opus_encoder_create(sampleRate, channels, application, &err);
-        if (err != OPUS_OK) {
-            std::cerr << "Failed to create Opus encoder: " << opus_strerror(err) << "\n";
-            opus_encoder = nullptr;
-            return;
-        }
-        opus_decoder = opus_decoder_create(sampleRate, channels, &err);
-        if (err != OPUS_OK) {
-            std::cerr << "Failed to create Opus decoder: " << opus_strerror(err) << "\n";
-            opus_decoder = nullptr;
-            return;
-        }
-
-        // Set encoder options for low-latency music streaming
-        opus_encoder_ctl(opus_encoder, OPUS_SET_COMPLEXITY(complexity));
-        opus_encoder_ctl(opus_encoder, OPUS_SET_BITRATE(bitrate));
-        opus_encoder_ctl(opus_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
-        opus_encoder_ctl(opus_encoder, OPUS_SET_VBR(1));              // Variable bitrate for better quality
-        opus_encoder_ctl(opus_encoder, OPUS_SET_VBR_CONSTRAINT(0));   // Unconstrained VBR for music
-        opus_encoder_ctl(opus_encoder, OPUS_SET_INBAND_FEC(1));       // Forward error correction for UDP
-        opus_encoder_ctl(opus_encoder, OPUS_SET_PACKET_LOSS_PERC(5)); // Expect some packet loss
-        opus_encoder_ctl(opus_encoder, OPUS_SET_DTX(0));              // Disable DTX for music (no silence detection)
-    }
-
-    void destroy_opus() {
-        if (opus_encoder) {
-            opus_encoder_destroy(opus_encoder);
-            opus_encoder = nullptr;
-        }
-        if (opus_decoder) {
-            opus_decoder_destroy(opus_decoder);
-            opus_decoder = nullptr;
-        }
-    }
-
-    int get_channel_count() const { return _channel_count; }
     int get_input_channel_count() const { return _input_channel_count; }
     int get_output_channel_count() const { return _output_channel_count; }
 
-    std::vector<float> stereo_buffer;
-
   private:
     PaStream *_stream = nullptr;
-    OpusEncoder *opus_encoder = nullptr;
-    OpusDecoder *opus_decoder = nullptr;
-    int _channel_count;
+    audio_codec _audio_codec;
+
     int _input_channel_count;
     int _output_channel_count;
 };
@@ -261,7 +188,8 @@ class client {
             } else if (hdr.magic == ECHO_MAGIC && bytes >= sizeof(EchoHdr)) {
                 EchoHdr ehdr{};
                 std::memcpy(&ehdr, _recv_buf.data(), sizeof(EchoHdr));
-                std::cout << "Echo from server: " << std::string(ehdr.data) << "\n";
+                static int echo_count = 0;
+                std::cout << "Echo " << ++echo_count << " from server: " << std::string(ehdr.data) << "\n";
             } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint8_t)) {
                 uint8_t encoded_bytes;
                 std::memcpy(&encoded_bytes, _recv_buf.data() + sizeof(MsgHdr), sizeof(uint8_t));
@@ -277,7 +205,7 @@ class client {
                 std::vector<float> decodedData;
                 if (encoded_bytes > 0) {
                     // Decode the received Opus data
-                    _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_channel_count(), decodedData);
+                    _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_output_channel_count(), decodedData);
                 }
                 if (!decodedData.empty()) {
                     // Play the decoded PCM data
@@ -314,19 +242,7 @@ class client {
 
         client *cl = static_cast<client *>(userData);
 
-        if (cl->_audio.get_input_channel_count() < 2) {
-            // duplicate mono to stereo
-            cl->_audio.stereo_buffer.resize(frameCount * 2);
-            if (in) {
-                for (unsigned long i = 0; i < frameCount; ++i) {
-                    cl->_audio.stereo_buffer[i * 2] = in[i];
-                    cl->_audio.stereo_buffer[i * 2 + 1] = in[i];
-                }
-                in = cl->_audio.stereo_buffer.data();
-            }
-        }
-
-        size_t bytesToCopy = frameCount * cl->_audio.get_channel_count() * sizeof(float);
+        size_t bytesToCopy = frameCount * cl->_audio.get_output_channel_count() * sizeof(float);
 
         std::vector<float> decodedData;
         if (cl->_audio_recv_queue.try_dequeue(decodedData)) {
@@ -357,6 +273,7 @@ class client {
     std::array<unsigned char, 128> _ctrl_tx_buf;
 
     audio_stream _audio;
+    std::vector<float> _stereo_buffer;
     moodycamel::ConcurrentQueue<std::vector<float>> _audio_recv_queue;
 
     periodic_timer _ping_timer;
