@@ -1,4 +1,4 @@
-name: Deploy to VPS
+name: VPS Control
 
 on:
   push:
@@ -50,109 +50,76 @@ jobs:
             set -e
             cd /root/jam
 
-            # Determine action: manual input or auto-rebuild on push
+            # Determine action
             if [ "${{ github.event_name }}" = "push" ]; then
               ACTION="rebuild"
-              echo "🔄 Auto-deploy triggered by push to main"
             else
               ACTION="${{ github.event.inputs.action }}"
-              echo "🎮 Manual action: $ACTION"
             fi
 
             case "$ACTION" in
               stop)
-                echo "🛑 Stopping jam_server.service..."
                 systemctl stop jam_server.service || true
-                echo "✅ Service stopped."
                 ;;
 
               start)
-                echo "🚀 Starting jam_server.service..."
                 systemctl start jam_server.service
-                sleep 1
                 systemctl status jam_server.service --no-pager || true
-                echo "✅ Service started."
                 ;;
 
               restart)
-                echo "♻️  Restarting jam_server.service (no build)..."
                 systemctl restart jam_server.service
-                sleep 1
                 systemctl status jam_server.service --no-pager || true
-                echo "✅ Service restarted."
                 ;;
 
               build)
-                echo "🔧 Incremental build (keeps dependencies)..."
                 mkdir -p build
                 cd build
-                # Only configure if needed (CMakeCache.txt missing)
                 if [ ! -f CMakeCache.txt ]; then
-                  echo "📦 First-time configuration..."
-                  cmake .. -DCMAKE_BUILD_TYPE=Release \
-                      -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
                 fi
-                # Incremental build - only recompiles changed files
                 cmake --build . --parallel $(nproc)
-                echo "✅ Build complete."
                 ;;
 
               rebuild)
-                echo "🔄 Incremental build + restart service..."
                 systemctl stop jam_server.service || true
-                
                 mkdir -p build
                 cd build
                 if [ ! -f CMakeCache.txt ]; then
-                  echo "📦 First-time configuration..."
-                  cmake .. -DCMAKE_BUILD_TYPE=Release \
-                      -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
                 fi
                 cmake --build . --parallel $(nproc)
-                
                 cd ..
                 systemctl start jam_server.service
-                sleep 1
                 systemctl status jam_server.service --no-pager || true
-                echo "✅ Rebuild + restart complete."
                 ;;
 
               clean_build)
-                echo "🧨 Full clean build (deletes build directory)..."
                 systemctl stop jam_server.service || true
-                
                 rm -rf build
                 mkdir -p build
                 cd build
-                echo "📦 Configuring from scratch..."
-                cmake .. -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
                 cmake --build . --parallel $(nproc)
-                
                 cd ..
                 systemctl start jam_server.service
-                sleep 1
                 systemctl status jam_server.service --no-pager || true
-                echo "✅ Clean build + restart complete."
                 ;;
 
               logs)
-                echo "📜 Service status:"
                 systemctl status jam_server.service --no-pager || true
-                echo ""
-                echo "📜 Last 50 log lines:"
-                journalctl -u jam_server.service -n 50 --no-pager || echo "No logs found."
+                echo "---"
+                journalctl -u jam_server.service -n 50 --no-pager || true
                 ;;
 
               *)
-                echo "❌ Unknown action: $ACTION"
+                echo "Unknown action: $ACTION"
                 exit 1
                 ;;
             esac
 
-            # Show logs after actions (except for 'logs' itself)
-            if [ "$ACTION" != "logs" ]; then
-              echo ""
-              echo "📜 Recent logs:"
-              journalctl -u jam_server.service -n 10 --no-pager || echo "No logs found."
+            # Show recent logs after build/restart actions
+            if [ "$ACTION" = "rebuild" ] || [ "$ACTION" = "clean_build" ] || [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
+              echo "---"
+              journalctl -u jam_server.service -n 10 --no-pager || true
             fi
