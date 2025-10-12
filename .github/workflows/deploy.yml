@@ -25,16 +25,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # --- Incremental file sync (safe) ---
       - name: Sync files to VPS
         uses: burnett01/rsync-deployments@5.2
         with:
-          switches: -avz --delete
+          # Prevent nuking cached build/_deps/.cmake_deps
+          switches: -avz --delete \
+            --exclude 'build/' \
+            --exclude '_deps/' \
+            --exclude '.cmake_deps/' \
+            --exclude '.git/' \
+            --exclude '.github/'
           path: ./
           remote_path: /root/jam
           remote_host: ${{ secrets.VPS_HOST }}
           remote_user: ${{ secrets.VPS_USER }}
           remote_key: ${{ secrets.VPS_KEY }}
 
+      # --- Build / control on VPS ---
       - name: Execute command on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -45,7 +53,9 @@ jobs:
             set -e
             cd /root/jam
 
-            case "${{ github.event.inputs.action || 'restart' }}" in
+            ACTION="${{ github.event.inputs.action || 'restart' }}"
+
+            case "$ACTION" in
               stop)
                 echo "🛑 Stopping jam_server.service..."
                 systemctl stop jam_server.service || true
@@ -56,6 +66,7 @@ jobs:
                 ;;
               build)
                 echo "🔧 Building project..."
+                mkdir -p build
                 cmake -B build -DCMAKE_BUILD_TYPE=Release \
                     -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
                 cmake --build build --parallel
@@ -63,16 +74,19 @@ jobs:
               restart)
                 echo "♻️ Restarting jam_server.service with rebuild..."
                 systemctl stop jam_server.service || true
+                mkdir -p build
                 cmake -B build -DCMAKE_BUILD_TYPE=Release \
                     -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
                 cmake --build build --parallel
                 systemctl start jam_server.service
                 ;;
               *)
-                echo "❌ Unknown action"
+                echo "❌ Unknown action: $ACTION"
                 exit 1
                 ;;
             esac
+            
+            echo "🧾 Deployed commit:" ${{ github.sha }}
 
             echo "📜 Last logs:"
             journalctl -u jam_server.service -n 20 --no-pager
