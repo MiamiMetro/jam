@@ -32,28 +32,6 @@ class server {
 
     ~server() { _socket.close(); }
 
-    // Set pan position for a client: -1.0 = full left, 0.0 = center, +1.0 = full right
-    void set_client_pan(const udp::endpoint& ep, float pan) {
-        auto it = _clients.find(ep);
-        if (it == _clients.end()) {
-            return; // Client not found
-        }
-        it->second.pan = std::clamp(pan, -1.0f, 1.0f);
-        std::cout << "Client " << ep.address().to_string() << ":" << ep.port() 
-                  << " pan=" << it->second.pan << "\n";
-    }
-
-    // Set gain/volume for a client: 0.0 = mute, 1.0 = unity, >1.0 = boost
-    void set_client_gain(const udp::endpoint& ep, float gain) {
-        auto it = _clients.find(ep);
-        if (it == _clients.end()) {
-            return; // Client not found
-        }
-        it->second.gain = std::max(0.0f, gain); // Prevent negative gain
-        std::cout << "Client " << ep.address().to_string() << ":" << ep.port() 
-                  << " gain=" << it->second.gain << "\n";
-    }
-
     void do_receive() {
         _socket.async_receive_from(asio::buffer(_recv_buf), _remote_endpoint,
                                    [this](std::error_code ec, std::size_t bytes) { on_receive(ec, bytes); });
@@ -183,13 +161,6 @@ class server {
     struct client_info {
         std::chrono::steady_clock::time_point last_alive;
         moodycamel::ConcurrentQueue<std::vector<unsigned char>> _audio_queue;
-        
-        // Per-client audio state for proper mixing
-        std::vector<float> stereo_contribution; // This client's stereo output (after panning)
-        float pan = 0.0f;  // Pan position: -1.0 = full left, 0.0 = center, +1.0 = full right
-        float gain = 1.0f; // Client gain/volume
-        
-        client_info() : stereo_contribution(240, 0.0f) {} // Pre-allocate 120 frames × 2 channels
     };
 
     std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
@@ -210,128 +181,7 @@ class server {
     }
 
     void _broadcast_timer_callback() {
-        auto t_start = std::chrono::high_resolution_clock::now();
-
-        if (_clients.empty())
-            return; // No clients to process
-
-        // Reusable buffers - allocated ONCE, reused forever
-        static std::vector<unsigned char> compressed_audio;
-        static std::vector<float> mono_decoded(120);
-        static std::vector<float> global_mix(240, 0.0f); // Global stereo mix of ALL clients
-        static std::vector<float> custom_mix(240, 0.0f); // Custom mix per client
-        static std::vector<unsigned char> encoded_output;
-
-        const size_t frame_size = 120; // TODO: Get from _audio_codec.frame_size() eventually
-        const float pi_over_2 = static_cast<float>(M_PI_2); // Can't use M_PI_2f as variable name (conflicts with macro)
-
-        // Step 1: Decode all clients and build their stereo contributions with panning
-        std::fill(global_mix.begin(), global_mix.end(), 0.0f);
-        int active_sources = 0;
-
-        for (auto &[ep, info] : _clients) {
-            if (info._audio_queue.try_dequeue(compressed_audio)) {
-                // Decode mono audio from this client
-                _audio_codec.decode_opus(compressed_audio.data(), compressed_audio.size(), frame_size, 1,
-                                         mono_decoded);
-
-                // Apply panning to create stereo contribution
-                // Equal-power panning: maintains perceived loudness
-                float pan_angle = (info.pan + 1.0f) * 0.5f * pi_over_2; // Map -1..1 to 0..π/2
-                float pan_left = std::cos(pan_angle) * info.gain;
-                float pan_right = std::sin(pan_angle) * info.gain;
-
-                // Build this client's stereo contribution and add to global mix
-                for (size_t i = 0; i < frame_size; ++i) {
-                    float mono_sample = mono_decoded[i];
-                    info.stereo_contribution[i * 2 + 0] = mono_sample * pan_left;  // Left
-                    info.stereo_contribution[i * 2 + 1] = mono_sample * pan_right; // Right
-
-                    global_mix[i * 2 + 0] += info.stereo_contribution[i * 2 + 0];
-                    global_mix[i * 2 + 1] += info.stereo_contribution[i * 2 + 1];
-                }
-                active_sources++;
-            } else {
-                // Client didn't send audio - fill with silence
-                std::fill(info.stereo_contribution.begin(), info.stereo_contribution.end(), 0.0f);
-            }
-        }
-
-        if (active_sources == 0)
-            return; // No audio to process
-
-        // Step 2: For each client, create custom mix by subtracting their own stereo contribution
-        for (auto &[target_ep, target_info] : _clients) {
-            // Start with global mix
-            std::copy(global_mix.begin(), global_mix.end(), custom_mix.begin());
-
-            // Subtract this client's stereo contribution (not raw mono!)
-            for (size_t i = 0; i < frame_size * 2; ++i) {
-                custom_mix[i] -= target_info.stereo_contribution[i];
-            }
-
-            // Check if this client contributed audio
-            bool client_was_active = !std::all_of(target_info.stereo_contribution.begin(),
-                                                   target_info.stereo_contribution.end(),
-                                                   [](float s) { return s == 0.0f; });
-            
-            int other_sources = active_sources;
-            if (client_was_active) {
-                other_sources--;
-            }
-
-            if (other_sources == 0)
-                continue; // No other audio to send
-
-            // Equal-power normalization: 1/sqrt(N) maintains perceived loudness better than 1/N
-            if (active_sources > 1) {
-                float scale = 1.0f / std::sqrt(static_cast<float>(active_sources));
-                for (auto &sample : custom_mix) {
-                    sample *= scale;
-                }
-            }
-
-            // Encode the custom mix
-            _audio_codec.encode_opus(custom_mix.data(), frame_size, encoded_output);
-
-            if (encoded_output.empty())
-                continue;
-
-            // Send to this specific client
-            AudioHdr ahdr{};
-            ahdr.magic = AUDIO_MAGIC;
-            ahdr.encoded_bytes = static_cast<uint16_t>(encoded_output.size());
-            std::memcpy(ahdr.buf, encoded_output.data(), std::min(encoded_output.size(), sizeof(ahdr.buf)));
-            size_t packet_size = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
-
-            send(&ahdr, packet_size, target_ep);
-        }
-
-        // Performance monitoring (optional - can comment out for production)
-        auto t_end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-
-        static int tick_count = 0;
-        static long long total_time = 0;
-        static long long max_time = 0;
-
-        total_time += duration;
-        max_time = std::max(max_time, static_cast<long long>(duration)); // Cast to match types
-        tick_count++;
-
-        // Report every 400 ticks (1 second at 2.5ms rate)
-        if (tick_count >= 400) {
-            long long avg_time = total_time / tick_count;
-            std::cout << "Broadcast stats [" << active_sources << " active / " << _clients.size()
-                      << " total clients]: "
-                      << "avg=" << avg_time << "μs, max=" << max_time << "μs, "
-                      << "budget=" << (avg_time * 100 / 2500) << "%\n";
-
-            // Reset for next interval
-            tick_count = 0;
-            total_time = 0;
-            max_time = 0;
-        }
+        
     }
 
     std::array<char, 1024> _recv_buf;

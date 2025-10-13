@@ -80,38 +80,38 @@ class audio_codec {
         }
     }
 
-    void encode_opus(const float *input, int frameSize, std::vector<unsigned char> &output) {
+    void encode_opus(const float *input, int frame_size, std::vector<unsigned char> &output) {
         if (!_encoder) {
             std::cerr << "Opus encoder not initialized.\n";
             output.clear();
             return;
         }
         output.resize(512); // Larger buffer for high-quality music (was 128)
-        int encodedBytes = opus_encode_float(_encoder, input, frameSize, output.data(), output.size());
-        if (encodedBytes < 0) {
-            std::cerr << "Opus encoding failed: " << opus_strerror(encodedBytes) << "\n";
+        int encoded_bytes = opus_encode_float(_encoder, input, frame_size, output.data(), output.size());
+        if (encoded_bytes < 0) {
+            std::cerr << "Opus encoding failed: " << opus_strerror(encoded_bytes) << "\n";
             output.clear();
         } else {
-            output.resize(encodedBytes); // Resize to actual encoded size
+            output.resize(encoded_bytes); // Resize to actual encoded size
         }
     }
 
-    void decode_opus(const unsigned char *input, int inputSize, int frameSize, int channelCount,
+    void decode_opus(const unsigned char *input, int input_size, int frame_size, int channel_count,
                      std::vector<float> &output) {
         if (!_decoder) {
             std::cerr << "Opus decoder not initialized.\n";
             output.clear();
             return;
         }
-        output.resize(frameSize * channelCount); // Allocate space for decoded PCM (frameSize is samples per channel)
+        output.resize(frame_size * channel_count); // Allocate space for decoded PCM (frameSize is samples per channel)
         // opus_decode_float returns samples per channel decoded
-        int decodedSamplesPerChannel = opus_decode_float(_decoder, input, inputSize, output.data(), frameSize, 0);
-        if (decodedSamplesPerChannel < 0) {
-            std::cerr << "Opus decoding failed: " << opus_strerror(decodedSamplesPerChannel) << "\n";
+        int decoded_samples_per_channel = opus_decode_float(_decoder, input, input_size, output.data(), frame_size, 0);
+        if (decoded_samples_per_channel < 0) {
+            std::cerr << "Opus decoding failed: " << opus_strerror(decoded_samples_per_channel) << "\n";
             output.clear();
         } else {
             // The output buffer now contains decodedSamplesPerChannel * channelCount total samples
-            output.resize(decodedSamplesPerChannel * channelCount);
+            output.resize(decoded_samples_per_channel * channel_count);
         }
     }
 };
