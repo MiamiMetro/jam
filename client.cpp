@@ -122,6 +122,15 @@ class audio_stream {
         _audio_codec.destroy_codec();
     }
 
+    void print_latency_info() {
+        const PaStreamInfo *streamInfo = Pa_GetStreamInfo(_stream);
+        if (streamInfo) {
+            printf("Input latency:  %.3f ms\n", streamInfo->inputLatency * 1000.0);
+            printf("Output latency: %.3f ms\n", streamInfo->outputLatency * 1000.0);
+            printf("Sample rate:    %.1f Hz\n", streamInfo->sampleRate);
+        }
+    }
+
     void encode_opus(const float *input, int frameSize, std::vector<unsigned char> &output) {
         _audio_codec.encode_opus(input, frameSize, output);
     }
@@ -150,22 +159,25 @@ class client {
           _alive_timer(io, 5s, [this]() { _alive_timer_callback(); }) {
 
         std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
-        
+
         // Resolve hostname or IP address
         udp::resolver resolver(io);
-        udp::resolver::results_type endpoints = resolver.resolve(udp::v4(), server_address, std::to_string(server_port));
+        udp::resolver::results_type endpoints =
+            resolver.resolve(udp::v4(), server_address, std::to_string(server_port));
         _server_endpoint = *endpoints.begin();
-        
-        std::cout << "Connecting to: " << _server_endpoint.address().to_string() << ":" << _server_endpoint.port() << "\n";
+
+        std::cout << "Connecting to: " << _server_endpoint.address().to_string() << ":" << _server_endpoint.port()
+                  << "\n";
 
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type = CtrlHdr::Cmd::JOIN;
         std::memcpy(_ctrl_tx_buf.data(), &chdr, sizeof(CtrlHdr));
         send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
-        
+
         // _audio.list_devices();
         _audio.start_audio_stream(17, 15, 120, audio_callback, this);
+        _audio.print_latency_info();
 
         do_receive();
     }
