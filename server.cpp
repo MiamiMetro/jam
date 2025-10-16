@@ -125,7 +125,7 @@ class server {
 
                 std::vector<unsigned char> audio_data_vec(audio_data, audio_data + encoded_bytes);
 
-                _clients[_remote_endpoint]._audio_queue.enqueue(std::move(audio_data_vec));
+                _clients[_remote_endpoint].audio_queue.enqueue(std::move(audio_data_vec));
             }
         }
 
@@ -160,7 +160,7 @@ class server {
 
     struct client_info {
         std::chrono::steady_clock::time_point last_alive;
-        moodycamel::ConcurrentQueue<std::vector<unsigned char>> _audio_queue;
+        moodycamel::ConcurrentQueue<std::vector<unsigned char>> audio_queue;
     };
 
     std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
@@ -181,7 +181,61 @@ class server {
     }
 
     void _broadcast_timer_callback() {
-        
+        const int frame_size = 120; // 2.5ms @ 48000 Hz
+        const int channels_out = 2; // stereo output
+        const int samples_out = frame_size * channels_out;
+
+        // Reusable buffers
+        static std::vector<float> global_mix(samples_out, 0.0f);
+        static std::vector<unsigned char> compressed_audio;
+        static std::vector<float> decoded_audio(frame_size);
+        static std::vector<float> stereo_tmp(samples_out);
+
+        std::fill(global_mix.begin(), global_mix.end(), 0.0f);
+        int active_sources = 0;
+
+        // --- MIX PHASE ---
+        for (auto &[ep, info] : _clients) {
+            std::vector<unsigned char> packet;
+            if (!info.audio_queue.try_dequeue(packet))
+                continue; // no fresh packet
+
+            decoded_audio.resize(frame_size);
+            _audio_codec.decode_opus(packet.data(), static_cast<int>(packet.size()), frame_size, 1, decoded_audio);
+
+            if (decoded_audio.size() < static_cast<size_t>(frame_size))
+                decoded_audio.resize(frame_size, 0.0f);
+
+            // upmix to stereo and sum into global_mix
+            for (int i = 0; i < frame_size; ++i) {
+                float s = decoded_audio[i];
+                global_mix[i * 2 + 0] += s; // L
+                global_mix[i * 2 + 1] += s; // R
+            }
+
+            ++active_sources;
+        }
+
+        // --- NORMALIZE ---
+        if (active_sources > 1) {
+            float norm = 1.0f / static_cast<float>(active_sources);
+            for (auto &s : global_mix)
+                s *= norm;
+        }
+
+        // --- ENCODE ---
+        compressed_audio.clear();
+        _audio_codec.encode_opus(global_mix.data(), frame_size, compressed_audio);
+
+        // --- BROADCAST ---
+        for (auto &[ep, info] : _clients) {
+            AudioHdr ahdr{};
+            ahdr.magic = AUDIO_MAGIC;
+            ahdr.encoded_bytes = static_cast<uint16_t>(compressed_audio.size());
+            std::memcpy(ahdr.buf, compressed_audio.data(), std::min(compressed_audio.size(), sizeof(ahdr.buf)));
+            size_t packetSize = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
+            send(&ahdr, packetSize, ep);
+        }
     }
 
     std::array<char, 1024> _recv_buf;

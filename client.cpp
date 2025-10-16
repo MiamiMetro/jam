@@ -163,8 +163,9 @@ class client {
         chdr.type = CtrlHdr::Cmd::JOIN;
         std::memcpy(_ctrl_tx_buf.data(), &chdr, sizeof(CtrlHdr));
         send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
-
-        _audio.start_audio_stream(17, 14, 120, audio_callback, this);
+        
+        // _audio.list_devices();
+        _audio.start_audio_stream(17, 15, 120, audio_callback, this);
 
         do_receive();
     }
