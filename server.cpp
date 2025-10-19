@@ -1,6 +1,5 @@
 #include <array>
 #include <asio.hpp>
-#include <cmath>
 #include <concurrentqueue.h>
 #include <iostream>
 #include <opus.h>
@@ -10,9 +9,6 @@
 #include "opus_encoder.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
-
-#define M_PI 3.14159265358979323846   // pi
-#define M_PI_2 1.57079632679489661923 // pi/2
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -223,174 +219,99 @@ class server {
         }
     }
 
+    void _send_audio_to_client(const udp::endpoint& endpoint, const std::vector<unsigned char>& encoded_audio) {
+        if (encoded_audio.empty()) {
+            return;
+        }
+
+        // Create audio packet header
+        AudioHdr ahdr{};
+        ahdr.magic = AUDIO_MAGIC;
+        ahdr.encoded_bytes = static_cast<uint16_t>(encoded_audio.size());
+        
+        // Copy encoded audio data to the header buffer
+        size_t copy_size = std::min(encoded_audio.size(), sizeof(ahdr.buf));
+        std::memcpy(ahdr.buf, encoded_audio.data(), copy_size);
+        
+        // Send the packet
+        size_t packet_size = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
+        send(&ahdr, packet_size, endpoint);
+    }
+
     void _broadcast_timer_callback() {
+        // Only broadcast if we have clients
         if (_clients.empty()) {
             return;
         }
 
-        static constexpr int FRAME_SIZE = 120; // 2.5ms at 48kHz
-        static constexpr int STEREO_CHANNELS = 2;
-        static constexpr int MONO_CHANNELS = 1;
-        static constexpr float SOFT_LIMIT_THRESHOLD = 0.95F; // Start compressing above 0.95
-        static constexpr float SOFT_LIMIT_KNEE = 0.05F;      // Smooth knee width
+        // Constants for audio processing
+        constexpr int FRAME_SIZE = 120;        // 2.5ms at 48kHz
+        constexpr int SAMPLE_RATE = 48000;
+        constexpr int INPUT_CHANNELS = 1;      // Clients send mono
+        constexpr int OUTPUT_CHANNELS = 2;     // Server sends stereo
+        constexpr int SAMPLES_PER_FRAME = FRAME_SIZE * OUTPUT_CHANNELS;
 
-        // Reusable buffers (avoid allocations every 2.5ms!)
-        static std::vector<float> decoded_mono(FRAME_SIZE);                   // Temp for one client's decoded audio
-        static std::vector<float> mixed_mono(FRAME_SIZE, 0.0F);               // Accumulated mix
-        static std::vector<float> mixed_stereo(FRAME_SIZE * STEREO_CHANNELS); // Final stereo output
-        static std::vector<unsigned char> encoded_packet;                     // Opus-encoded result
-        static std::vector<unsigned char> client_packet;                      // Temp for dequeued packet
+        // Create stereo mix buffer (initialized to silence)
+        std::vector<float> stereo_mix(SAMPLES_PER_FRAME, 0.0F);
+        int active_clients = 0;
 
-        // Diagnostics
-        static int callback_count = 0;
-        static int total_packets_sent = 0;
-        if (++callback_count % 400 == 0) { // Every second (400 × 2.5ms)
-            // Check queue depths
-            std::cout << "Server: " << callback_count << " callbacks, " << _clients.size() << " clients, "
-                      << total_packets_sent << " packets sent";
-            for (const auto &[endpoint, client] : _clients) {
-                std::cout << " | Q:" << client.audio_queue.size_approx();
-            }
-            std::cout << "\n";
-        }
-
-        // For each client, we need to send a mix of all OTHER clients
-        for (auto &[target_endpoint, target_client] : _clients) {
-            // Reset mix accumulator
-            std::fill(mixed_mono.begin(), mixed_mono.end(), 0.0F);
-            int sources_mixed = 0;
-
-            // First pass: Decode all available packets and collect them
-            std::vector<std::vector<float>> decoded_sources;
-            decoded_sources.reserve(_clients.size() - 1);
-
-            // Decode and collect all clients EXCEPT the target
-            for (auto &[source_endpoint, source_client] : _clients) {
-                if (source_endpoint == target_endpoint) {
-                    continue; // Don't send client their own audio back
-                }
-
-                // Check queue depth
-                size_t queue_depth = source_client.audio_queue.size_approx();
-
-                if (queue_depth >= 1 && source_client.audio_queue.try_dequeue(client_packet)) {
-                    // Decode Opus mono → PCM float using this client's decoder
-                    decoded_mono.clear();
-                    bool decode_ok = source_client.decoder.decode(client_packet.data(), client_packet.size(),
-                                                                  FRAME_SIZE, decoded_mono);
-
-                    if (decode_ok && decoded_mono.size() == FRAME_SIZE) {
-                        decoded_sources.push_back(decoded_mono);
-                        sources_mixed++;
-                    } else if (decode_ok) {
-                        // Decoded size mismatch - log warning
-                        static int mismatch_count = 0;
-                        if (++mismatch_count % 100 == 0) {
-                            std::cerr << "Server: Decoded " << decoded_mono.size() << " samples, expected "
-                                      << FRAME_SIZE << "\n";
+        // Process each client's audio
+        for (auto& [endpoint, client_info] : _clients) {
+            std::vector<unsigned char> audio_packet;
+            
+            // Try to get the latest audio packet from this client
+            if (client_info.audio_queue.try_dequeue(audio_packet)) {
+                // Decode the client's mono audio
+                std::vector<float> mono_audio;
+                if (client_info.decoder.decode(audio_packet.data(), audio_packet.size(), FRAME_SIZE, mono_audio)) {
+                    // Upmix mono to stereo and add to mix
+                    if (mono_audio.size() == FRAME_SIZE) {
+                        for (int i = 0; i < FRAME_SIZE; ++i) {
+                            float sample = mono_audio[i];
+                            // Simple upmix: duplicate mono to both stereo channels
+                            stereo_mix[(i * 2)] += sample;     // Left channel
+                            stereo_mix[(i * 2) + 1] += sample; // Right channel
                         }
-                    }
-                }
-                // else: queue_depth == 0 → Client is silent, don't mix anything
-            }
-
-            // Second pass: Mix with proper gain based on ACTUAL sources
-            if (sources_mixed > 0) {
-                // Calculate gain based on actual number of sources (not total clients)
-                float mix_gain = 1.0F / std::sqrt(static_cast<float>(sources_mixed));
-
-                // Diagnostic: Log mixing stats periodically
-                static int mix_count = 0;
-                static int total_sources_mixed = 0;
-                static int mix_with_2_sources = 0;
-                static int mix_with_1_source = 0;
-                static int empty_mixes = 0;
-                total_sources_mixed += sources_mixed;
-                mix_count++;
-                if (sources_mixed == 2) {
-                    mix_with_2_sources++;
-                }
-                if (sources_mixed == 1) {
-                    mix_with_1_source++;
-                }
-                if (mix_count % 400 == 0) {
-                    std::cout << "Mix stats: 2src=" << mix_with_2_sources << " (1src=" << mix_with_1_source
-                              << ", 0src=" << empty_mixes << "), gain=" << mix_gain << "\n";
-                }
-
-                // Mix all sources with gain
-                for (const auto &source : decoded_sources) {
-                    for (int i = 0; i < FRAME_SIZE; ++i) {
-                        mixed_mono[i] += source[i] * mix_gain;
+                        active_clients++;
                     }
                 }
             } else {
-                static int empty_count = 0;
-                empty_count++;
-            }
-
-            // If we have audio to send (at least one source mixed)
-            if (sources_mixed > 0) {
-                // Convert mono → stereo and apply final limiting
-                for (int i = 0; i < FRAME_SIZE; ++i) {
-                    float sample = mixed_mono[i];
-
-                    // Check for NaN or Inf (corrupted audio)
-                    if (!std::isfinite(sample)) {
-                        sample = 0.0F;
-                        static int nan_count = 0;
-                        if (++nan_count % 100 == 0) {
-                            std::cerr << "Warning: NaN/Inf detected in mix, zeroing\n";
+                // No audio packet available - use packet loss concealment
+                std::vector<float> plc_audio;
+                if (client_info.decoder.decode_plc(FRAME_SIZE, plc_audio)) {
+                    if (plc_audio.size() == FRAME_SIZE) {
+                        for (int i = 0; i < FRAME_SIZE; ++i) {
+                            float sample = plc_audio[i];
+                            stereo_mix[(i * 2)] += sample;     // Left channel
+                            stereo_mix[(i * 2) + 1] += sample; // Right channel
                         }
                     }
-
-                    float abs_sample = std::fabs(sample);
-
-                    // Soft limiting only if needed
-                    if (abs_sample > SOFT_LIMIT_THRESHOLD) {
-                        float excess = abs_sample - SOFT_LIMIT_THRESHOLD;
-                        float compressed = SOFT_LIMIT_THRESHOLD + (std::tanh(excess / SOFT_LIMIT_KNEE) * SOFT_LIMIT_KNEE);
-                        sample = std::copysign(compressed, sample);
-                    }
-
-                    // Hard clamp as final safety
-                    sample = std::clamp(sample, -1.0F, 1.0F);
-
-                    // Duplicate to both stereo channels
-                    mixed_stereo[(i * STEREO_CHANNELS) + 0] = sample; // Left
-                    mixed_stereo[(i * STEREO_CHANNELS) + 1] = sample; // Right
-                }
-
-                // Encode mixed stereo PCM → Opus (using shared encoder)
-                bool encode_ok = _encoder.encode(mixed_stereo.data(), FRAME_SIZE, encoded_packet);
-
-                if (encode_ok && !encoded_packet.empty()) {
-                    // Verify packet size is reasonable
-                    if (encoded_packet.size() > sizeof(AudioHdr::buf)) {
-                        std::cerr << "Warning: Encoded packet too large (" << encoded_packet.size()
-                                  << " bytes), truncating\n";
-                        encoded_packet.resize(sizeof(AudioHdr::buf));
-                    }
-
-                    // Build audio packet header
-                    AudioHdr ahdr{};
-                    ahdr.magic = AUDIO_MAGIC;
-                    ahdr.encoded_bytes = static_cast<uint16_t>(encoded_packet.size());
-                    std::memcpy(ahdr.buf, encoded_packet.data(), encoded_packet.size());
-
-                    size_t packet_size = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
-
-                    // Send to this client
-                    send(&ahdr, packet_size, target_endpoint);
-                    total_packets_sent++;
-                } else {
-                    static int encode_fail_count = 0;
-                    if (++encode_fail_count % 100 == 0) {
-                        std::cerr << "Warning: Encoding failed " << encode_fail_count << " times\n";
-                    }
                 }
             }
-            // If sources_mixed == 0, send nothing (silence) - client will handle it
+        }
+
+        // Apply gain control to prevent clipping (simple normalization)
+        if (active_clients > 0) {
+            float gain = 1.0F / static_cast<float>(active_clients);
+            for (float& sample : stereo_mix) {
+                sample *= gain;
+            }
+        }
+
+        // Encode the stereo mix
+        std::vector<unsigned char> encoded_mix;
+        if (_encoder.encode(stereo_mix.data(), FRAME_SIZE, encoded_mix)) {
+            // Broadcast to all clients
+            for (const auto& [endpoint, client_info] : _clients) {
+                _send_audio_to_client(endpoint, encoded_mix);
+            }
+        }
+
+        // Optional: Print stats periodically
+        static int callback_count = 0;
+        if (++callback_count % 400 == 0) { // Every second (400 * 2.5ms = 1000ms)
+            std::cout << "Broadcast: " << _clients.size() << " clients, " 
+                      << active_clients << " active, mix size: " << encoded_mix.size() << " bytes\n";
         }
     }
 
