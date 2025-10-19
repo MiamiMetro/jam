@@ -1,5 +1,6 @@
 #include <array>
 #include <asio.hpp>
+#include <atomic>
 #include <chrono>
 #include <concurrentqueue.h>
 #include <cstdint>
@@ -156,7 +157,8 @@ class client {
   public:
     client(asio::io_context &io, const std::string &server_address, short server_port)
         : _socket(io, udp::endpoint(udp::v4(), 0)), _ping_timer(io, 100ms, [this]() { _ping_timer_callback(); }),
-          _alive_timer(io, 5s, [this]() { _alive_timer_callback(); }) {
+          _alive_timer(io, 5s, [this]() { _alive_timer_callback(); }), _jitter_buffer_ready(false),
+          _jitter_buffer_min_packets(4), _jitter_buffer_target_packets(6), _jitter_buffer_max_packets(12) {
 
         std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
 
@@ -231,8 +233,24 @@ class client {
                     _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_output_channel_count(), decodedData);
                 }
                 if (!decodedData.empty()) {
-                    // Play the decoded PCM data
-                    _audio_recv_queue.enqueue(std::move(decodedData));
+                    // Add to jitter buffer queue
+                    size_t queue_size = _audio_recv_queue.size_approx();
+                    
+                    // Drop packet if queue is too full (prevent unbounded latency)
+                    if (queue_size < 16) {
+                        _audio_recv_queue.enqueue(std::move(decodedData));
+                        
+                        // Mark buffer as ready once we have enough packets
+                        if (!_jitter_buffer_ready && queue_size >= _jitter_buffer_min_packets) {
+                            _jitter_buffer_ready = true;
+                            std::cout << "\nJitter buffer ready (" << queue_size << " packets buffered)\n";
+                        }
+                    } else {
+                        // Buffer overflow - drop oldest packet
+                        std::vector<float> discarded;
+                        _audio_recv_queue.try_dequeue(discarded);
+                        _audio_recv_queue.enqueue(std::move(decodedData));
+                    }
                 }
 
             } else {
@@ -268,15 +286,95 @@ class client {
         // Use static buffers to avoid allocations (reused across calls)
         static std::vector<float> decoded_data;
         static std::vector<unsigned char> encoded_data;
+        static int underrun_count = 0;
+        static int playback_count = 0;
+        static int consecutive_low_buffer = 0;
+        static int consecutive_high_buffer = 0;
+        static auto last_adaptation = std::chrono::steady_clock::now();
 
         size_t out_channels = cl->_audio.get_output_channel_count(); // 2
         size_t bytes_to_copy = frame_count * out_channels * sizeof(float);
 
-        // 1. Play received audio from server
-        if (cl->_audio_recv_queue.try_dequeue(decoded_data)) {
+        // 1. Play received audio from server (with adaptive jitter buffer)
+        size_t queue_size = cl->_audio_recv_queue.size_approx();
+        size_t current_min = cl->_jitter_buffer_min_packets.load();
+        size_t current_target = cl->_jitter_buffer_target_packets.load();
+        
+        // Jitter buffer logic: only play if buffer is ready
+        if (cl->_jitter_buffer_ready && cl->_audio_recv_queue.try_dequeue(decoded_data)) {
             std::memcpy(out, decoded_data.data(), bytes_to_copy);
+            playback_count++;
+            
+            // === ADAPTIVE BUFFER SIZE ADJUSTMENT ===
+            auto now = std::chrono::steady_clock::now();
+            auto time_since_adapt = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_adaptation);
+            
+            // Only adapt every 1 second to avoid oscillation
+            if (time_since_adapt.count() >= 1000) {
+                // Track buffer health
+                if (queue_size < current_min) {
+                    consecutive_low_buffer++;
+                    consecutive_high_buffer = 0;
+                } else if (queue_size > current_target + 2) {
+                    consecutive_high_buffer++;
+                    consecutive_low_buffer = 0;
+                } else {
+                    // Buffer in healthy range - decay counters slowly
+                    consecutive_low_buffer = std::max(0, consecutive_low_buffer - 1);
+                    consecutive_high_buffer = std::max(0, consecutive_high_buffer - 1);
+                }
+                
+                // Increase buffer if consistently low (network jitter detected)
+                if (consecutive_low_buffer >= 3 && current_min < cl->_jitter_buffer_max_packets - 2) {
+                    size_t new_min = std::min(current_min + 2, cl->_jitter_buffer_max_packets - 2);
+                    size_t new_target = std::min(current_target + 2, cl->_jitter_buffer_max_packets);
+                    cl->_jitter_buffer_min_packets.store(new_min);
+                    cl->_jitter_buffer_target_packets.store(new_target);
+                    std::cout << "\n📈 Adaptive: Increasing buffer to min=" << new_min 
+                              << ", target=" << new_target << " (high jitter detected)\n";
+                    consecutive_low_buffer = 0;
+                    last_adaptation = now;
+                }
+                // Decrease buffer if consistently high (stable network, reduce latency)
+                else if (consecutive_high_buffer >= 5 && current_min > 3) {
+                    size_t new_min = std::max(current_min - 1, size_t(3));
+                    size_t new_target = std::max(current_target - 1, size_t(5));
+                    cl->_jitter_buffer_min_packets.store(new_min);
+                    cl->_jitter_buffer_target_packets.store(new_target);
+                    std::cout << "\n📉 Adaptive: Decreasing buffer to min=" << new_min 
+                              << ", target=" << new_target << " (stable network)\n";
+                    consecutive_high_buffer = 0;
+                    last_adaptation = now;
+                }
+            }
+            
+            // Warn if buffer is critically low
+            if (queue_size < current_min - 1) {
+                underrun_count++;
+                if (underrun_count % 200 == 0) {
+                    std::cout << "\n⚠️  Jitter buffer low (" << queue_size << "/" << current_min 
+                              << " packets)\n";
+                }
+            } else {
+                underrun_count = 0;
+            }
         } else {
+            // Buffer not ready or underrun - play silence
             std::memset(out, 0, bytes_to_copy);
+            underrun_count++;
+            
+            // Print underrun stats periodically
+            if (!cl->_jitter_buffer_ready && underrun_count % 100 == 0) {
+                std::cout << "\nBuffering... (" << queue_size << "/" << current_min << " packets)\n";
+            }
+            
+            // Reset buffer ready flag if we've drained completely
+            if (cl->_jitter_buffer_ready && queue_size == 0) {
+                cl->_jitter_buffer_ready = false;
+                std::cout << "\n❌ Jitter buffer underrun! Rebuffering...\n";
+                consecutive_low_buffer = 0;
+                consecutive_high_buffer = 0;
+            }
         }
 
         // 2. Mix in your own live instrument (local monitor)
@@ -312,6 +410,12 @@ class client {
     audio_stream _audio;
     std::vector<float> _stereo_buffer;
     moodycamel::ConcurrentQueue<std::vector<float>> _audio_recv_queue;
+
+    // Jitter buffer state
+    std::atomic<bool> _jitter_buffer_ready;
+    std::atomic<size_t> _jitter_buffer_min_packets;      // Adaptive minimum (starts at 4)
+    std::atomic<size_t> _jitter_buffer_target_packets;   // Adaptive target (starts at 6)
+    const size_t _jitter_buffer_max_packets;             // Hard max (12 packets = 30ms)
 
     periodic_timer _ping_timer;
     void _ping_timer_callback() {
