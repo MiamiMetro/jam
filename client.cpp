@@ -6,14 +6,17 @@
 #include <concurrentqueue.h>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <opus.h>
 #include <portaudio.h>
+#include <thread>
 
 #include "opus_decoder.hpp"
 #include "opus_encoder.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
+#include "tcp_control_server.hpp"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -50,6 +53,34 @@ class audio_stream {
                       << ", out: " << deviceInfo->maxOutputChannels << ", defaultSR: " << deviceInfo->defaultSampleRate
                       << ")\n";
         }
+    }
+
+    static std::string get_devices_json(const std::string &hostApiName = "") {
+        std::string json = "[";
+        int numDevices = Pa_GetDeviceCount();
+        bool first = true;
+        for (int i = 0; i < numDevices; ++i) {
+            const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(i);
+            if (deviceInfo == nullptr) {
+                continue;
+            }
+            const PaHostApiInfo *hostApiInfo = Pa_GetHostApiInfo(deviceInfo->hostApi);
+            std::string apiName = (hostApiInfo != nullptr) ? hostApiInfo->name : "Unknown API";
+            if (!hostApiName.empty() && apiName != hostApiName) {
+                continue;
+            }
+            if (!first) {
+                json += ",";
+            }
+            first = false;
+            json += R"({"index": )" + std::to_string(i) + R"(, "name": ")" + deviceInfo->name +
+                    R"(", "maxInputChannels": )" + std::to_string(deviceInfo->maxInputChannels) +
+                    R"(, "maxOutputChannels": )" + std::to_string(deviceInfo->maxOutputChannels) +
+                    R"(, "defaultSampleRate": )" + std::to_string(deviceInfo->defaultSampleRate) + R"(, "hostApi": ")" +
+                    apiName + R"("})";
+        }
+        json += "]";
+        return json;
     }
 
     static const PaDeviceInfo *get_device_info(int deviceIndex) {
@@ -106,6 +137,8 @@ class audio_stream {
         err = Pa_StartStream(_stream);
         if (err != paNoError) {
             std::cerr << "Pa_StartStream failed: " << Pa_GetErrorText(err) << "\n";
+        } else {
+            _stream_active.store(true, std::memory_order_relaxed);
         }
 
         std::cout << _input_channel_count << " input channel(s), " << _output_channel_count << " output channel(s) at "
@@ -121,6 +154,7 @@ class audio_stream {
     }
 
     void stop_audio_stream() {
+        _stream_active.store(false, std::memory_order_relaxed);
         if (_stream != nullptr) {
             Pa_StopStream(_stream);
             Pa_CloseStream(_stream);
@@ -151,11 +185,13 @@ class audio_stream {
 
     int get_input_channel_count() const { return _input_channel_count; }
     int get_output_channel_count() const { return _output_channel_count; }
+    bool is_stream_active() const { return _stream_active.load(std::memory_order_relaxed); }
 
   private:
     PaStream *_stream = nullptr;
     opus_encoder_wrapper _encoder;
     opus_decoder_wrapper _decoder;
+    std::atomic<bool> _stream_active{false};
 
     int _input_channel_count;
     int _output_channel_count;
@@ -174,11 +210,10 @@ class client {
         std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
 
         std::cout << "\n=== Available Audio Devices ===\n";
-        _audio.list_devices();
+        audio_stream::list_devices();
 
         // Start audio stream
         start_audio_stream(17, 15, 120);
-
         // Connect to server
         start_connection(server_address, server_port);
     }
@@ -231,6 +266,7 @@ class client {
     bool is_connected() const { return _is_connected.load(std::memory_order_relaxed); }
 
     void start_audio_stream(PaDeviceIndex inputDevice, PaDeviceIndex outputDevice, int framesPerBuffer = 120) {
+        std::cout << "Starting audio stream...\n";
         _audio.start_audio_stream(inputDevice, outputDevice, framesPerBuffer, audio_callback, this);
         _audio.print_latency_info();
     }
@@ -476,7 +512,7 @@ class client {
 
             // Print underrun stats periodically
             if (!client_ptr->_jitter_buffer_ready && state.underrun_count % 100 == 0) {
-                std::cout << "\nBuffering... (" << queue_size << "/" << current_min << " packets)\n";
+                // std::cout << "\nBuffering... (" << queue_size << "/" << current_min << " packets)\n";
             }
 
             // Reset buffer ready flag if we've drained completely
@@ -565,8 +601,8 @@ class client {
             max_sample = std::max(abs_sample, max_sample);
         }
 
-        // Only encode and send if there's actual audio (not silence)
-        if (max_sample > SILENCE_THRESHOLD) {
+        // Only encode and send if there's actual audio (not silence) and stream is active
+        if (max_sample > SILENCE_THRESHOLD && client_ptr->_audio.is_stream_active()) {
             client_ptr->_audio.encode_opus(input_buffer, frame_count, state.encoded_data);
 
             // Diagnostic: Check encoding success
@@ -594,7 +630,7 @@ class client {
             // Silence detected - don't send packet (save bandwidth and prevent glitches)
             static int silence_count = 0;
             if (++silence_count % 400 == 0) {
-                std::cout << "Client: " << silence_count << " silent frames skipped\n";
+                // std::cout << "Client: " << silence_count << " silent frames skipped\n";
             }
         }
     }
@@ -634,7 +670,78 @@ int main() {
     try {
         asio::io_context io_context;
         client client_instance(io_context, "127.0.0.1", 9999);
+        // client_instance.start_connection("127.0.0.1", 9999);
+        // client_instance.start_audio_stream(15, 17, 120);
+
+        // Create TCP server on a separate thread with its own io_context
+        std::thread tcp_server_thread([&]() {
+            try {
+                asio::io_context tcp_io_context;
+                tcp_control_server server(tcp_io_context, 9969);
+                server.add_endpoint("GET", "/join",
+                                    [&client_instance, &io_context](const std::string &method, const std::string &path,
+                                                                    const std::string &body) {
+                                        // Post audio operations to the main thread's io_context
+                                        asio::post(io_context, [&client_instance]() {
+                                            client_instance.start_connection("127.0.0.1", 9999);
+                                            client_instance.start_audio_stream(17, 15, 120);
+                                            client_instance.enable_echo(true);
+                                        });
+
+                                        return tcp_control_server::http_response(
+                                            tcp_control_server::HTTP_OK, "OK",
+                                            "Audio connection started. Echo enabled. Try speaking!");
+                                    });
+
+                server.add_endpoint("GET", "/exit",
+                                    [&client_instance, &io_context](const std::string &method, const std::string &path,
+                                                                    const std::string &body) {
+                                        // Post audio operations to the main thread's io_context
+                                        asio::post(io_context, [&client_instance]() {
+                                            client_instance.stop_connection();
+                                            client_instance.stop_audio_stream();
+                                            client_instance.enable_echo(false);
+                                        });
+
+                                        return tcp_control_server::http_response(tcp_control_server::HTTP_OK, "OK",
+                                                                                 "Audio connection stopped.");
+                                    });
+                server.add_endpoint(
+                    "GET", "/devices", [](const std::string &method, const std::string &path, const std::string &body) {
+                        return tcp_control_server::http_response(tcp_control_server::HTTP_OK, "OK",
+                                                                 audio_stream::get_devices_json(), "application/json");
+                    });
+                server.add_endpoint("GET", "/devices/mme",
+                                    [](const std::string &method, const std::string &path, const std::string &body) {
+                                        return tcp_control_server::http_response(tcp_control_server::HTTP_OK, "OK",
+                                                                                 audio_stream::get_devices_json("MME"),
+                                                                                 "application/json");
+                                    });
+                server.add_endpoint("GET", "/devices/wasapi",
+                                    [](const std::string &method, const std::string &path, const std::string &body) {
+                                        return tcp_control_server::http_response(
+                                            tcp_control_server::HTTP_OK, "OK",
+                                            audio_stream::get_devices_json("Windows WASAPI"), "application/json");
+                                    });
+                server.add_endpoint("GET", "/devices/directsound",
+                                    [](const std::string &method, const std::string &path, const std::string &body) {
+                                        return tcp_control_server::http_response(
+                                            tcp_control_server::HTTP_OK, "OK",
+                                            audio_stream::get_devices_json("Windows DirectSound"), "application/json");
+                                    });
+                tcp_io_context.run();
+            } catch (std::exception &e) {
+                std::cerr << "TCP Server ERR: " << e.what() << "\n";
+            }
+        });
+
+        // Run the main UDP client on the main thread
         io_context.run();
+
+        // Wait for TCP server thread to finish
+        if (tcp_server_thread.joinable()) {
+            tcp_server_thread.join();
+        }
     } catch (std::exception &e) {
         std::cerr << "ERR: " << e.what() << "\n";
     }
