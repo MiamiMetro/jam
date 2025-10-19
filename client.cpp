@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <asio.hpp>
 #include <atomic>
@@ -8,7 +9,6 @@
 #include <iostream>
 #include <opus.h>
 #include <portaudio.h>
-#include <unordered_map>
 
 #include "opus_decoder.hpp"
 #include "opus_encoder.hpp"
@@ -23,7 +23,7 @@ class audio_stream {
     audio_stream() { Pa_Initialize(); }
 
     ~audio_stream() {
-        if (_stream) {
+        if (_stream != nullptr) {
             Pa_StopStream(_stream);
             Pa_CloseStream(_stream);
         }
@@ -31,7 +31,7 @@ class audio_stream {
         Pa_Terminate();
     }
 
-    void list_devices() {
+    static void list_devices() {
         int numDevices = Pa_GetDeviceCount();
         if (numDevices < 0) {
             std::cerr << "ERROR: Pa_GetDeviceCount returned " << numDevices << "\n";
@@ -40,32 +40,36 @@ class audio_stream {
 
         for (int i = 0; i < numDevices; ++i) {
             const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(i);
-            if (!deviceInfo)
+            if (deviceInfo == nullptr) {
                 continue;
+            }
             const PaHostApiInfo *hostApiInfo = Pa_GetHostApiInfo(deviceInfo->hostApi);
             // device index: api - name (in: maxInputChannels, out: maxOutputChannels, defaultSR)
-            std::cout << i << ": " << (hostApiInfo ? hostApiInfo->name : "Unknown API") << " - " << deviceInfo->name
-                      << " (in: " << deviceInfo->maxInputChannels << ", out: " << deviceInfo->maxOutputChannels
-                      << ", defaultSR: " << deviceInfo->defaultSampleRate << ")\n";
+            std::cout << i << ": " << ((hostApiInfo != nullptr) ? hostApiInfo->name : "Unknown API") << " - "
+                      << deviceInfo->name << " (in: " << deviceInfo->maxInputChannels
+                      << ", out: " << deviceInfo->maxOutputChannels << ", defaultSR: " << deviceInfo->defaultSampleRate
+                      << ")\n";
         }
     }
 
-    const PaDeviceInfo *get_device_info(int deviceIndex) {
+    static const PaDeviceInfo *get_device_info(int deviceIndex) {
         const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(deviceIndex);
-        if (!deviceInfo) {
+        if (deviceInfo == nullptr) {
             std::cerr << "Invalid device index: " << deviceIndex << "\n";
             return nullptr;
         }
         return deviceInfo;
     }
 
-    void print_device_info(const PaDeviceInfo *inputInfo, const PaDeviceInfo *outputInfo) const {
+    static void print_device_info(const PaDeviceInfo *inputInfo, const PaDeviceInfo *outputInfo) {
         std::cout << "Input Device: " << inputInfo->name << " | API: "
-                  << (Pa_GetHostApiInfo(inputInfo->hostApi) ? Pa_GetHostApiInfo(inputInfo->hostApi)->name : "Unknown")
+                  << ((Pa_GetHostApiInfo(inputInfo->hostApi) != nullptr) ? Pa_GetHostApiInfo(inputInfo->hostApi)->name
+                                                                         : "Unknown")
                   << " | Max Input Channels: " << inputInfo->maxInputChannels
                   << " | Default Sample Rate: " << inputInfo->defaultSampleRate << "\n";
         std::cout << "Output Device: " << outputInfo->name << " | API: "
-                  << (Pa_GetHostApiInfo(outputInfo->hostApi) ? Pa_GetHostApiInfo(outputInfo->hostApi)->name : "Unknown")
+                  << ((Pa_GetHostApiInfo(outputInfo->hostApi) != nullptr) ? Pa_GetHostApiInfo(outputInfo->hostApi)->name
+                                                                          : "Unknown")
                   << " | Max Output Channels: " << outputInfo->maxOutputChannels
                   << " | Default Sample Rate: " << outputInfo->defaultSampleRate << "\n";
     }
@@ -73,9 +77,9 @@ class audio_stream {
     void start_audio_stream(PaDeviceIndex inputDevice, PaDeviceIndex outputDevice, int framesPerBuffer = 120,
                             PaStreamCallback *callback = nullptr, void *userData = nullptr) {
         // Opus requires specific frame sizes: 120, 240, 480, 960, 1920, or 2880 frames
-        auto inputInfo = get_device_info(inputDevice);
-        auto outputInfo = get_device_info(outputDevice);
-        if (!inputInfo || !outputInfo) {
+        const auto *inputInfo = get_device_info(inputDevice);
+        const auto *outputInfo = get_device_info(outputDevice);
+        if (inputInfo == nullptr || outputInfo == nullptr) {
             std::cerr << "Invalid input or output device.\n";
             return;
         }
@@ -117,7 +121,7 @@ class audio_stream {
     }
 
     void stop_audio_stream() {
-        if (_stream) {
+        if (_stream != nullptr) {
             Pa_StopStream(_stream);
             Pa_CloseStream(_stream);
             _stream = nullptr;
@@ -128,9 +132,10 @@ class audio_stream {
 
     void print_latency_info() {
         const PaStreamInfo *streamInfo = Pa_GetStreamInfo(_stream);
-        if (streamInfo) {
-            printf("Input latency:  %.3f ms\n", streamInfo->inputLatency * 1000.0);
-            printf("Output latency: %.3f ms\n", streamInfo->outputLatency * 1000.0);
+        if (streamInfo != nullptr) {
+            static constexpr double SECONDS_TO_MILLISECONDS = 1000.0;
+            printf("Input latency:  %.3f ms\n", streamInfo->inputLatency * SECONDS_TO_MILLISECONDS);
+            printf("Output latency: %.3f ms\n", streamInfo->outputLatency * SECONDS_TO_MILLISECONDS);
             printf("Sample rate:    %.1f Hz\n", streamInfo->sampleRate);
         }
     }
@@ -159,10 +164,10 @@ class audio_stream {
 class client {
 
   public:
-    client(asio::io_context &io, const std::string &server_address, short server_port)
-        : _io_context(io), _socket(io, udp::endpoint(udp::v4(), 0)),
-          _ping_timer(io, 100ms, [this]() { _ping_timer_callback(); }),
-          _alive_timer(io, 5s, [this]() { _alive_timer_callback(); }), _jitter_buffer_ready(false),
+    client(asio::io_context &io_context, const std::string &server_address, short server_port)
+        : _io_context(io_context), _socket(io_context, udp::endpoint(udp::v4(), 0)),
+          _ping_timer(io_context, 100ms, [this]() { _ping_timer_callback(); }),
+          _alive_timer(io_context, 5s, [this]() { _alive_timer_callback(); }), _jitter_buffer_ready(false),
           _jitter_buffer_min_packets(4), _jitter_buffer_target_packets(6), _jitter_buffer_max_packets(12),
           _is_connected(false), _echo_enabled(false) {
 
@@ -180,7 +185,7 @@ class client {
 
     // Start connection to server (or switch to new server)
     void start_connection(const std::string &server_address, short server_port) {
-        std::cout << "\n🔌 Connecting to " << server_address << ":" << server_port << "...\n";
+        std::cout << "\nConnecting to " << server_address << ":" << server_port << "...\n";
 
         // Resolve hostname or IP address
         udp::resolver resolver(_io_context);
@@ -191,22 +196,22 @@ class client {
         std::cout << "Resolved to: " << _server_endpoint.address().to_string() << ":" << _server_endpoint.port()
                   << "\n";
 
+        _is_connected.store(true, std::memory_order_relaxed);
+        do_receive();
+
+        std::cout << "Connected and receiving!\n";
+
         // Send JOIN message
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type = CtrlHdr::Cmd::JOIN;
         std::memcpy(_ctrl_tx_buf.data(), &chdr, sizeof(CtrlHdr));
         send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
-
-        _is_connected.store(true, std::memory_order_relaxed);
-        do_receive();
-
-        std::cout << "✅ Connected and receiving!\n";
     }
 
     // Stop connection (stops sending/receiving UDP packets)
     void stop_connection() {
-        std::cout << "\n🔌 Disconnecting from server...\n";
+        std::cout << "\nDisconnecting from server...\n";
 
         _is_connected.store(false, std::memory_order_relaxed);
 
@@ -219,7 +224,7 @@ class client {
         }
         _jitter_buffer_ready = false;
 
-        std::cout << "✅ Disconnected (no longer sending/receiving)\n";
+        std::cout << "Disconnected (no longer sending/receiving)\n";
     }
 
     // Check if connected to server
@@ -236,90 +241,29 @@ class client {
 
     bool is_echo_enabled() const { return _echo_enabled.load(std::memory_order_relaxed); }
 
-    void on_receive(std::error_code ec, std::size_t bytes) {
-        if (ec) {
-            // std::cerr << "receive error: " << ec.message() << "\n";
+    void on_receive(std::error_code error_code, std::size_t bytes) {
+        if (error_code) {
+            // std::cerr << "receive error: " << error_code.message() << "\n";
             do_receive(); // keep listening
             return;
         }
 
-        if (bytes >= sizeof(MsgHdr)) {
-            MsgHdr hdr{};
-            std::memcpy(&hdr, _recv_buf.data(), sizeof(MsgHdr));
+        if (bytes < sizeof(MsgHdr)) {
+            do_receive();
+            return;
+        }
 
-            if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
-                SyncHdr hdr{};
-                std::memcpy(&hdr, _recv_buf.data(), sizeof(SyncHdr));
+        MsgHdr hdr{};
+        std::memcpy(&hdr, _recv_buf.data(), sizeof(MsgHdr));
 
-                auto now = std::chrono::steady_clock::now();
-                auto t4 = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-                auto rtt = (t4 - hdr.t1_client_send) - (hdr.t3_server_send - hdr.t2_server_recv);
-                auto offset = ((hdr.t2_server_recv - hdr.t1_client_send) + (hdr.t3_server_send - t4)) / 2;
-
-                double rtt_ms = rtt / 1e6;
-                double offset_ms = offset / 1e6;
-
-                // print live stats
-                std::cout << "seq " << hdr.seq << " RTT " << rtt_ms << " ms"
-                          << " | offset " << offset_ms << " ms" << std::string(20, ' ') << "\r" << std::flush;
-            } else if (hdr.magic == ECHO_MAGIC && bytes >= sizeof(EchoHdr)) {
-                EchoHdr ehdr{};
-                std::memcpy(&ehdr, _recv_buf.data(), sizeof(EchoHdr));
-                static int echo_count = 0;
-                std::cout << "Echo " << ++echo_count << " from server: " << std::string(ehdr.data) << "\n";
-            } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint16_t)) {
-                uint16_t encoded_bytes;
-                std::memcpy(&encoded_bytes, _recv_buf.data() + sizeof(MsgHdr), sizeof(uint16_t));
-                size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
-                if (bytes < expected_size) {
-                    std::cerr << "Incomplete audio packet: got " << bytes << ", expected " << expected_size << "\n";
-                    do_receive();
-                    return;
-                }
-                const unsigned char *audio_data =
-                    reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint16_t));
-
-                std::vector<float> decodedData;
-                if (encoded_bytes > 0) {
-                    // Decode the received Opus data
-                    _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_output_channel_count(), decodedData);
-
-                    // Diagnostic: Check decoded size periodically
-                    static int decode_count = 0;
-                    static int size_errors = 0;
-                    if (++decode_count % 400 == 0) {
-                        std::cout << "Client decoded " << decode_count << " packets, " << decodedData.size()
-                                  << " samples (expected " << (120 * _audio.get_output_channel_count()) << "), "
-                                  << size_errors << " size errors\n";
-                    }
-                    if (decodedData.size() != 120 * _audio.get_output_channel_count()) {
-                        size_errors++;
-                    }
-                }
-                if (!decodedData.empty()) {
-                    // Add to jitter buffer queue
-                    size_t queue_size = _audio_recv_queue.size_approx();
-
-                    // Drop packet if queue is too full (prevent unbounded latency)
-                    if (queue_size < 16) {
-                        _audio_recv_queue.enqueue(std::move(decodedData));
-
-                        // Mark buffer as ready once we have enough packets
-                        if (!_jitter_buffer_ready && queue_size >= _jitter_buffer_min_packets) {
-                            _jitter_buffer_ready = true;
-                            std::cout << "\nJitter buffer ready (" << queue_size << " packets buffered)\n";
-                        }
-                    } else {
-                        // Buffer overflow - drop oldest packet
-                        std::vector<float> discarded;
-                        _audio_recv_queue.try_dequeue(discarded);
-                        _audio_recv_queue.enqueue(std::move(decodedData));
-                    }
-                }
-
-            } else {
-                std::cout << "Unknown message: " << std::string(_recv_buf.data(), bytes) << "\n";
-            }
+        if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
+            _handle_ping_message(bytes);
+        } else if (hdr.magic == ECHO_MAGIC && bytes >= sizeof(EchoHdr)) {
+            _handle_echo_message(bytes);
+        } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint16_t)) {
+            _handle_audio_message(bytes);
+        } else {
+            std::cout << "Unknown message: " << std::string(_recv_buf.data(), bytes) << "\n";
         }
 
         do_receive(); // keep listening
@@ -331,8 +275,9 @@ class client {
             return;
         }
 
-        _socket.async_receive_from(asio::buffer(_recv_buf), _server_endpoint,
-                                   [this](std::error_code ec, std::size_t bytes) { on_receive(ec, bytes); });
+        _socket.async_receive_from(
+            asio::buffer(_recv_buf), _server_endpoint,
+            [this](std::error_code error_code, std::size_t bytes) { on_receive(error_code, bytes); });
     }
 
     void send(void *data, std::size_t len) {
@@ -341,9 +286,10 @@ class client {
             return;
         }
 
-        _socket.async_send_to(asio::buffer(data, len), _server_endpoint, [](std::error_code ec, std::size_t) {
-            if (ec)
-                std::cerr << "send error: " << ec.message() << "\n";
+        _socket.async_send_to(asio::buffer(data, len), _server_endpoint, [](std::error_code error_code, std::size_t) {
+            if (error_code) {
+                std::cerr << "send error: " << error_code.message() << "\n";
+            }
         });
     }
 
@@ -391,184 +337,294 @@ class client {
         send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
     }
 
-    static int audio_callback(const void *input, void *output, unsigned long frame_count,
-                              const PaStreamCallbackTimeInfo *, PaStreamCallbackFlags, void *user_data) {
+    void _handle_ping_message(std::size_t bytes) {
+        SyncHdr hdr{};
+        std::memcpy(&hdr, _recv_buf.data(), sizeof(SyncHdr));
 
-        const float *in = static_cast<const float *>(input);
-        float *out = static_cast<float *>(output);
-        if (!out)
-            return paContinue;
+        auto now = std::chrono::steady_clock::now();
+        auto current_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        auto rtt = (current_time - hdr.t1_client_send) - (hdr.t3_server_send - hdr.t2_server_recv);
+        auto offset = ((hdr.t2_server_recv - hdr.t1_client_send) + (hdr.t3_server_send - current_time)) / 2;
 
-        client *cl = static_cast<client *>(user_data);
+        double rtt_ms = rtt / 1e6;
+        double offset_ms = offset / 1e6;
 
-        // Use static buffers to avoid allocations (reused across calls)
-        static std::vector<float> decoded_data;
-        static std::vector<unsigned char> encoded_data;
-        static int underrun_count = 0;
-        static int playback_count = 0;
-        static int consecutive_low_buffer = 0;
-        static int consecutive_high_buffer = 0;
-        static auto last_adaptation = std::chrono::steady_clock::now();
+        // print live stats
+        std::cout << "seq " << hdr.seq << " RTT " << rtt_ms << " ms"
+                  << " | offset " << offset_ms << " ms" << std::string(20, ' ') << "\r" << std::flush;
+    }
 
-        size_t out_channels = cl->_audio.get_output_channel_count(); // 2
-        size_t bytes_to_copy = frame_count * out_channels * sizeof(float);
+    void _handle_echo_message(std::size_t bytes) {
+        EchoHdr ehdr{};
+        std::memcpy(&ehdr, _recv_buf.data(), sizeof(EchoHdr));
+        static int echo_count = 0;
+        std::cout << "Echo " << ++echo_count << " from server: " << std::string(ehdr.data) << "\n";
+    }
 
-        // 1. Play received audio from server (with adaptive jitter buffer)
-        size_t queue_size = cl->_audio_recv_queue.size_approx();
-        size_t current_min = cl->_jitter_buffer_min_packets.load();
-        size_t current_target = cl->_jitter_buffer_target_packets.load();
+    void _handle_audio_message(std::size_t bytes) {
+        uint16_t encoded_bytes;
+        std::memcpy(&encoded_bytes, _recv_buf.data() + sizeof(MsgHdr), sizeof(uint16_t));
+        size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
+
+        if (bytes < expected_size) {
+            std::cerr << "Incomplete audio packet: got " << bytes << ", expected " << expected_size << "\n";
+            do_receive();
+            return;
+        }
+
+        const unsigned char *audio_data =
+            reinterpret_cast<const unsigned char *>(_recv_buf.data() + sizeof(MsgHdr) + sizeof(uint16_t));
+
+        std::vector<float> decodedData;
+        if (encoded_bytes > 0) {
+            _decode_audio_data(audio_data, encoded_bytes, decodedData);
+        }
+
+        if (!decodedData.empty()) {
+            _process_decoded_audio(std::move(decodedData));
+        }
+    }
+
+    void _decode_audio_data(const unsigned char *audio_data, uint16_t encoded_bytes, std::vector<float> &decodedData) {
+        // Decode the received Opus data
+        _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_output_channel_count(), decodedData);
+
+        // Diagnostic: Check decoded size periodically
+        static int decode_count = 0;
+        static int size_errors = 0;
+        if (++decode_count % 400 == 0) {
+            std::cout << "Client decoded " << decode_count << " packets, " << decodedData.size()
+                      << " samples (expected " << (120 * _audio.get_output_channel_count()) << "), " << size_errors
+                      << " size errors\n";
+        }
+        if (decodedData.size() != 120 * _audio.get_output_channel_count()) {
+            size_errors++;
+        }
+    }
+
+    void _process_decoded_audio(std::vector<float> decodedData) {
+        // Add to jitter buffer queue
+        size_t queue_size = _audio_recv_queue.size_approx();
+
+        // Drop packet if queue is too full (prevent unbounded latency)
+        if (queue_size < 16) {
+            _audio_recv_queue.enqueue(std::move(decodedData));
+
+            // Mark buffer as ready once we have enough packets
+            if (!_jitter_buffer_ready && queue_size >= _jitter_buffer_min_packets) {
+                _jitter_buffer_ready = true;
+                std::cout << "\nJitter buffer ready (" << queue_size << " packets buffered)\n";
+            }
+        } else {
+            // Buffer overflow - drop oldest packet
+            std::vector<float> discarded;
+            _audio_recv_queue.try_dequeue(discarded);
+            _audio_recv_queue.enqueue(std::move(decodedData));
+        }
+    }
+
+    // Helper methods for audio callback to reduce cognitive complexity
+    struct AudioCallbackState {
+        std::vector<float> decoded_data;
+        std::vector<unsigned char> encoded_data;
+        int underrun_count = 0;
+        int playback_count = 0;
+        int consecutive_low_buffer = 0;
+        int consecutive_high_buffer = 0;
+        std::chrono::steady_clock::time_point last_adaptation = std::chrono::steady_clock::now();
+    };
+
+    static void handle_audio_playback(client *client_ptr, float *output_buffer, unsigned long frame_count,
+                                      size_t out_channels, size_t bytes_to_copy, AudioCallbackState &state) {
+        size_t queue_size = client_ptr->_audio_recv_queue.size_approx();
+        size_t current_min = client_ptr->_jitter_buffer_min_packets.load();
+        size_t current_target = client_ptr->_jitter_buffer_target_packets.load();
 
         // Jitter buffer logic: only play if buffer is ready
-        if (cl->_jitter_buffer_ready && cl->_audio_recv_queue.try_dequeue(decoded_data)) {
+        if (client_ptr->_jitter_buffer_ready && client_ptr->_audio_recv_queue.try_dequeue(state.decoded_data)) {
             // Validate decoded data size matches expected output
             size_t expected_samples = frame_count * out_channels;
-            if (decoded_data.size() == expected_samples) {
-                std::memcpy(out, decoded_data.data(), bytes_to_copy);
+            if (state.decoded_data.size() == expected_samples) {
+                std::memcpy(output_buffer, state.decoded_data.data(), bytes_to_copy);
             } else {
                 // Size mismatch - zero output and log warning
-                std::memset(out, 0, bytes_to_copy);
+                std::memset(output_buffer, 0, bytes_to_copy);
                 static int mismatch_count = 0;
                 if (++mismatch_count % 100 == 0) {
-                    std::cerr << "Client: Decoded size mismatch: got " << decoded_data.size() << " samples, expected "
-                              << expected_samples << "\n";
+                    std::cerr << "Client: Decoded size mismatch: got " << state.decoded_data.size()
+                              << " samples, expected " << expected_samples << "\n";
                 }
             }
-            playback_count++;
+            state.playback_count++;
 
-            // === ADAPTIVE BUFFER SIZE ADJUSTMENT ===
-            auto now = std::chrono::steady_clock::now();
-            auto time_since_adapt = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_adaptation);
-
-            // Only adapt every 1 second to avoid oscillation
-            if (time_since_adapt.count() >= 1000) {
-                // Track buffer health
-                if (queue_size < current_min) {
-                    consecutive_low_buffer++;
-                    consecutive_high_buffer = 0;
-                } else if (queue_size > current_target + 2) {
-                    consecutive_high_buffer++;
-                    consecutive_low_buffer = 0;
-                } else {
-                    // Buffer in healthy range - decay counters slowly
-                    consecutive_low_buffer = std::max(0, consecutive_low_buffer - 1);
-                    consecutive_high_buffer = std::max(0, consecutive_high_buffer - 1);
-                }
-
-                // Increase buffer if consistently low (network jitter detected)
-                if (consecutive_low_buffer >= 3 && current_min < cl->_jitter_buffer_max_packets - 2) {
-                    size_t new_min = std::min(current_min + 2, cl->_jitter_buffer_max_packets - 2);
-                    size_t new_target = std::min(current_target + 2, cl->_jitter_buffer_max_packets);
-                    cl->_jitter_buffer_min_packets.store(new_min);
-                    cl->_jitter_buffer_target_packets.store(new_target);
-                    std::cout << "\n📈 Adaptive: Increasing buffer to min=" << new_min << ", target=" << new_target
-                              << " (high jitter detected)\n";
-                    consecutive_low_buffer = 0;
-                    last_adaptation = now;
-                }
-                // Decrease buffer if consistently high (stable network, reduce latency)
-                else if (consecutive_high_buffer >= 5 && current_min > 3) {
-                    size_t new_min = std::max(current_min - 1, size_t(3));
-                    size_t new_target = std::max(current_target - 1, size_t(5));
-                    cl->_jitter_buffer_min_packets.store(new_min);
-                    cl->_jitter_buffer_target_packets.store(new_target);
-                    std::cout << "\n📉 Adaptive: Decreasing buffer to min=" << new_min << ", target=" << new_target
-                              << " (stable network)\n";
-                    consecutive_high_buffer = 0;
-                    last_adaptation = now;
-                }
-            }
+            // Adaptive buffer management
+            adapt_jitter_buffer(client_ptr, queue_size, current_min, current_target, state);
 
             // Warn if buffer is critically low
             if (queue_size < current_min - 1) {
-                underrun_count++;
-                if (underrun_count % 200 == 0) {
-                    std::cout << "\n⚠️  Jitter buffer low (" << queue_size << "/" << current_min << " packets)\n";
+                state.underrun_count++;
+                if (state.underrun_count % 200 == 0) {
+                    std::cout << "\nJitter buffer low (" << queue_size << "/" << current_min << " packets)\n";
                 }
             } else {
-                underrun_count = 0;
+                state.underrun_count = 0;
             }
         } else {
             // Buffer not ready or underrun - play silence
-            std::memset(out, 0, bytes_to_copy);
-            underrun_count++;
+            std::memset(output_buffer, 0, bytes_to_copy);
+            state.underrun_count++;
 
             // Print underrun stats periodically
-            if (!cl->_jitter_buffer_ready && underrun_count % 100 == 0) {
+            if (!client_ptr->_jitter_buffer_ready && state.underrun_count % 100 == 0) {
                 std::cout << "\nBuffering... (" << queue_size << "/" << current_min << " packets)\n";
             }
 
             // Reset buffer ready flag if we've drained completely
-            if (cl->_jitter_buffer_ready && queue_size == 0) {
-                cl->_jitter_buffer_ready = false;
-                std::cout << "\n❌ Jitter buffer underrun! Rebuffering...\n";
-                consecutive_low_buffer = 0;
-                consecutive_high_buffer = 0;
+            if (client_ptr->_jitter_buffer_ready && queue_size == 0) {
+                client_ptr->_jitter_buffer_ready = false;
+                std::cout << "\nJitter buffer underrun! Rebuffering...\n";
+                state.consecutive_low_buffer = 0;
+                state.consecutive_high_buffer = 0;
             }
         }
+    }
 
-        // 2. Mix in your own live instrument (local monitor)
-        if (cl->is_echo_enabled()) {
-            float self_gain = 1.0f; // Adjust to taste (0.0–1.0)
-            if (in) {
-                for (size_t i = 0; i < frame_count; ++i) {
-                    float sample = in[i] * self_gain;
-                    out[i * out_channels + 0] += sample; // Left
-                    out[i * out_channels + 1] += sample; // Right
-                }
-            }
-        }
+    static void adapt_jitter_buffer(client *client_ptr, size_t queue_size, size_t current_min, size_t current_target,
+                                    AudioCallbackState &state) {
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_adapt = std::chrono::duration_cast<std::chrono::milliseconds>(now - state.last_adaptation);
 
-        // 3. Encode and send to server
-        if (in) {
-            // Silence detection: Check if input has significant audio
-            static constexpr float SILENCE_THRESHOLD = 0.001f; // -60dB
-            float max_sample = 0.0f;
-            for (unsigned long i = 0; i < frame_count; ++i) {
-                float abs_sample = std::fabs(in[i]);
-                if (abs_sample > max_sample) {
-                    max_sample = abs_sample;
-                }
-            }
-
-            // Only encode and send if there's actual audio (not silence)
-            if (max_sample > SILENCE_THRESHOLD) {
-                cl->_audio.encode_opus(in, frame_count, encoded_data);
-
-                // Diagnostic: Check encoding success
-                static int encode_count = 0;
-                static int encode_failures = 0;
-                encode_count++;
-                if (encoded_data.empty()) {
-                    encode_failures++;
-                }
-                if (encode_count % 400 == 0) {
-                    std::cout << "Client encoded " << encode_count << " packets, " << encode_failures
-                              << " failures, last size: " << encoded_data.size() << " bytes, peak: " << max_sample
-                              << "\n";
-                }
-
-                if (!encoded_data.empty()) {
-                    AudioHdr ahdr{};
-                    ahdr.magic = AUDIO_MAGIC;
-                    ahdr.encoded_bytes = static_cast<uint16_t>(encoded_data.size());
-                    std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
-                    size_t packetSize = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
-                    cl->send(&ahdr, packetSize);
-                }
+        // Only adapt every 1 second to avoid oscillation
+        if (time_since_adapt.count() >= 1000) {
+            // Track buffer health
+            if (queue_size < current_min) {
+                state.consecutive_low_buffer++;
+                state.consecutive_high_buffer = 0;
+            } else if (queue_size > current_target + 2) {
+                state.consecutive_high_buffer++;
+                state.consecutive_low_buffer = 0;
             } else {
-                // Silence detected - don't send packet (save bandwidth and prevent glitches)
-                static int silence_count = 0;
-                if (++silence_count % 400 == 0) {
-                    std::cout << "Client: " << silence_count << " silent frames skipped\n";
-                }
+                // Buffer in healthy range - decay counters slowly
+                state.consecutive_low_buffer = std::max(0, state.consecutive_low_buffer - 1);
+                state.consecutive_high_buffer = std::max(0, state.consecutive_high_buffer - 1);
             }
-        } else {
+
+            // Increase buffer if consistently low (network jitter detected)
+            if (state.consecutive_low_buffer >= 3 && current_min < client_ptr->_jitter_buffer_max_packets - 2) {
+                size_t new_min = std::min(current_min + 2, client_ptr->_jitter_buffer_max_packets - 2);
+                size_t new_target = std::min(current_target + 2, client_ptr->_jitter_buffer_max_packets);
+                client_ptr->_jitter_buffer_min_packets.store(new_min);
+                client_ptr->_jitter_buffer_target_packets.store(new_target);
+                std::cout << "\nAdaptive: Increasing buffer to min=" << new_min << ", target=" << new_target
+                          << " (high jitter detected)\n";
+                state.consecutive_low_buffer = 0;
+                state.last_adaptation = now;
+            }
+            // Decrease buffer if consistently high (stable network, reduce latency)
+            else if (state.consecutive_high_buffer >= 5 && current_min > 3) {
+                size_t new_min = std::max(current_min - 1, size_t(3));
+                size_t new_target = std::max(current_target - 1, size_t(5));
+                client_ptr->_jitter_buffer_min_packets.store(new_min);
+                client_ptr->_jitter_buffer_target_packets.store(new_target);
+                std::cout << "\nAdaptive: Decreasing buffer to min=" << new_min << ", target=" << new_target
+                          << " (stable network)\n";
+                state.consecutive_high_buffer = 0;
+                state.last_adaptation = now;
+            }
+        }
+    }
+
+    static void handle_echo_monitoring(const float *input_buffer, float *output_buffer, unsigned long frame_count,
+                                       size_t out_channels, bool echo_enabled) {
+        if (echo_enabled && (input_buffer != nullptr)) {
+            float self_gain = 1.0F; // Adjust to taste (0.0–1.0)
+            for (size_t i = 0; i < frame_count; ++i) {
+                float sample = input_buffer[i] * self_gain;
+                output_buffer[(i * out_channels) + 0] += sample; // Left
+                output_buffer[(i * out_channels) + 1] += sample; // Right
+            }
+        }
+    }
+
+    static void handle_audio_encoding(client *client_ptr, const float *input_buffer, unsigned long frame_count,
+                                      AudioCallbackState &state) {
+        if (input_buffer == nullptr) {
             // No input - send silence packet periodically to keep connection alive
             static int no_input_count = 0;
             if (++no_input_count % 100 == 0) {
                 std::cerr << "Warning: No input audio (in == nullptr)\n";
             }
+            return;
         }
+
+        // Silence detection: Check if input has significant audio
+        static constexpr float SILENCE_THRESHOLD = 0.001F; // -60dB
+        float max_sample = 0.0F;
+        for (unsigned long i = 0; i < frame_count; ++i) {
+            float abs_sample = std::fabs(input_buffer[i]);
+            max_sample = std::max(abs_sample, max_sample);
+        }
+
+        // Only encode and send if there's actual audio (not silence)
+        if (max_sample > SILENCE_THRESHOLD) {
+            client_ptr->_audio.encode_opus(input_buffer, frame_count, state.encoded_data);
+
+            // Diagnostic: Check encoding success
+            static int encode_count = 0;
+            static int encode_failures = 0;
+            encode_count++;
+            if (state.encoded_data.empty()) {
+                encode_failures++;
+            }
+            if (encode_count % 400 == 0) {
+                std::cout << "Client encoded " << encode_count << " packets, " << encode_failures
+                          << " failures, last size: " << state.encoded_data.size() << " bytes, peak: " << max_sample
+                          << "\n";
+            }
+
+            if (!state.encoded_data.empty()) {
+                AudioHdr ahdr{};
+                ahdr.magic = AUDIO_MAGIC;
+                ahdr.encoded_bytes = static_cast<uint16_t>(state.encoded_data.size());
+                std::memcpy(ahdr.buf, state.encoded_data.data(), std::min(state.encoded_data.size(), sizeof(ahdr.buf)));
+                size_t packetSize = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
+                client_ptr->send(&ahdr, packetSize);
+            }
+        } else {
+            // Silence detected - don't send packet (save bandwidth and prevent glitches)
+            static int silence_count = 0;
+            if (++silence_count % 400 == 0) {
+                std::cout << "Client: " << silence_count << " silent frames skipped\n";
+            }
+        }
+    }
+
+    static int audio_callback(const void *input, void *output, unsigned long frame_count,
+                              const PaStreamCallbackTimeInfo * /*unused*/, PaStreamCallbackFlags /*unused*/,
+                              void *user_data) {
+        const auto *input_buffer = static_cast<const float *>(input);
+        auto *output_buffer = static_cast<float *>(output);
+        if (output_buffer == nullptr) {
+            return paContinue;
+        }
+
+        auto *client_ptr = static_cast<client *>(user_data);
+
+        // Use static state to avoid allocations (reused across calls)
+        static AudioCallbackState state;
+
+        size_t out_channels = client_ptr->_audio.get_output_channel_count(); // 2
+        size_t bytes_to_copy = frame_count * out_channels * sizeof(float);
+
+        // 1. Play received audio from server (with adaptive jitter buffer)
+        client::handle_audio_playback(client_ptr, output_buffer, frame_count, out_channels, bytes_to_copy, state);
+
+        // 2. Mix in your own live instrument (local monitor)
+        client::handle_echo_monitoring(input_buffer, output_buffer, frame_count, out_channels,
+                                       client_ptr->is_echo_enabled());
+
+        // 3. Encode and send to server
+        client::handle_audio_encoding(client_ptr, input_buffer, frame_count, state);
 
         return paContinue;
     }
@@ -576,9 +632,9 @@ class client {
 
 int main() {
     try {
-        asio::io_context io;
-        client cl(io, "127.0.0.1", 9999);
-        io.run();
+        asio::io_context io_context;
+        client client_instance(io_context, "127.0.0.1", 9999);
+        io_context.run();
     } catch (std::exception &e) {
         std::cerr << "ERR: " << e.what() << "\n";
     }

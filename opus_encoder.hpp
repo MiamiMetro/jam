@@ -72,7 +72,7 @@ class opus_encoder_wrapper {
     }
 
     void destroy() {
-        if (_encoder) {
+        if (_encoder != nullptr) {
             opus_encoder_destroy(_encoder);
             _encoder = nullptr;
         }
@@ -81,7 +81,7 @@ class opus_encoder_wrapper {
     }
 
     bool encode(const float *input, int frame_size, std::vector<unsigned char> &output) {
-        if (!_encoder) {
+        if (_encoder == nullptr) {
             std::cerr << "Opus encoder not initialized.\n";
             output.clear();
             return false;

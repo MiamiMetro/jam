@@ -56,7 +56,7 @@ class opus_decoder_wrapper {
     }
 
     void destroy() {
-        if (_decoder) {
+        if (_decoder != nullptr) {
             opus_decoder_destroy(_decoder);
             _decoder = nullptr;
         }
@@ -65,7 +65,7 @@ class opus_decoder_wrapper {
     }
 
     bool decode(const unsigned char *input, int input_size, int frame_size, std::vector<float> &output) {
-        if (!_decoder) {
+        if (_decoder == nullptr) {
             std::cerr << "Opus decoder not initialized.\n";
             output.clear();
             return false;
@@ -86,7 +86,7 @@ class opus_decoder_wrapper {
 
     // Decode with Packet Loss Concealment (when packet is lost)
     bool decode_plc(int frame_size, std::vector<float> &output) {
-        if (!_decoder) {
+        if (_decoder == nullptr) {
             std::cerr << "Opus decoder not initialized.\n";
             output.clear();
             return false;
