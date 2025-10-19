@@ -160,35 +160,81 @@ class client {
 
   public:
     client(asio::io_context &io, const std::string &server_address, short server_port)
-        : _socket(io, udp::endpoint(udp::v4(), 0)), _ping_timer(io, 100ms, [this]() { _ping_timer_callback(); }),
+        : _io_context(io), _socket(io, udp::endpoint(udp::v4(), 0)),
+          _ping_timer(io, 100ms, [this]() { _ping_timer_callback(); }),
           _alive_timer(io, 5s, [this]() { _alive_timer_callback(); }), _jitter_buffer_ready(false),
-          _jitter_buffer_min_packets(4), _jitter_buffer_target_packets(6), _jitter_buffer_max_packets(12) {
+          _jitter_buffer_min_packets(4), _jitter_buffer_target_packets(6), _jitter_buffer_max_packets(12),
+          _is_connected(false), _echo_enabled(false) {
 
         std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
 
+        std::cout << "\n=== Available Audio Devices ===\n";
+        _audio.list_devices();
+
+        // Start audio stream
+        start_audio_stream(17, 15, 120);
+
+        // Connect to server
+        start_connection(server_address, server_port);
+    }
+
+    // Start connection to server (or switch to new server)
+    void start_connection(const std::string &server_address, short server_port) {
+        std::cout << "\n🔌 Connecting to " << server_address << ":" << server_port << "...\n";
+
         // Resolve hostname or IP address
-        udp::resolver resolver(io);
+        udp::resolver resolver(_io_context);
         udp::resolver::results_type endpoints =
             resolver.resolve(udp::v4(), server_address, std::to_string(server_port));
         _server_endpoint = *endpoints.begin();
 
-        std::cout << "Connecting to: " << _server_endpoint.address().to_string() << ":" << _server_endpoint.port()
+        std::cout << "Resolved to: " << _server_endpoint.address().to_string() << ":" << _server_endpoint.port()
                   << "\n";
 
+        // Send JOIN message
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type = CtrlHdr::Cmd::JOIN;
         std::memcpy(_ctrl_tx_buf.data(), &chdr, sizeof(CtrlHdr));
         send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
 
-        std::cout << "\n=== Available Audio Devices ===\n";
-        _audio.list_devices();
-
-        _audio.start_audio_stream(18, 15, 120, audio_callback, this);
-        _audio.print_latency_info();
-
+        _is_connected.store(true, std::memory_order_relaxed);
         do_receive();
+
+        std::cout << "✅ Connected and receiving!\n";
     }
+
+    // Stop connection (stops sending/receiving UDP packets)
+    void stop_connection() {
+        std::cout << "\n🔌 Disconnecting from server...\n";
+
+        _is_connected.store(false, std::memory_order_relaxed);
+
+        // Cancel pending async operations
+        _socket.cancel();
+
+        // Clear audio receive queue
+        std::vector<float> temp;
+        while (_audio_recv_queue.try_dequeue(temp)) {
+        }
+        _jitter_buffer_ready = false;
+
+        std::cout << "✅ Disconnected (no longer sending/receiving)\n";
+    }
+
+    // Check if connected to server
+    bool is_connected() const { return _is_connected.load(std::memory_order_relaxed); }
+
+    void start_audio_stream(PaDeviceIndex inputDevice, PaDeviceIndex outputDevice, int framesPerBuffer = 120) {
+        _audio.start_audio_stream(inputDevice, outputDevice, framesPerBuffer, audio_callback, this);
+        _audio.print_latency_info();
+    }
+
+    void stop_audio_stream() { _audio.stop_audio_stream(); }
+
+    void enable_echo(bool enable) { _echo_enabled.store(enable, std::memory_order_relaxed); }
+
+    bool is_echo_enabled() const { return _echo_enabled.load(std::memory_order_relaxed); }
 
     void on_receive(std::error_code ec, std::size_t bytes) {
         if (ec) {
@@ -280,15 +326,69 @@ class client {
     }
 
     void do_receive() {
+        // Only receive if connected
+        if (!_is_connected.load(std::memory_order_relaxed)) {
+            return;
+        }
+
         _socket.async_receive_from(asio::buffer(_recv_buf), _server_endpoint,
                                    [this](std::error_code ec, std::size_t bytes) { on_receive(ec, bytes); });
     }
 
     void send(void *data, std::size_t len) {
+        // Only send if connected
+        if (!_is_connected.load(std::memory_order_relaxed)) {
+            return;
+        }
+
         _socket.async_send_to(asio::buffer(data, len), _server_endpoint, [](std::error_code ec, std::size_t) {
             if (ec)
                 std::cerr << "send error: " << ec.message() << "\n";
         });
+    }
+
+  private:
+    asio::io_context &_io_context;
+    udp::socket _socket;
+    udp::endpoint _server_endpoint;
+
+    std::array<char, 1024> _recv_buf;
+    std::array<unsigned char, 128> _sync_tx_buf;
+    std::array<unsigned char, 128> _ctrl_tx_buf;
+
+    audio_stream _audio;
+    std::vector<float> _stereo_buffer;
+    moodycamel::ConcurrentQueue<std::vector<float>> _audio_recv_queue;
+
+    // Connection state (atomic for thread-safe access from audio callback)
+    std::atomic<bool> _is_connected;
+
+    std::atomic<bool> _echo_enabled;
+
+    // Jitter buffer state
+    std::atomic<bool> _jitter_buffer_ready;
+    std::atomic<size_t> _jitter_buffer_min_packets;    // Adaptive minimum (starts at 4)
+    std::atomic<size_t> _jitter_buffer_target_packets; // Adaptive target (starts at 6)
+    const size_t _jitter_buffer_max_packets;           // Hard max (12 packets = 30ms)
+
+    periodic_timer _ping_timer;
+    void _ping_timer_callback() {
+        static uint32_t seq = 0;
+        SyncHdr shdr{};
+        shdr.magic = PING_MAGIC;
+        shdr.seq = seq++;
+        auto now = std::chrono::steady_clock::now();
+        shdr.t1_client_send = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        std::memcpy(_sync_tx_buf.data(), &shdr, sizeof(SyncHdr));
+        send(_sync_tx_buf.data(), sizeof(SyncHdr));
+    }
+    periodic_timer _alive_timer;
+    void _alive_timer_callback() {
+        CtrlHdr chdr{};
+        chdr.magic = CTRL_MAGIC;
+        chdr.type = CtrlHdr::Cmd::ALIVE;
+        std::memcpy(_ctrl_tx_buf.data(), &chdr, sizeof(CtrlHdr));
+        send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
     }
 
     static int audio_callback(const void *input, void *output, unsigned long frame_count,
@@ -407,14 +507,16 @@ class client {
         }
 
         // 2. Mix in your own live instrument (local monitor)
-        // float self_gain = 1.0f; // Adjust to taste (0.0–1.0)
-        // if (in) {
-        //     for (size_t i = 0; i < frame_count; ++i) {
-        //         float sample = in[i] * self_gain;
-        //         out[i * out_channels + 0] += sample; // Left
-        //         out[i * out_channels + 1] += sample; // Right
-        //     }
-        // }
+        if (cl->is_echo_enabled()) {
+            float self_gain = 1.0f; // Adjust to taste (0.0–1.0)
+            if (in) {
+                for (size_t i = 0; i < frame_count; ++i) {
+                    float sample = in[i] * self_gain;
+                    out[i * out_channels + 0] += sample; // Left
+                    out[i * out_channels + 1] += sample; // Right
+                }
+            }
+        }
 
         // 3. Encode and send to server
         if (in) {
@@ -427,7 +529,7 @@ class client {
                     max_sample = abs_sample;
                 }
             }
-            
+
             // Only encode and send if there's actual audio (not silence)
             if (max_sample > SILENCE_THRESHOLD) {
                 cl->_audio.encode_opus(in, frame_count, encoded_data);
@@ -440,9 +542,9 @@ class client {
                     encode_failures++;
                 }
                 if (encode_count % 400 == 0) {
-                    std::cout << "Client encoded " << encode_count << " packets, "
-                              << encode_failures << " failures, last size: " << encoded_data.size() 
-                              << " bytes, peak: " << max_sample << "\n";
+                    std::cout << "Client encoded " << encode_count << " packets, " << encode_failures
+                              << " failures, last size: " << encoded_data.size() << " bytes, peak: " << max_sample
+                              << "\n";
                 }
 
                 if (!encoded_data.empty()) {
@@ -469,44 +571,6 @@ class client {
         }
 
         return paContinue;
-    }
-
-  private:
-    udp::socket _socket;
-    udp::endpoint _server_endpoint;
-
-    std::array<char, 1024> _recv_buf;
-    std::array<unsigned char, 128> _sync_tx_buf;
-    std::array<unsigned char, 128> _ctrl_tx_buf;
-
-    audio_stream _audio;
-    std::vector<float> _stereo_buffer;
-    moodycamel::ConcurrentQueue<std::vector<float>> _audio_recv_queue;
-
-    // Jitter buffer state
-    std::atomic<bool> _jitter_buffer_ready;
-    std::atomic<size_t> _jitter_buffer_min_packets;    // Adaptive minimum (starts at 4)
-    std::atomic<size_t> _jitter_buffer_target_packets; // Adaptive target (starts at 6)
-    const size_t _jitter_buffer_max_packets;           // Hard max (12 packets = 30ms)
-
-    periodic_timer _ping_timer;
-    void _ping_timer_callback() {
-        static uint32_t seq = 0;
-        SyncHdr shdr{};
-        shdr.magic = PING_MAGIC;
-        shdr.seq = seq++;
-        auto now = std::chrono::steady_clock::now();
-        shdr.t1_client_send = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-        std::memcpy(_sync_tx_buf.data(), &shdr, sizeof(SyncHdr));
-        send(_sync_tx_buf.data(), sizeof(SyncHdr));
-    }
-    periodic_timer _alive_timer;
-    void _alive_timer_callback() {
-        CtrlHdr chdr{};
-        chdr.magic = CTRL_MAGIC;
-        chdr.type = CtrlHdr::Cmd::ALIVE;
-        std::memcpy(_ctrl_tx_buf.data(), &chdr, sizeof(CtrlHdr));
-        send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
     }
 };
 
