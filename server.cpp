@@ -243,7 +243,7 @@ class server {
                 // Check queue depth
                 size_t queue_depth = source_client.audio_queue.size_approx();
                 
-                if (queue_depth >= 2 && source_client.audio_queue.try_dequeue(client_packet)) {
+                if (queue_depth >= 1 && source_client.audio_queue.try_dequeue(client_packet)) {
                     // Decode Opus mono → PCM float using this client's decoder
                     decoded_mono.clear();
                     bool decode_ok = source_client.decoder.decode(client_packet.data(), client_packet.size(), 
@@ -258,19 +258,6 @@ class server {
                         if (++mismatch_count % 100 == 0) {
                             std::cerr << "Server: Decoded " << decoded_mono.size() 
                                      << " samples, expected " << FRAME_SIZE << "\n";
-                        }
-                    }
-                } else if (queue_depth == 1) {
-                    // Only 1 packet left - use PLC to smooth timing jitter (not silence)
-                    static int plc_count = 0;
-                    decoded_mono.clear();
-                    bool plc_ok = source_client.decoder.decode_plc(FRAME_SIZE, decoded_mono);
-                    
-                    if (plc_ok && decoded_mono.size() == FRAME_SIZE) {
-                        decoded_sources.push_back(decoded_mono);
-                        sources_mixed++;
-                        if (++plc_count % 100 == 0) {
-                            std::cout << "PLC: Used " << plc_count << " times (queue_depth=1)\n";
                         }
                     }
                 }
