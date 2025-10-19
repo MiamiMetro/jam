@@ -6,17 +6,16 @@
 #include <concurrentqueue.h>
 #include <cstdint>
 #include <cstring>
-#include <functional>
 #include <iostream>
+#include <ixwebsocket/IXWebSocketServer.h>
+#include <nlohmann/json.hpp>
 #include <opus.h>
 #include <portaudio.h>
-#include <thread>
 
 #include "opus_decoder.hpp"
 #include "opus_encoder.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
-#include "tcp_control_server.hpp"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -204,7 +203,7 @@ class client {
         : _io_context(io_context), _socket(io_context, udp::endpoint(udp::v4(), 0)),
           _ping_timer(io_context, 100ms, [this]() { _ping_timer_callback(); }),
           _alive_timer(io_context, 5s, [this]() { _alive_timer_callback(); }), _jitter_buffer_ready(false),
-          _jitter_buffer_min_packets(4), _jitter_buffer_target_packets(6), _jitter_buffer_max_packets(12),
+          _jitter_buffer_min_packets(4), _jitter_buffer_target_packets(6), _jitter_buffer_max_packets(16),
           _is_connected(false), _echo_enabled(false) {
 
         std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
@@ -670,78 +669,42 @@ int main() {
     try {
         asio::io_context io_context;
         client client_instance(io_context, "127.0.0.1", 9999);
-        // client_instance.start_connection("127.0.0.1", 9999);
-        // client_instance.start_audio_stream(15, 17, 120);
 
-        // Create TCP server on a separate thread with its own io_context
-        std::thread tcp_server_thread([&]() {
-            try {
-                asio::io_context tcp_io_context;
-                tcp_control_server server(tcp_io_context, 9969);
-                server.add_endpoint("GET", "/join",
-                                    [&client_instance, &io_context](const std::string &method, const std::string &path,
-                                                                    const std::string &body) {
-                                        // Post audio operations to the main thread's io_context
-                                        asio::post(io_context, [&client_instance]() {
-                                            client_instance.start_connection("127.0.0.1", 9999);
-                                            client_instance.start_audio_stream(17, 15, 120);
-                                            client_instance.enable_echo(true);
-                                        });
-
-                                        return tcp_control_server::http_response(
-                                            tcp_control_server::HTTP_OK, "OK",
-                                            "Audio connection started. Echo enabled. Try speaking!");
-                                    });
-
-                server.add_endpoint("GET", "/exit",
-                                    [&client_instance, &io_context](const std::string &method, const std::string &path,
-                                                                    const std::string &body) {
-                                        // Post audio operations to the main thread's io_context
-                                        asio::post(io_context, [&client_instance]() {
-                                            client_instance.stop_connection();
-                                            client_instance.stop_audio_stream();
-                                            client_instance.enable_echo(false);
-                                        });
-
-                                        return tcp_control_server::http_response(tcp_control_server::HTTP_OK, "OK",
-                                                                                 "Audio connection stopped.");
-                                    });
-                server.add_endpoint(
-                    "GET", "/devices", [](const std::string &method, const std::string &path, const std::string &body) {
-                        return tcp_control_server::http_response(tcp_control_server::HTTP_OK, "OK",
-                                                                 audio_stream::get_devices_json(), "application/json");
-                    });
-                server.add_endpoint("GET", "/devices/mme",
-                                    [](const std::string &method, const std::string &path, const std::string &body) {
-                                        return tcp_control_server::http_response(tcp_control_server::HTTP_OK, "OK",
-                                                                                 audio_stream::get_devices_json("MME"),
-                                                                                 "application/json");
-                                    });
-                server.add_endpoint("GET", "/devices/wasapi",
-                                    [](const std::string &method, const std::string &path, const std::string &body) {
-                                        return tcp_control_server::http_response(
-                                            tcp_control_server::HTTP_OK, "OK",
-                                            audio_stream::get_devices_json("Windows WASAPI"), "application/json");
-                                    });
-                server.add_endpoint("GET", "/devices/directsound",
-                                    [](const std::string &method, const std::string &path, const std::string &body) {
-                                        return tcp_control_server::http_response(
-                                            tcp_control_server::HTTP_OK, "OK",
-                                            audio_stream::get_devices_json("Windows DirectSound"), "application/json");
-                                    });
-                tcp_io_context.run();
-            } catch (std::exception &e) {
-                std::cerr << "TCP Server ERR: " << e.what() << "\n";
+        ix::WebSocketServer webSocketServer(9969);
+        webSocketServer.setOnClientMessageCallback([](const std::shared_ptr<ix::ConnectionState> &connectionState,
+                                                      ix::WebSocket &webSocket,
+                                                      const ix::WebSocketMessagePtr &message) {
+            std::cout << "WebSocket connection from " << connectionState->getRemoteIp() << ":"
+                      << connectionState->getRemotePort() << '\n';
+            std::cout << "Received message: " << message->str << '\n';
+            // devices list request
+            if (message->type == ix::WebSocketMessageType::Message) {
+                try {
+                    auto json_msg = nlohmann::json::parse(message->str);
+                    if (json_msg.contains("command") && json_msg["command"] == "get_devices") {
+                        std::string hostApi;
+                        if (json_msg.contains("host_api")) {
+                            hostApi = json_msg["host_api"].get<std::string>();
+                        }
+                        std::string devices_json = audio_stream::get_devices_json(hostApi);
+                        nlohmann::json response;
+                        response["devices"] = nlohmann::json::parse(devices_json);
+                        webSocket.sendText(response.dump());
+                    }
+                } catch (std::exception &e) {
+                    std::cerr << "WebSocket message parse error: " << e.what() << "\n";
+                }
             }
         });
 
-        // Run the main UDP client on the main thread
-        io_context.run();
-
-        // Wait for TCP server thread to finish
-        if (tcp_server_thread.joinable()) {
-            tcp_server_thread.join();
+        auto res = webSocketServer.listen();
+        if (!res.first) {
+            std::cerr << "WS listen failed: " << res.second << '\n';
+            return 1;
         }
+        webSocketServer.start(); // launches its own threads
+
+        io_context.run();
     } catch (std::exception &e) {
         std::cerr << "ERR: " << e.what() << "\n";
     }
