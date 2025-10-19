@@ -28,8 +28,8 @@ class tcp_control_server {
         std::function<http_response(const std::string &method, const std::string &path, const std::string &body)>;
 
     tcp_control_server(asio::io_context &io_context, short port)
-        : acceptor_(io_context, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)) {
-        std::cout << "TCP Server listening on port " << port << "\n";
+        : acceptor_(io_context, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), port)) {
+        std::cout << "TCP Server listening on localhost (127.0.0.1) port " << port << "\n";
 
         // Add default endpoints
         add_endpoint("GET", "/", [](const std::string &, const std::string &, const std::string &) {
