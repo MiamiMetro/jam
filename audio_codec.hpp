@@ -69,6 +69,9 @@ class audio_codec {
                   << " bps, complexity=" << complexity << "\n";
     }
 
+    bool is_decoder_initialized() const { return _decoder != nullptr; }
+    bool is_encoder_initialized() const { return _encoder != nullptr; }
+
     void destroy_codec() {
         if (_encoder) {
             opus_encoder_destroy(_encoder);
