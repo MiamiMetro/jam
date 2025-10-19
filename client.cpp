@@ -10,7 +10,8 @@
 #include <portaudio.h>
 #include <unordered_map>
 
-#include "audio_codec.hpp"
+#include "opus_decoder.hpp"
+#include "opus_encoder.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
 
@@ -109,9 +110,10 @@ class audio_stream {
         // Decoder receives stereo from server, Encoder sends mono to server
         // Use 256 kbps for near-transparent music quality (mono: ~80 bytes per 2.5ms packet)
         // Complexity 5 balances quality vs performance
-        std::cout << "Creating codec with 256kbps bitrate, complexity 5\n";
-        _audio_codec.create_codec(static_cast<int>(inputInfo->defaultSampleRate), _output_channel_count,
-                                  _input_channel_count, OPUS_APPLICATION_AUDIO, 256000, 5);
+        std::cout << "Creating client encoder (mono) and decoder (stereo) with 256kbps bitrate, complexity 5\n";
+        _encoder.create(static_cast<int>(inputInfo->defaultSampleRate), _input_channel_count, OPUS_APPLICATION_AUDIO,
+                        256000, 5);
+        _decoder.create(static_cast<int>(inputInfo->defaultSampleRate), _output_channel_count);
     }
 
     void stop_audio_stream() {
@@ -120,7 +122,8 @@ class audio_stream {
             Pa_CloseStream(_stream);
             _stream = nullptr;
         }
-        _audio_codec.destroy_codec();
+        _encoder.destroy();
+        _decoder.destroy();
     }
 
     void print_latency_info() {
@@ -133,12 +136,12 @@ class audio_stream {
     }
 
     void encode_opus(const float *input, int frameSize, std::vector<unsigned char> &output) {
-        _audio_codec.encode_opus(input, frameSize, output);
+        _encoder.encode(input, frameSize, output);
     }
 
     void decode_opus(const unsigned char *input, int inputSize, int frameSize, int channelCount,
                      std::vector<float> &output) {
-        _audio_codec.decode_opus(input, inputSize, frameSize, channelCount, output);
+        _decoder.decode(input, inputSize, frameSize, output);
     }
 
     int get_input_channel_count() const { return _input_channel_count; }
@@ -146,7 +149,8 @@ class audio_stream {
 
   private:
     PaStream *_stream = nullptr;
-    audio_codec _audio_codec;
+    opus_encoder_wrapper _encoder;
+    opus_decoder_wrapper _decoder;
 
     int _input_channel_count;
     int _output_channel_count;
@@ -177,8 +181,10 @@ class client {
         std::memcpy(_ctrl_tx_buf.data(), &chdr, sizeof(CtrlHdr));
         send(_ctrl_tx_buf.data(), sizeof(CtrlHdr));
 
-        // _audio.list_devices();
-        _audio.start_audio_stream(17, 15, 120, audio_callback, this);
+        std::cout << "\n=== Available Audio Devices ===\n";
+        _audio.list_devices();
+
+        _audio.start_audio_stream(18, 15, 120, audio_callback, this);
         _audio.print_latency_info();
 
         do_receive();
@@ -231,15 +237,27 @@ class client {
                 if (encoded_bytes > 0) {
                     // Decode the received Opus data
                     _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_output_channel_count(), decodedData);
+
+                    // Diagnostic: Check decoded size periodically
+                    static int decode_count = 0;
+                    static int size_errors = 0;
+                    if (++decode_count % 400 == 0) {
+                        std::cout << "Client decoded " << decode_count << " packets, " << decodedData.size()
+                                  << " samples (expected " << (120 * _audio.get_output_channel_count()) << "), "
+                                  << size_errors << " size errors\n";
+                    }
+                    if (decodedData.size() != 120 * _audio.get_output_channel_count()) {
+                        size_errors++;
+                    }
                 }
                 if (!decodedData.empty()) {
                     // Add to jitter buffer queue
                     size_t queue_size = _audio_recv_queue.size_approx();
-                    
+
                     // Drop packet if queue is too full (prevent unbounded latency)
                     if (queue_size < 16) {
                         _audio_recv_queue.enqueue(std::move(decodedData));
-                        
+
                         // Mark buffer as ready once we have enough packets
                         if (!_jitter_buffer_ready && queue_size >= _jitter_buffer_min_packets) {
                             _jitter_buffer_ready = true;
@@ -299,16 +317,28 @@ class client {
         size_t queue_size = cl->_audio_recv_queue.size_approx();
         size_t current_min = cl->_jitter_buffer_min_packets.load();
         size_t current_target = cl->_jitter_buffer_target_packets.load();
-        
+
         // Jitter buffer logic: only play if buffer is ready
         if (cl->_jitter_buffer_ready && cl->_audio_recv_queue.try_dequeue(decoded_data)) {
-            std::memcpy(out, decoded_data.data(), bytes_to_copy);
+            // Validate decoded data size matches expected output
+            size_t expected_samples = frame_count * out_channels;
+            if (decoded_data.size() == expected_samples) {
+                std::memcpy(out, decoded_data.data(), bytes_to_copy);
+            } else {
+                // Size mismatch - zero output and log warning
+                std::memset(out, 0, bytes_to_copy);
+                static int mismatch_count = 0;
+                if (++mismatch_count % 100 == 0) {
+                    std::cerr << "Client: Decoded size mismatch: got " << decoded_data.size() << " samples, expected "
+                              << expected_samples << "\n";
+                }
+            }
             playback_count++;
-            
+
             // === ADAPTIVE BUFFER SIZE ADJUSTMENT ===
             auto now = std::chrono::steady_clock::now();
             auto time_since_adapt = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_adaptation);
-            
+
             // Only adapt every 1 second to avoid oscillation
             if (time_since_adapt.count() >= 1000) {
                 // Track buffer health
@@ -323,15 +353,15 @@ class client {
                     consecutive_low_buffer = std::max(0, consecutive_low_buffer - 1);
                     consecutive_high_buffer = std::max(0, consecutive_high_buffer - 1);
                 }
-                
+
                 // Increase buffer if consistently low (network jitter detected)
                 if (consecutive_low_buffer >= 3 && current_min < cl->_jitter_buffer_max_packets - 2) {
                     size_t new_min = std::min(current_min + 2, cl->_jitter_buffer_max_packets - 2);
                     size_t new_target = std::min(current_target + 2, cl->_jitter_buffer_max_packets);
                     cl->_jitter_buffer_min_packets.store(new_min);
                     cl->_jitter_buffer_target_packets.store(new_target);
-                    std::cout << "\n📈 Adaptive: Increasing buffer to min=" << new_min 
-                              << ", target=" << new_target << " (high jitter detected)\n";
+                    std::cout << "\n📈 Adaptive: Increasing buffer to min=" << new_min << ", target=" << new_target
+                              << " (high jitter detected)\n";
                     consecutive_low_buffer = 0;
                     last_adaptation = now;
                 }
@@ -341,19 +371,18 @@ class client {
                     size_t new_target = std::max(current_target - 1, size_t(5));
                     cl->_jitter_buffer_min_packets.store(new_min);
                     cl->_jitter_buffer_target_packets.store(new_target);
-                    std::cout << "\n📉 Adaptive: Decreasing buffer to min=" << new_min 
-                              << ", target=" << new_target << " (stable network)\n";
+                    std::cout << "\n📉 Adaptive: Decreasing buffer to min=" << new_min << ", target=" << new_target
+                              << " (stable network)\n";
                     consecutive_high_buffer = 0;
                     last_adaptation = now;
                 }
             }
-            
+
             // Warn if buffer is critically low
             if (queue_size < current_min - 1) {
                 underrun_count++;
                 if (underrun_count % 200 == 0) {
-                    std::cout << "\n⚠️  Jitter buffer low (" << queue_size << "/" << current_min 
-                              << " packets)\n";
+                    std::cout << "\n⚠️  Jitter buffer low (" << queue_size << "/" << current_min << " packets)\n";
                 }
             } else {
                 underrun_count = 0;
@@ -362,12 +391,12 @@ class client {
             // Buffer not ready or underrun - play silence
             std::memset(out, 0, bytes_to_copy);
             underrun_count++;
-            
+
             // Print underrun stats periodically
             if (!cl->_jitter_buffer_ready && underrun_count % 100 == 0) {
                 std::cout << "\nBuffering... (" << queue_size << "/" << current_min << " packets)\n";
             }
-            
+
             // Reset buffer ready flag if we've drained completely
             if (cl->_jitter_buffer_ready && queue_size == 0) {
                 cl->_jitter_buffer_ready = false;
@@ -388,13 +417,56 @@ class client {
         // }
 
         // 3. Encode and send to server
-        cl->_audio.encode_opus(in, frame_count, encoded_data);
-        AudioHdr ahdr{};
-        ahdr.magic = AUDIO_MAGIC;
-        ahdr.encoded_bytes = static_cast<uint16_t>(encoded_data.size());
-        std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
-        size_t packetSize = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
-        cl->send(&ahdr, packetSize);
+        if (in) {
+            // Silence detection: Check if input has significant audio
+            static constexpr float SILENCE_THRESHOLD = 0.001f; // -60dB
+            float max_sample = 0.0f;
+            for (unsigned long i = 0; i < frame_count; ++i) {
+                float abs_sample = std::fabs(in[i]);
+                if (abs_sample > max_sample) {
+                    max_sample = abs_sample;
+                }
+            }
+            
+            // Only encode and send if there's actual audio (not silence)
+            if (max_sample > SILENCE_THRESHOLD) {
+                cl->_audio.encode_opus(in, frame_count, encoded_data);
+
+                // Diagnostic: Check encoding success
+                static int encode_count = 0;
+                static int encode_failures = 0;
+                encode_count++;
+                if (encoded_data.empty()) {
+                    encode_failures++;
+                }
+                if (encode_count % 400 == 0) {
+                    std::cout << "Client encoded " << encode_count << " packets, "
+                              << encode_failures << " failures, last size: " << encoded_data.size() 
+                              << " bytes, peak: " << max_sample << "\n";
+                }
+
+                if (!encoded_data.empty()) {
+                    AudioHdr ahdr{};
+                    ahdr.magic = AUDIO_MAGIC;
+                    ahdr.encoded_bytes = static_cast<uint16_t>(encoded_data.size());
+                    std::memcpy(ahdr.buf, encoded_data.data(), std::min(encoded_data.size(), sizeof(ahdr.buf)));
+                    size_t packetSize = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
+                    cl->send(&ahdr, packetSize);
+                }
+            } else {
+                // Silence detected - don't send packet (save bandwidth and prevent glitches)
+                static int silence_count = 0;
+                if (++silence_count % 400 == 0) {
+                    std::cout << "Client: " << silence_count << " silent frames skipped\n";
+                }
+            }
+        } else {
+            // No input - send silence packet periodically to keep connection alive
+            static int no_input_count = 0;
+            if (++no_input_count % 100 == 0) {
+                std::cerr << "Warning: No input audio (in == nullptr)\n";
+            }
+        }
 
         return paContinue;
     }
@@ -413,9 +485,9 @@ class client {
 
     // Jitter buffer state
     std::atomic<bool> _jitter_buffer_ready;
-    std::atomic<size_t> _jitter_buffer_min_packets;      // Adaptive minimum (starts at 4)
-    std::atomic<size_t> _jitter_buffer_target_packets;   // Adaptive target (starts at 6)
-    const size_t _jitter_buffer_max_packets;             // Hard max (12 packets = 30ms)
+    std::atomic<size_t> _jitter_buffer_min_packets;    // Adaptive minimum (starts at 4)
+    std::atomic<size_t> _jitter_buffer_target_packets; // Adaptive target (starts at 6)
+    const size_t _jitter_buffer_max_packets;           // Hard max (12 packets = 30ms)
 
     periodic_timer _ping_timer;
     void _ping_timer_callback() {
