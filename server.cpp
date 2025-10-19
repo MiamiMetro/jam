@@ -125,7 +125,7 @@ class server {
 
                 std::vector<unsigned char> audio_data_vec(audio_data, audio_data + encoded_bytes);
 
-                _clients[_remote_endpoint].audio_queue.enqueue(std::move(audio_data_vec));
+                _clients[_remote_endpoint].push_audio_packet(std::move(audio_data_vec));
             }
         }
 
@@ -161,6 +161,14 @@ class server {
     struct client_info {
         std::chrono::steady_clock::time_point last_alive;
         moodycamel::ConcurrentQueue<std::vector<unsigned char>> audio_queue;
+
+        void push_audio_packet(const std::vector<unsigned char> &packet) {
+            if (audio_queue.size_approx() >= 16) {
+                std::vector<unsigned char> discarded;
+                audio_queue.try_dequeue(discarded); // discard oldest
+            }
+            audio_queue.enqueue(packet);
+        }
     };
 
     std::unordered_map<udp::endpoint, client_info, endpoint_hash> _clients;
