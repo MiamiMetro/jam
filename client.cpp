@@ -144,11 +144,11 @@ class audio_stream {
                   << inputInfo->defaultSampleRate << " Hz\n";
 
         // Decoder receives stereo from server, Encoder sends mono to server
-        // Use 256 kbps for near-transparent music quality (mono: ~80 bytes per 2.5ms packet)
-        // Complexity 5 balances quality vs performance
-        std::cout << "Creating client encoder (mono) and decoder (stereo) with 256kbps bitrate, complexity 5\n";
+        // Use 64 kbps to match Jamulus bandwidth (mono: ~40 bytes per 5ms packet)
+        // Complexity 2 for lower CPU usage like Jamulus
+        std::cout << "Creating client encoder (mono) and decoder (stereo) with 64kbps bitrate, complexity 2\n";
         _encoder.create(static_cast<int>(inputInfo->defaultSampleRate), _input_channel_count, OPUS_APPLICATION_AUDIO,
-                        256000, 5);
+                        64000, 2);
         _decoder.create(static_cast<int>(inputInfo->defaultSampleRate), _output_channel_count);
     }
 
@@ -201,9 +201,9 @@ class client {
   public:
     client(asio::io_context &io_context, const std::string &server_address, short server_port)
         : _io_context(io_context), _socket(io_context, udp::endpoint(udp::v4(), 0)),
-          _ping_timer(io_context, 100ms, [this]() { _ping_timer_callback(); }),
+          _ping_timer(io_context, 500ms, [this]() { _ping_timer_callback(); }),
           _alive_timer(io_context, 5s, [this]() { _alive_timer_callback(); }), _jitter_buffer_ready(false),
-          _jitter_buffer_min_packets(4), _jitter_buffer_target_packets(6), _jitter_buffer_max_packets(16),
+          _jitter_buffer_min_packets(2), _jitter_buffer_target_packets(4), _jitter_buffer_max_packets(16),
           _is_connected(false), _echo_enabled(false) {
 
         std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
@@ -212,7 +212,7 @@ class client {
         audio_stream::list_devices();
 
         // Start audio stream
-        start_audio_stream(17, 15, 120);
+        start_audio_stream(17, 15, 240);
         // Connect to server
         start_connection(server_address, server_port);
     }
@@ -422,17 +422,17 @@ class client {
 
     void _decode_audio_data(const unsigned char *audio_data, uint16_t encoded_bytes, std::vector<float> &decodedData) {
         // Decode the received Opus data
-        _audio.decode_opus(audio_data, encoded_bytes, 120, _audio.get_output_channel_count(), decodedData);
+        _audio.decode_opus(audio_data, encoded_bytes, 240, _audio.get_output_channel_count(), decodedData);
 
         // Diagnostic: Check decoded size periodically
         static int decode_count = 0;
         static int size_errors = 0;
         if (++decode_count % 400 == 0) {
             std::cout << "Client decoded " << decode_count << " packets, " << decodedData.size()
-                      << " samples (expected " << (120 * _audio.get_output_channel_count()) << "), " << size_errors
+                      << " samples (expected " << (240 * _audio.get_output_channel_count()) << "), " << size_errors
                       << " size errors\n";
         }
-        if (decodedData.size() != 120 * _audio.get_output_channel_count()) {
+        if (decodedData.size() != 240 * _audio.get_output_channel_count()) {
             size_errors++;
         }
     }
@@ -556,9 +556,9 @@ class client {
                 state.last_adaptation = now;
             }
             // Decrease buffer if consistently high (stable network, reduce latency)
-            else if (state.consecutive_high_buffer >= 5 && current_min > 3) {
-                size_t new_min = std::max(current_min - 1, size_t(3));
-                size_t new_target = std::max(current_target - 1, size_t(5));
+            else if (state.consecutive_high_buffer >= 5 && current_min > 2) {
+                size_t new_min = std::max(current_min - 1, size_t(2));
+                size_t new_target = std::max(current_target - 1, size_t(3));
                 client_ptr->_jitter_buffer_min_packets.store(new_min);
                 client_ptr->_jitter_buffer_target_packets.store(new_target);
                 std::cout << "\nAdaptive: Decreasing buffer to min=" << new_min << ", target=" << new_target
@@ -702,6 +702,7 @@ int main() {
             std::cerr << "WS listen failed: " << res.second << '\n';
             return 1;
         }
+        webSocketServer.disablePerMessageDeflate();
         webSocketServer.start(); // launches its own threads
 
         io_context.run();

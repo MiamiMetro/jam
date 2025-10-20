@@ -18,13 +18,13 @@ class server {
     server(asio::io_context &io_context, short port)
         : _socket(io_context, udp::endpoint(udp::v4(), port)),
           _alive_check_timer(io_context, 5s, [this]() { _alive_check_timer_callback(); }),
-          _broadcast_timer(io_context, 2500us, [this]() { _broadcast_timer_callback(); }) {
+          _broadcast_timer(io_context, 5000us, [this]() { _broadcast_timer_callback(); }) {
 
         do_receive();
         // Server encoder: sends stereo to clients (2 ch)
-        // Complexity 5 balances quality vs performance (saves ~40% CPU vs complexity 8)
-        std::cout << "Creating server encoder: 2ch (stereo), 48kHz, complexity=5\n";
-        _encoder.create(48000, 2, OPUS_APPLICATION_AUDIO, 256000, 5);
+        // Complexity 2 matches Jamulus for lower CPU usage
+        std::cout << "Creating server encoder: 2ch (stereo), 48kHz, complexity=2\n";
+        _encoder.create(48000, 2, OPUS_APPLICATION_AUDIO, 128000, 2);
     }
 
     ~server() { _socket.close(); }
@@ -102,9 +102,6 @@ class server {
             return;
         }
 
-        std::cout << "CTRL msg from " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port()
-                  << "\n";
-
         CtrlHdr chdr{};
         std::memcpy(&chdr, _recv_buf.data(), sizeof(CtrlHdr));
 
@@ -112,19 +109,24 @@ class server {
 
         switch (chdr.type) {
         case CtrlHdr::Cmd::JOIN:
-            std::cout << "  JOIN\n";
+            std::cout << "Client JOIN: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
             _clients[_remote_endpoint].last_alive = now;
             break;
         case CtrlHdr::Cmd::LEAVE:
-            std::cout << "  LEAVE\n";
+            std::cout << "Client LEAVE: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
             _clients.erase(_remote_endpoint);
             break;
         case CtrlHdr::Cmd::ALIVE:
-            std::cout << "  ALIVE\n";
+            // Reduce ALIVE message frequency - only log every 10th ALIVE message
+            static int alive_count = 0;
+            if (++alive_count % 10 == 0) {
+                std::cout << "ALIVE from " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
+            }
             _clients[_remote_endpoint].last_alive = now;
             break;
         default:
-            std::cout << "  Unknown CTRL cmd: " << static_cast<int>(chdr.type) << "\n";
+            std::cout << "Unknown CTRL cmd: " << static_cast<int>(chdr.type) << " from " 
+                      << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
             break;
         }
     }
@@ -245,7 +247,7 @@ class server {
         }
 
         // Constants for audio processing
-        constexpr int FRAME_SIZE = 120;        // 2.5ms at 48kHz
+        constexpr int FRAME_SIZE = 240;        // 5ms at 48kHz (matches Jamulus)
         constexpr int SAMPLE_RATE = 48000;
         constexpr int INPUT_CHANNELS = 1;      // Clients send mono
         constexpr int OUTPUT_CHANNELS = 2;     // Server sends stereo
@@ -307,9 +309,9 @@ class server {
             }
         }
 
-        // Optional: Print stats periodically
+        // Optional: Print stats periodically (reduced frequency to lower CPU overhead)
         static int callback_count = 0;
-        if (++callback_count % 400 == 0) { // Every second (400 * 2.5ms = 1000ms)
+        if (++callback_count % 2000 == 0) { // Every 10 seconds (2000 * 5ms = 10000ms)
             std::cout << "Broadcast: " << _clients.size() << " clients, " 
                       << active_clients << " active, mix size: " << encoded_mix.size() << " bytes\n";
         }
@@ -327,7 +329,7 @@ int main() {
         asio::io_context io_context;
         server srv(io_context, 9999);
         std::cout << "Echo server listening on 127.0.0.1:9999\n";
-        std::cout << "Broadcast timer running at 2.5ms intervals (48kHz, 120 frames)\n";
+        std::cout << "Broadcast timer running at 5ms intervals (48kHz, 240 frames)\n";
 
         // Just run the io_context - timers handle everything!
         io_context.run();
