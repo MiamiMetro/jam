@@ -109,23 +109,20 @@ class server {
 
         switch (chdr.type) {
         case CtrlHdr::Cmd::JOIN:
-            std::cout << "Client JOIN: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
+            std::cout << "Client JOIN: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port()
+                      << "\n";
             _clients[_remote_endpoint].last_alive = now;
             break;
         case CtrlHdr::Cmd::LEAVE:
-            std::cout << "Client LEAVE: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
+            std::cout << "Client LEAVE: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port()
+                      << "\n";
             _clients.erase(_remote_endpoint);
             break;
         case CtrlHdr::Cmd::ALIVE:
-            // Reduce ALIVE message frequency - only log every 10th ALIVE message
-            static int alive_count = 0;
-            if (++alive_count % 10 == 0) {
-                std::cout << "ALIVE from " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
-            }
             _clients[_remote_endpoint].last_alive = now;
             break;
         default:
-            std::cout << "Unknown CTRL cmd: " << static_cast<int>(chdr.type) << " from " 
+            std::cout << "Unknown CTRL cmd: " << static_cast<int>(chdr.type) << " from "
                       << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
             break;
         }
@@ -221,7 +218,7 @@ class server {
         }
     }
 
-    void _send_audio_to_client(const udp::endpoint& endpoint, const std::vector<unsigned char>& encoded_audio) {
+    void _send_audio_to_client(const udp::endpoint &endpoint, const std::vector<unsigned char> &encoded_audio) {
         if (encoded_audio.empty()) {
             return;
         }
@@ -230,11 +227,11 @@ class server {
         AudioHdr ahdr{};
         ahdr.magic = AUDIO_MAGIC;
         ahdr.encoded_bytes = static_cast<uint16_t>(encoded_audio.size());
-        
+
         // Copy encoded audio data to the header buffer
         size_t copy_size = std::min(encoded_audio.size(), sizeof(ahdr.buf));
         std::memcpy(ahdr.buf, encoded_audio.data(), copy_size);
-        
+
         // Send the packet
         size_t packet_size = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
         send(&ahdr, packet_size, endpoint);
@@ -247,10 +244,10 @@ class server {
         }
 
         // Constants for audio processing
-        constexpr int FRAME_SIZE = 240;        // 5ms at 48kHz (matches Jamulus)
+        constexpr int FRAME_SIZE = 240; // 5ms at 48kHz (matches Jamulus)
         constexpr int SAMPLE_RATE = 48000;
-        constexpr int INPUT_CHANNELS = 1;      // Clients send mono
-        constexpr int OUTPUT_CHANNELS = 2;     // Server sends stereo
+        constexpr int INPUT_CHANNELS = 1;  // Clients send mono
+        constexpr int OUTPUT_CHANNELS = 2; // Server sends stereo
         constexpr int SAMPLES_PER_FRAME = FRAME_SIZE * OUTPUT_CHANNELS;
 
         // Create stereo mix buffer (initialized to silence)
@@ -258,9 +255,9 @@ class server {
         int active_clients = 0;
 
         // Process each client's audio
-        for (auto& [endpoint, client_info] : _clients) {
+        for (auto &[endpoint, client_info] : _clients) {
             std::vector<unsigned char> audio_packet;
-            
+
             // Try to get the latest audio packet from this client
             if (client_info.audio_queue.try_dequeue(audio_packet)) {
                 // Decode the client's mono audio
@@ -295,7 +292,7 @@ class server {
         // Apply gain control to prevent clipping (simple normalization)
         if (active_clients > 0) {
             float gain = 1.0F / static_cast<float>(active_clients);
-            for (float& sample : stereo_mix) {
+            for (float &sample : stereo_mix) {
                 sample *= gain;
             }
         }
@@ -304,7 +301,7 @@ class server {
         std::vector<unsigned char> encoded_mix;
         if (_encoder.encode(stereo_mix.data(), FRAME_SIZE, encoded_mix)) {
             // Broadcast to all clients
-            for (const auto& [endpoint, client_info] : _clients) {
+            for (const auto &[endpoint, client_info] : _clients) {
                 _send_audio_to_client(endpoint, encoded_mix);
             }
         }
@@ -312,8 +309,8 @@ class server {
         // Optional: Print stats periodically (reduced frequency to lower CPU overhead)
         static int callback_count = 0;
         if (++callback_count % 2000 == 0) { // Every 10 seconds (2000 * 5ms = 10000ms)
-            std::cout << "Broadcast: " << _clients.size() << " clients, " 
-                      << active_clients << " active, mix size: " << encoded_mix.size() << " bytes\n";
+            std::cout << "Broadcast: " << _clients.size() << " clients, " << active_clients
+                      << " active, mix size: " << encoded_mix.size() << " bytes\n";
         }
     }
 
