@@ -3,8 +3,8 @@
 #include <asio.hpp>
 #include <chrono>
 #include <functional>
-#include <iostream>
 #include <utility>
+#include "logger.hpp"
 
 class periodic_timer {
   private:
@@ -15,7 +15,7 @@ class periodic_timer {
 
     void on_timeout(std::error_code error_code) {
         if (error_code) {
-            std::cerr << "Timer error: " << error_code.message() << "\n";
+            Log::error("Timer error: {}", error_code.message());
             return;
         }
         _callback();

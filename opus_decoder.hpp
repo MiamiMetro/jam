@@ -1,8 +1,8 @@
 #pragma once
 
-#include <iostream>
 #include <opus.h>
 #include <vector>
+#include "logger.hpp"
 
 class opus_decoder_wrapper {
   private:
@@ -44,14 +44,14 @@ class opus_decoder_wrapper {
         int err;
         _decoder = opus_decoder_create(sample_rate, channels, &err);
         if (err != OPUS_OK) {
-            std::cerr << "Failed to create Opus decoder: " << opus_strerror(err) << "\n";
+            Log::error("Failed to create Opus decoder: {}", opus_strerror(err));
             return false;
         }
 
         _channels = channels;
         _sample_rate = sample_rate;
 
-        std::cout << "Opus decoder created: " << channels << "ch, " << sample_rate << "Hz\n";
+        Log::info("Opus decoder created: {}ch, {}Hz", channels, sample_rate);
         return true;
     }
 
@@ -66,7 +66,7 @@ class opus_decoder_wrapper {
 
     bool decode(const unsigned char *input, int input_size, int frame_size, std::vector<float> &output) {
         if (_decoder == nullptr) {
-            std::cerr << "Opus decoder not initialized.\n";
+            Log::error("Opus decoder not initialized.");
             output.clear();
             return false;
         }
@@ -75,7 +75,7 @@ class opus_decoder_wrapper {
         int decoded_samples_per_channel = opus_decode_float(_decoder, input, input_size, output.data(), frame_size, 0);
         
         if (decoded_samples_per_channel < 0) {
-            std::cerr << "Opus decoding failed: " << opus_strerror(decoded_samples_per_channel) << "\n";
+            Log::error("Opus decoding failed: {}", opus_strerror(decoded_samples_per_channel));
             output.clear();
             return false;
         }
@@ -87,7 +87,7 @@ class opus_decoder_wrapper {
     // Decode with Packet Loss Concealment (when packet is lost)
     bool decode_plc(int frame_size, std::vector<float> &output) {
         if (_decoder == nullptr) {
-            std::cerr << "Opus decoder not initialized.\n";
+            Log::error("Opus decoder not initialized.");
             output.clear();
             return false;
         }
@@ -97,7 +97,7 @@ class opus_decoder_wrapper {
         int decoded_samples_per_channel = opus_decode_float(_decoder, nullptr, 0, output.data(), frame_size, 0);
         
         if (decoded_samples_per_channel < 0) {
-            std::cerr << "Opus PLC decoding failed: " << opus_strerror(decoded_samples_per_channel) << "\n";
+            Log::error("Opus PLC decoding failed: {}", opus_strerror(decoded_samples_per_channel));
             output.clear();
             return false;
         }

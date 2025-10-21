@@ -1,10 +1,10 @@
 #include <array>
 #include <asio.hpp>
 #include <concurrentqueue.h>
-#include <iostream>
 #include <opus.h>
 #include <unordered_map>
 
+#include "logger.hpp"
 #include "opus_decoder.hpp"
 #include "opus_encoder.hpp"
 #include "periodic_timer.hpp"
@@ -23,7 +23,7 @@ class server {
         do_receive();
         // Server encoder: sends stereo to clients (2 ch)
         // Complexity 2 matches Jamulus for lower CPU usage
-        std::cout << "Creating server encoder: 2ch (stereo), 48kHz, complexity=2\n";
+        Log::info("Creating server encoder: 2ch (stereo), 48kHz, complexity=2");
         _encoder.create(48000, 2, OPUS_APPLICATION_AUDIO, 128000, 2);
     }
 
@@ -65,17 +65,17 @@ class server {
     void send(void *data, std::size_t len, const udp::endpoint &target) {
         _socket.async_send_to(asio::buffer(data, len), target, [](std::error_code error_code, std::size_t) {
             if (error_code) {
-                std::cerr << "send error: " << error_code.message() << "\n";
+                Log::error("send error: {}", error_code.message());
             }
         });
     }
 
   private:
     void _handle_receive_error(std::error_code error_code) {
-        std::cerr << "receive error: " << error_code.message() << "\n";
+        Log::error("receive error: {}", error_code.message());
         _clients.erase(_remote_endpoint);
-        std::cout << "Client " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port()
-                  << " removed due to receive error\n";
+        Log::info("Client {}:{} removed due to receive error", 
+                                _remote_endpoint.address().to_string(), _remote_endpoint.port());
         do_receive(); // keep listening
     }
 
@@ -109,21 +109,19 @@ class server {
 
         switch (chdr.type) {
         case CtrlHdr::Cmd::JOIN:
-            std::cout << "Client JOIN: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port()
-                      << "\n";
+            Log::info("Client JOIN: {}:{}", _remote_endpoint.address().to_string(), _remote_endpoint.port());
             _clients[_remote_endpoint].last_alive = now;
             break;
         case CtrlHdr::Cmd::LEAVE:
-            std::cout << "Client LEAVE: " << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port()
-                      << "\n";
+            Log::info("Client LEAVE: {}:{}", _remote_endpoint.address().to_string(), _remote_endpoint.port());
             _clients.erase(_remote_endpoint);
             break;
         case CtrlHdr::Cmd::ALIVE:
             _clients[_remote_endpoint].last_alive = now;
             break;
         default:
-            std::cout << "Unknown CTRL cmd: " << static_cast<int>(chdr.type) << " from "
-                      << _remote_endpoint.address().to_string() << ":" << _remote_endpoint.port() << "\n";
+            Log::warn("Unknown CTRL cmd: {} from {}:{}", static_cast<int>(chdr.type),
+                                    _remote_endpoint.address().to_string(), _remote_endpoint.port());
             break;
         }
     }
@@ -150,7 +148,7 @@ class server {
         // Verify we received all the data
         size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
         if (bytes < expected_size) {
-            std::cerr << "Incomplete audio packet: got " << bytes << ", expected " << expected_size << "\n";
+            Log::error("Incomplete audio packet: got {}, expected {}", bytes, expected_size);
             do_receive();
             return;
         }
@@ -210,7 +208,7 @@ class server {
         auto now = std::chrono::steady_clock::now();
         for (auto it = _clients.begin(); it != _clients.end();) {
             if (now - it->second.last_alive > 15s) {
-                std::cout << "Client " << it->first.address().to_string() << ":" << it->first.port() << " timed out\n";
+                Log::info("Client {}:{} timed out", it->first.address().to_string(), it->first.port());
                 it = _clients.erase(it);
             } else {
                 ++it;
@@ -309,8 +307,8 @@ class server {
         // Optional: Print stats periodically (reduced frequency to lower CPU overhead)
         static int callback_count = 0;
         if (++callback_count % 2000 == 0) { // Every 10 seconds (2000 * 5ms = 10000ms)
-            std::cout << "Broadcast: " << _clients.size() << " clients, " << active_clients
-                      << " active, mix size: " << encoded_mix.size() << " bytes\n";
+            Log::info("Broadcast: {} clients, {} active, mix size: {} bytes", 
+                                    _clients.size(), active_clients, encoded_mix.size());
         }
     }
 
@@ -323,14 +321,17 @@ class server {
 
 int main() {
     try {
+        auto &log = logger::instance();
+        log.init(true, true, false, "server.log", spdlog::level::info);
+        
         asio::io_context io_context;
         server srv(io_context, 9999);
-        std::cout << "Echo server listening on 127.0.0.1:9999\n";
-        std::cout << "Broadcast timer running at 5ms intervals (48kHz, 240 frames)\n";
+        log.info("Echo server listening on 127.0.0.1:9999");
+        log.info("Broadcast timer running at 5ms intervals (48kHz, 240 frames)");
 
         // Just run the io_context - timers handle everything!
         io_context.run();
     } catch (std::exception &e) {
-        std::cerr << "ERR: " << e.what() << "\n";
+        Log::error("ERR: {}", e.what());
     }
 }

@@ -59,7 +59,15 @@ FetchContent_Declare(
   GIT_TAG        v3.12.0
 )
 
-FetchContent_MakeAvailable(asio portaudio opus concurrentqueue ixwebsocket json)
+FetchContent_Declare(
+  spdlog
+  GIT_REPOSITORY https://github.com/gabime/spdlog.git
+  GIT_TAG        v1.16.0
+)
+
+set(SPDLOG_USE_STD_FORMAT ON CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(asio portaudio opus concurrentqueue ixwebsocket json spdlog)
 
 # --- Targets ---
 add_executable(server server.cpp)
@@ -68,8 +76,9 @@ target_include_directories(server PRIVATE
   ${portaudio_SOURCE_DIR}/include
   ${opus_SOURCE_DIR}/include
   ${concurrentqueue_SOURCE_DIR}/include
+  ${spdlog_SOURCE_DIR}/include
 )
-target_link_libraries(server PRIVATE portaudio opus concurrentqueue)
+target_link_libraries(server PRIVATE portaudio opus concurrentqueue spdlog::spdlog)
 
 add_executable(client client.cpp)
 target_include_directories(client PRIVATE
@@ -79,5 +88,6 @@ target_include_directories(client PRIVATE
   ${concurrentqueue_SOURCE_DIR}/include
   ${ixwebsocket_SOURCE_DIR}/include
   ${json_SOURCE_DIR}/include
+  ${spdlog_SOURCE_DIR}/include
 )
-target_link_libraries(client PRIVATE portaudio opus concurrentqueue ixwebsocket nlohmann_json::nlohmann_json)
+target_link_libraries(client PRIVATE portaudio opus concurrentqueue ixwebsocket nlohmann_json::nlohmann_json spdlog::spdlog)

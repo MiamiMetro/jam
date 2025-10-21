@@ -1,8 +1,8 @@
 #pragma once
 
-#include <iostream>
 #include <opus.h>
 #include <vector>
+#include "logger.hpp"
 
 class opus_encoder_wrapper {
   private:
@@ -45,7 +45,7 @@ class opus_encoder_wrapper {
         int err;
         _encoder = opus_encoder_create(sample_rate, channels, application, &err);
         if (err != OPUS_OK) {
-            std::cerr << "Failed to create Opus encoder: " << opus_strerror(err) << "\n";
+            Log::error("Failed to create Opus encoder: {}", opus_strerror(err));
             return false;
         }
 
@@ -65,8 +65,8 @@ class opus_encoder_wrapper {
         // Verify settings
         int32_t actual_bitrate;
         opus_encoder_ctl(_encoder, OPUS_GET_BITRATE(&actual_bitrate));
-        std::cout << "Opus encoder created: " << channels << "ch, " << sample_rate << "Hz, target=" << bitrate
-                  << "bps, actual=" << actual_bitrate << "bps, complexity=" << complexity << "\n";
+        Log::info("Opus encoder created: {}ch, {}Hz, target={}bps, actual={}bps, complexity={}", 
+                                channels, sample_rate, bitrate, actual_bitrate, complexity);
 
         return true;
     }
@@ -82,7 +82,7 @@ class opus_encoder_wrapper {
 
     bool encode(const float *input, int frame_size, std::vector<unsigned char> &output) {
         if (_encoder == nullptr) {
-            std::cerr << "Opus encoder not initialized.\n";
+            Log::error("Opus encoder not initialized.");
             output.clear();
             return false;
         }
@@ -91,7 +91,7 @@ class opus_encoder_wrapper {
         int encoded_bytes = opus_encode_float(_encoder, input, frame_size, output.data(), output.size());
         
         if (encoded_bytes < 0) {
-            std::cerr << "Opus encoding failed: " << opus_strerror(encoded_bytes) << "\n";
+            Log::error("Opus encoding failed: {}", opus_strerror(encoded_bytes));
             output.clear();
             return false;
         }

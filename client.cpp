@@ -6,198 +6,20 @@
 #include <concurrentqueue.h>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
-#include <ixwebsocket/IXWebSocketServer.h>
 #include <nlohmann/json.hpp>
 #include <opus.h>
 #include <portaudio.h>
 
-#include "opus_decoder.hpp"
-#include "opus_encoder.hpp"
+#include "audio_stream.hpp"
+#include "logger.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
-
-class audio_stream {
-  public:
-    audio_stream() { Pa_Initialize(); }
-
-    ~audio_stream() {
-        if (_stream != nullptr) {
-            Pa_StopStream(_stream);
-            Pa_CloseStream(_stream);
-        }
-
-        Pa_Terminate();
-    }
-
-    static void list_devices() {
-        int numDevices = Pa_GetDeviceCount();
-        if (numDevices < 0) {
-            std::cerr << "ERROR: Pa_GetDeviceCount returned " << numDevices << "\n";
-            return;
-        }
-
-        for (int i = 0; i < numDevices; ++i) {
-            const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(i);
-            if (deviceInfo == nullptr) {
-                continue;
-            }
-            const PaHostApiInfo *hostApiInfo = Pa_GetHostApiInfo(deviceInfo->hostApi);
-            // device index: api - name (in: maxInputChannels, out: maxOutputChannels, defaultSR)
-            std::cout << i << ": " << ((hostApiInfo != nullptr) ? hostApiInfo->name : "Unknown API") << " - "
-                      << deviceInfo->name << " (in: " << deviceInfo->maxInputChannels
-                      << ", out: " << deviceInfo->maxOutputChannels << ", defaultSR: " << deviceInfo->defaultSampleRate
-                      << ")\n";
-        }
-    }
-
-    static std::string get_devices_json(const std::string &hostApiName = "") {
-        std::string json = "[";
-        int numDevices = Pa_GetDeviceCount();
-        bool first = true;
-        for (int i = 0; i < numDevices; ++i) {
-            const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(i);
-            if (deviceInfo == nullptr) {
-                continue;
-            }
-            const PaHostApiInfo *hostApiInfo = Pa_GetHostApiInfo(deviceInfo->hostApi);
-            std::string apiName = (hostApiInfo != nullptr) ? hostApiInfo->name : "Unknown API";
-            if (!hostApiName.empty() && apiName != hostApiName) {
-                continue;
-            }
-            if (!first) {
-                json += ",";
-            }
-            first = false;
-            json += R"({"index": )" + std::to_string(i) + R"(, "name": ")" + deviceInfo->name +
-                    R"(", "maxInputChannels": )" + std::to_string(deviceInfo->maxInputChannels) +
-                    R"(, "maxOutputChannels": )" + std::to_string(deviceInfo->maxOutputChannels) +
-                    R"(, "defaultSampleRate": )" + std::to_string(deviceInfo->defaultSampleRate) + R"(, "hostApi": ")" +
-                    apiName + R"("})";
-        }
-        json += "]";
-        return json;
-    }
-
-    static const PaDeviceInfo *get_device_info(int deviceIndex) {
-        const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(deviceIndex);
-        if (deviceInfo == nullptr) {
-            std::cerr << "Invalid device index: " << deviceIndex << "\n";
-            return nullptr;
-        }
-        return deviceInfo;
-    }
-
-    static void print_device_info(const PaDeviceInfo *inputInfo, const PaDeviceInfo *outputInfo) {
-        std::cout << "Input Device: " << inputInfo->name << " | API: "
-                  << ((Pa_GetHostApiInfo(inputInfo->hostApi) != nullptr) ? Pa_GetHostApiInfo(inputInfo->hostApi)->name
-                                                                         : "Unknown")
-                  << " | Max Input Channels: " << inputInfo->maxInputChannels
-                  << " | Default Sample Rate: " << inputInfo->defaultSampleRate << "\n";
-        std::cout << "Output Device: " << outputInfo->name << " | API: "
-                  << ((Pa_GetHostApiInfo(outputInfo->hostApi) != nullptr) ? Pa_GetHostApiInfo(outputInfo->hostApi)->name
-                                                                          : "Unknown")
-                  << " | Max Output Channels: " << outputInfo->maxOutputChannels
-                  << " | Default Sample Rate: " << outputInfo->defaultSampleRate << "\n";
-    }
-
-    void start_audio_stream(PaDeviceIndex inputDevice, PaDeviceIndex outputDevice, int framesPerBuffer = 120,
-                            PaStreamCallback *callback = nullptr, void *userData = nullptr) {
-        // Opus requires specific frame sizes: 120, 240, 480, 960, 1920, or 2880 frames
-        const auto *inputInfo = get_device_info(inputDevice);
-        const auto *outputInfo = get_device_info(outputDevice);
-        if (inputInfo == nullptr || outputInfo == nullptr) {
-            std::cerr << "Invalid input or output device.\n";
-            return;
-        }
-
-        PaStreamParameters inputParameters = {inputDevice, std::min(inputInfo->maxInputChannels, 1), paFloat32,
-                                              inputInfo->defaultLowInputLatency, nullptr};
-
-        PaStreamParameters outputParameters = {outputDevice, std::min(outputInfo->maxOutputChannels, 2), paFloat32,
-                                               outputInfo->defaultLowOutputLatency, nullptr};
-
-        _input_channel_count = inputParameters.channelCount;
-        _output_channel_count = outputParameters.channelCount;
-
-        print_device_info(inputInfo, outputInfo);
-        std::cout << "Frames per buffer: " << framesPerBuffer << "\n";
-
-        PaError err = Pa_OpenStream(&_stream, &inputParameters, &outputParameters, inputInfo->defaultSampleRate,
-                                    framesPerBuffer, paNoFlag, callback, userData);
-        if (err != paNoError) {
-            std::cerr << "Pa_OpenStream failed: " << Pa_GetErrorText(err) << "\n";
-            _stream = nullptr;
-            return;
-        }
-        err = Pa_StartStream(_stream);
-        if (err != paNoError) {
-            std::cerr << "Pa_StartStream failed: " << Pa_GetErrorText(err) << "\n";
-        } else {
-            _stream_active.store(true, std::memory_order_relaxed);
-        }
-
-        std::cout << _input_channel_count << " input channel(s), " << _output_channel_count << " output channel(s) at "
-                  << inputInfo->defaultSampleRate << " Hz\n";
-
-        // Decoder receives stereo from server, Encoder sends mono to server
-        // Use 64 kbps to match Jamulus bandwidth (mono: ~40 bytes per 5ms packet)
-        // Complexity 2 for lower CPU usage like Jamulus
-        std::cout << "Creating client encoder (mono) and decoder (stereo) with 64kbps bitrate, complexity 2\n";
-        _encoder.create(static_cast<int>(inputInfo->defaultSampleRate), _input_channel_count, OPUS_APPLICATION_AUDIO,
-                        64000, 2);
-        _decoder.create(static_cast<int>(inputInfo->defaultSampleRate), _output_channel_count);
-    }
-
-    void stop_audio_stream() {
-        _stream_active.store(false, std::memory_order_relaxed);
-        if (_stream != nullptr) {
-            Pa_StopStream(_stream);
-            Pa_CloseStream(_stream);
-            _stream = nullptr;
-        }
-        _encoder.destroy();
-        _decoder.destroy();
-    }
-
-    void print_latency_info() {
-        const PaStreamInfo *streamInfo = Pa_GetStreamInfo(_stream);
-        if (streamInfo != nullptr) {
-            static constexpr double SECONDS_TO_MILLISECONDS = 1000.0;
-            printf("Input latency:  %.3f ms\n", streamInfo->inputLatency * SECONDS_TO_MILLISECONDS);
-            printf("Output latency: %.3f ms\n", streamInfo->outputLatency * SECONDS_TO_MILLISECONDS);
-            printf("Sample rate:    %.1f Hz\n", streamInfo->sampleRate);
-        }
-    }
-
-    void encode_opus(const float *input, int frameSize, std::vector<unsigned char> &output) {
-        _encoder.encode(input, frameSize, output);
-    }
-
-    void decode_opus(const unsigned char *input, int inputSize, int frameSize, int channelCount,
-                     std::vector<float> &output) {
-        _decoder.decode(input, inputSize, frameSize, output);
-    }
-
-    int get_input_channel_count() const { return _input_channel_count; }
-    int get_output_channel_count() const { return _output_channel_count; }
-    bool is_stream_active() const { return _stream_active.load(std::memory_order_relaxed); }
-
-  private:
-    PaStream *_stream = nullptr;
-    opus_encoder_wrapper _encoder;
-    opus_decoder_wrapper _decoder;
-    std::atomic<bool> _stream_active{false};
-
-    int _input_channel_count;
-    int _output_channel_count;
-};
+using nlohmann::json;
 
 class client {
-
   public:
     client(asio::io_context &io_context, const std::string &server_address, short server_port)
         : _io_context(io_context), _socket(io_context, udp::endpoint(udp::v4(), 0)),
@@ -206,20 +28,25 @@ class client {
           _jitter_buffer_min_packets(2), _jitter_buffer_target_packets(4), _jitter_buffer_max_packets(16),
           _is_connected(false), _echo_enabled(false) {
 
-        std::cout << "Client local port: " << _socket.local_endpoint().port() << "\n";
+        Log::info("Client local port: {}", _socket.local_endpoint().port());
 
-        std::cout << "\n=== Available Audio Devices ===\n";
-        audio_stream::list_devices();
+        // Start audio stream with configuration
+        audio_stream::AudioConfig config;
+        config.sample_rate = 48000;
+        config.bitrate = 64000;
+        config.complexity = 2;
+        config.frames_per_buffer = 240;
+        config.input_gain = 1.0F;
+        config.output_gain = 1.0F;
 
-        // Start audio stream
-        start_audio_stream(17, 15, 240);
+        start_audio_stream(17, 15, config);
         // Connect to server
         start_connection(server_address, server_port);
     }
 
     // Start connection to server (or switch to new server)
     void start_connection(const std::string &server_address, short server_port) {
-        std::cout << "\nConnecting to " << server_address << ":" << server_port << "...\n";
+        Log::info("Connecting to {}:{}...", server_address, server_port);
 
         // Resolve hostname or IP address
         udp::resolver resolver(_io_context);
@@ -227,13 +54,12 @@ class client {
             resolver.resolve(udp::v4(), server_address, std::to_string(server_port));
         _server_endpoint = *endpoints.begin();
 
-        std::cout << "Resolved to: " << _server_endpoint.address().to_string() << ":" << _server_endpoint.port()
-                  << "\n";
+        Log::info("Resolved to: {}:{}", _server_endpoint.address().to_string(), _server_endpoint.port());
 
         _is_connected.store(true, std::memory_order_relaxed);
         do_receive();
 
-        std::cout << "Connected and receiving!\n";
+        Log::info("Connected and receiving!");
 
         // Send JOIN message
         CtrlHdr chdr{};
@@ -245,7 +71,7 @@ class client {
 
     // Stop connection (stops sending/receiving UDP packets)
     void stop_connection() {
-        std::cout << "\nDisconnecting from server...\n";
+        Log::info("Disconnecting from server...");
 
         _is_connected.store(false, std::memory_order_relaxed);
 
@@ -258,16 +84,20 @@ class client {
         }
         _jitter_buffer_ready = false;
 
-        std::cout << "Disconnected (no longer sending/receiving)\n";
+        Log::info("Disconnected (no longer sending/receiving)");
     }
 
     // Check if connected to server
     bool is_connected() const { return _is_connected.load(std::memory_order_relaxed); }
 
-    void start_audio_stream(PaDeviceIndex inputDevice, PaDeviceIndex outputDevice, int framesPerBuffer = 120) {
-        std::cout << "Starting audio stream...\n";
-        _audio.start_audio_stream(inputDevice, outputDevice, framesPerBuffer, audio_callback, this);
-        _audio.print_latency_info();
+    bool start_audio_stream(PaDeviceIndex inputDevice, PaDeviceIndex outputDevice,
+                            const audio_stream::AudioConfig &config = audio_stream::AudioConfig{}) {
+        Log::info("Starting audio stream...");
+        bool success = _audio.start_audio_stream(inputDevice, outputDevice, config, audio_callback, this);
+        if (success) {
+            _audio.print_latency_info();
+        }
+        return success;
     }
 
     void stop_audio_stream() { _audio.stop_audio_stream(); }
@@ -298,7 +128,7 @@ class client {
         } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint16_t)) {
             _handle_audio_message(bytes);
         } else {
-            std::cout << "Unknown message: " << std::string(_recv_buf.data(), bytes) << "\n";
+            Log::warn("Unknown message: {}", std::string(_recv_buf.data(), bytes));
         }
 
         do_receive(); // keep listening
@@ -321,11 +151,12 @@ class client {
             return;
         }
 
-        _socket.async_send_to(asio::buffer(data, len), _server_endpoint, [](std::error_code error_code, std::size_t) {
-            if (error_code) {
-                std::cerr << "send error: " << error_code.message() << "\n";
-            }
-        });
+        _socket.async_send_to(asio::buffer(data, len), _server_endpoint,
+                              [this](std::error_code error_code, std::size_t) {
+                                  if (error_code) {
+                                      Log::error("send error: {}", error_code.message());
+                                  }
+                              });
     }
 
   private:
@@ -385,15 +216,14 @@ class client {
         double offset_ms = offset / 1e6;
 
         // print live stats
-        std::cout << "seq " << hdr.seq << " RTT " << rtt_ms << " ms"
-                  << " | offset " << offset_ms << " ms" << std::string(20, ' ') << "\r" << std::flush;
+        Log::debug("seq {} RTT {:.2f} ms | offset {:.2f} ms", hdr.seq, rtt_ms, offset_ms);
     }
 
     void _handle_echo_message(std::size_t bytes) {
         EchoHdr ehdr{};
         std::memcpy(&ehdr, _recv_buf.data(), sizeof(EchoHdr));
         static int echo_count = 0;
-        std::cout << "Echo " << ++echo_count << " from server: " << std::string(ehdr.data) << "\n";
+        Log::info("Echo {} from server: {}", ++echo_count, std::string(ehdr.data));
     }
 
     void _handle_audio_message(std::size_t bytes) {
@@ -402,7 +232,7 @@ class client {
         size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
 
         if (bytes < expected_size) {
-            std::cerr << "Incomplete audio packet: got " << bytes << ", expected " << expected_size << "\n";
+            Log::error("Incomplete audio packet: got {}, expected {}", bytes, expected_size);
             do_receive();
             return;
         }
@@ -428,9 +258,8 @@ class client {
         static int decode_count = 0;
         static int size_errors = 0;
         if (++decode_count % 400 == 0) {
-            std::cout << "Client decoded " << decode_count << " packets, " << decodedData.size()
-                      << " samples (expected " << (240 * _audio.get_output_channel_count()) << "), " << size_errors
-                      << " size errors\n";
+            Log::debug("Client decoded {} packets, {} samples (expected {}), {} size errors", decode_count,
+                       decodedData.size(), (240 * _audio.get_output_channel_count()), size_errors);
         }
         if (decodedData.size() != 240 * _audio.get_output_channel_count()) {
             size_errors++;
@@ -448,7 +277,7 @@ class client {
             // Mark buffer as ready once we have enough packets
             if (!_jitter_buffer_ready && queue_size >= _jitter_buffer_min_packets) {
                 _jitter_buffer_ready = true;
-                std::cout << "\nJitter buffer ready (" << queue_size << " packets buffered)\n";
+                Log::info("Jitter buffer ready ({} packets buffered)", queue_size);
             }
         } else {
             // Buffer overflow - drop oldest packet
@@ -486,8 +315,8 @@ class client {
                 std::memset(output_buffer, 0, bytes_to_copy);
                 static int mismatch_count = 0;
                 if (++mismatch_count % 100 == 0) {
-                    std::cerr << "Client: Decoded size mismatch: got " << state.decoded_data.size()
-                              << " samples, expected " << expected_samples << "\n";
+                    Log::warn("Client: Decoded size mismatch: got {} samples, expected {}",
+                                            state.decoded_data.size(), expected_samples);
                 }
             }
             state.playback_count++;
@@ -499,7 +328,7 @@ class client {
             if (queue_size < current_min - 1) {
                 state.underrun_count++;
                 if (state.underrun_count % 200 == 0) {
-                    std::cout << "\nJitter buffer low (" << queue_size << "/" << current_min << " packets)\n";
+                    Log::warn("Jitter buffer low ({}/{}) packets", queue_size, current_min);
                 }
             } else {
                 state.underrun_count = 0;
@@ -511,13 +340,13 @@ class client {
 
             // Print underrun stats periodically
             if (!client_ptr->_jitter_buffer_ready && state.underrun_count % 100 == 0) {
-                // std::cout << "\nBuffering... (" << queue_size << "/" << current_min << " packets)\n";
+                // logger::debug("Buffering... ({}/{}) packets", queue_size, current_min);
             }
 
             // Reset buffer ready flag if we've drained completely
             if (client_ptr->_jitter_buffer_ready && queue_size == 0) {
                 client_ptr->_jitter_buffer_ready = false;
-                std::cout << "\nJitter buffer underrun! Rebuffering...\n";
+                Log::warn("Jitter buffer underrun! Rebuffering...");
                 state.consecutive_low_buffer = 0;
                 state.consecutive_high_buffer = 0;
             }
@@ -550,8 +379,8 @@ class client {
                 size_t new_target = std::min(current_target + 2, client_ptr->_jitter_buffer_max_packets);
                 client_ptr->_jitter_buffer_min_packets.store(new_min);
                 client_ptr->_jitter_buffer_target_packets.store(new_target);
-                std::cout << "\nAdaptive: Increasing buffer to min=" << new_min << ", target=" << new_target
-                          << " (high jitter detected)\n";
+                Log::info("Adaptive: Increasing buffer to min={}, target={} (high jitter detected)",
+                                        new_min, new_target);
                 state.consecutive_low_buffer = 0;
                 state.last_adaptation = now;
             }
@@ -561,8 +390,8 @@ class client {
                 size_t new_target = std::max(current_target - 1, size_t(3));
                 client_ptr->_jitter_buffer_min_packets.store(new_min);
                 client_ptr->_jitter_buffer_target_packets.store(new_target);
-                std::cout << "\nAdaptive: Decreasing buffer to min=" << new_min << ", target=" << new_target
-                          << " (stable network)\n";
+                Log::info("Adaptive: Decreasing buffer to min={}, target={} (stable network)", new_min,
+                                        new_target);
                 state.consecutive_high_buffer = 0;
                 state.last_adaptation = now;
             }
@@ -587,7 +416,7 @@ class client {
             // No input - send silence packet periodically to keep connection alive
             static int no_input_count = 0;
             if (++no_input_count % 100 == 0) {
-                std::cerr << "Warning: No input audio (in == nullptr)\n";
+                Log::warn("No input audio (in == nullptr)");
             }
             return;
         }
@@ -612,9 +441,8 @@ class client {
                 encode_failures++;
             }
             if (encode_count % 400 == 0) {
-                std::cout << "Client encoded " << encode_count << " packets, " << encode_failures
-                          << " failures, last size: " << state.encoded_data.size() << " bytes, peak: " << max_sample
-                          << "\n";
+                Log::debug("Client encoded {} packets, {} failures, last size: {} bytes, peak: {:.3f}",
+                                         encode_count, encode_failures, state.encoded_data.size(), max_sample);
             }
 
             if (!state.encoded_data.empty()) {
@@ -629,7 +457,7 @@ class client {
             // Silence detected - don't send packet (save bandwidth and prevent glitches)
             static int silence_count = 0;
             if (++silence_count % 400 == 0) {
-                // std::cout << "Client: " << silence_count << " silent frames skipped\n";
+                Log::debug("Client: {} silent frames skipped", silence_count);
             }
         }
     }
@@ -666,87 +494,15 @@ class client {
 };
 
 int main() {
+    auto &log = logger::instance();
+    log.init(true, true, false, "app.log", spdlog::level::info);
     try {
+
         asio::io_context io_context;
         client client_instance(io_context, "127.0.0.1", 9999);
 
-        ix::WebSocketServer webSocketServer(9969);
-        webSocketServer.setOnClientMessageCallback([](const std::shared_ptr<ix::ConnectionState> &connectionState,
-                                                      ix::WebSocket &webSocket,
-                                                      const ix::WebSocketMessagePtr &message) {
-            std::cout << "WebSocket connection from " << connectionState->getRemoteIp() << ":"
-                      << connectionState->getRemotePort() << '\n';
-            std::cout << "Received message: " << message->str << '\n';
-            // devices list request
-            if (message->type == ix::WebSocketMessageType::Message) {
-                try {
-                    auto json_msg = nlohmann::json::parse(message->str);
-                    if (json_msg.contains("command") && json_msg["command"] == "get_devices") {
-                        std::string hostApi;
-                        if (json_msg.contains("host_api")) {
-                            hostApi = json_msg["host_api"].get<std::string>();
-                        }
-                        std::string devices_json = audio_stream::get_devices_json(hostApi);
-                        nlohmann::json response;
-                        response["devices"] = nlohmann::json::parse(devices_json);
-                        webSocket.sendText(response.dump());
-                    }
-                } catch (std::exception &e) {
-                    std::cerr << "WebSocket message parse error: " << e.what() << "\n";
-                }
-            }
-        });
-
-        auto res = webSocketServer.listen();
-        if (!res.first) {
-            std::cerr << "WS listen failed: " << res.second << '\n';
-            return 1;
-        }
-        webSocketServer.disablePerMessageDeflate();
-        webSocketServer.start(); // launches its own threads
-
         io_context.run();
     } catch (std::exception &e) {
-        std::cerr << "ERR: " << e.what() << "\n";
+        log.error("ERR: {}", e.what());
     }
 }
-
-/*
-// 1️⃣ Create connection
-const ws = new WebSocket("ws://localhost:9969");
-
-// 2️⃣ When connected, send a JSON command
-ws.onopen = () => {
-  console.log("✅ Connected to WebSocket!");
-
-  // build request object
-  const request = {
-    command: "get_devices",
-    host_api: ""   // optional; can be empty or "ALSA"/"ASIO"/etc
-  };
-
-  // send as JSON string
-  ws.send(JSON.stringify(request));
-  console.log("📤 Sent:", request);
-};
-
-// 3️⃣ Handle server response
-ws.onmessage = event => {
-  try {
-    const response = JSON.parse(event.data);
-    console.log("📨 Received:", response);
-  } catch (err) {
-    console.error("❌ JSON parse error:", err);
-    console.log("Raw message:", event.data);
-  }
-};
-
-// 4️⃣ Handle errors and close
-ws.onerror = err => console.error("❌ WebSocket error:", err);
-ws.onclose = () => console.log("🔌 Disconnected");
-
-() => console.log("🔌 Disconnected")
-
-// Example: Request device list
-ws.send(JSON.stringify({ command: "get_devices" }));
-*/
