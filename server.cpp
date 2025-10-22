@@ -74,8 +74,8 @@ class server {
     void _handle_receive_error(std::error_code error_code) {
         Log::error("receive error: {}", error_code.message());
         _clients.erase(_remote_endpoint);
-        Log::info("Client {}:{} removed due to receive error", 
-                                _remote_endpoint.address().to_string(), _remote_endpoint.port());
+        Log::info("Client {}:{} removed due to receive error", _remote_endpoint.address().to_string(),
+                  _remote_endpoint.port());
         do_receive(); // keep listening
     }
 
@@ -121,7 +121,7 @@ class server {
             break;
         default:
             Log::warn("Unknown CTRL cmd: {} from {}:{}", static_cast<int>(chdr.type),
-                                    _remote_endpoint.address().to_string(), _remote_endpoint.port());
+                      _remote_endpoint.address().to_string(), _remote_endpoint.port());
             break;
         }
     }
@@ -307,8 +307,8 @@ class server {
         // Optional: Print stats periodically (reduced frequency to lower CPU overhead)
         static int callback_count = 0;
         if (++callback_count % 2000 == 0) { // Every 10 seconds (2000 * 5ms = 10000ms)
-            Log::info("Broadcast: {} clients, {} active, mix size: {} bytes", 
-                                    _clients.size(), active_clients, encoded_mix.size());
+            Log::info("Broadcast: {} clients, {} active, mix size: {} bytes", _clients.size(), active_clients,
+                      encoded_mix.size());
         }
     }
 
@@ -322,8 +322,8 @@ class server {
 int main() {
     try {
         auto &log = logger::instance();
-        log.init(true, true, false, "server.log", spdlog::level::info);
-        
+        log.init(true, false, false, "", spdlog::level::warn);
+
         asio::io_context io_context;
         server srv(io_context, 9999);
         log.info("Echo server listening on 127.0.0.1:9999");
