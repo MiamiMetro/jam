@@ -14,6 +14,7 @@
 #include "logger.hpp"
 #include "periodic_timer.hpp"
 #include "protocol.hpp"
+#include "websocket.hpp"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -39,7 +40,11 @@ class client {
         config.input_gain = 1.0F;
         config.output_gain = 1.0F;
 
+        auto wdm_ks_devices = audio_stream::get_devices_json("Windows WDM-KS");
+        Log::info("Available Windows WDM-KS devices: {}", wdm_ks_devices.dump());
+
         start_audio_stream(17, 15, config);
+        // start_audio_stream(38, 40, config);
         // Connect to server
         start_connection(server_address, server_port);
     }
@@ -216,7 +221,7 @@ class client {
         double offset_ms = offset / 1e6;
 
         // print live stats
-        Log::debug("seq {} RTT {:.2f} ms | offset {:.2f} ms", hdr.seq, rtt_ms, offset_ms);
+        Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
     }
 
     void _handle_echo_message(std::size_t bytes) {
@@ -315,8 +320,8 @@ class client {
                 std::memset(output_buffer, 0, bytes_to_copy);
                 static int mismatch_count = 0;
                 if (++mismatch_count % 100 == 0) {
-                    Log::warn("Client: Decoded size mismatch: got {} samples, expected {}",
-                                            state.decoded_data.size(), expected_samples);
+                    Log::warn("Client: Decoded size mismatch: got {} samples, expected {}", state.decoded_data.size(),
+                              expected_samples);
                 }
             }
             state.playback_count++;
@@ -379,8 +384,8 @@ class client {
                 size_t new_target = std::min(current_target + 2, client_ptr->_jitter_buffer_max_packets);
                 client_ptr->_jitter_buffer_min_packets.store(new_min);
                 client_ptr->_jitter_buffer_target_packets.store(new_target);
-                Log::info("Adaptive: Increasing buffer to min={}, target={} (high jitter detected)",
-                                        new_min, new_target);
+                Log::info("Adaptive: Increasing buffer to min={}, target={} (high jitter detected)", new_min,
+                          new_target);
                 state.consecutive_low_buffer = 0;
                 state.last_adaptation = now;
             }
@@ -390,8 +395,7 @@ class client {
                 size_t new_target = std::max(current_target - 1, size_t(3));
                 client_ptr->_jitter_buffer_min_packets.store(new_min);
                 client_ptr->_jitter_buffer_target_packets.store(new_target);
-                Log::info("Adaptive: Decreasing buffer to min={}, target={} (stable network)", new_min,
-                                        new_target);
+                Log::info("Adaptive: Decreasing buffer to min={}, target={} (stable network)", new_min, new_target);
                 state.consecutive_high_buffer = 0;
                 state.last_adaptation = now;
             }
@@ -441,8 +445,8 @@ class client {
                 encode_failures++;
             }
             if (encode_count % 400 == 0) {
-                Log::debug("Client encoded {} packets, {} failures, last size: {} bytes, peak: {:.3f}",
-                                         encode_count, encode_failures, state.encoded_data.size(), max_sample);
+                Log::debug("Client encoded {} packets, {} failures, last size: {} bytes, peak: {:.3f}", encode_count,
+                           encode_failures, state.encoded_data.size(), max_sample);
             }
 
             if (!state.encoded_data.empty()) {
@@ -494,15 +498,30 @@ class client {
 };
 
 int main() {
-    auto &log = logger::instance();
-    log.init(true, true, false, "app.log", spdlog::level::info);
     try {
+        auto &log = logger::instance();
+        log.init(true, true, false, "", spdlog::level::info);
 
         asio::io_context io_context;
         client client_instance(io_context, "127.0.0.1", 9999);
 
+        websocket ws_server(9969, [&client_instance](const std::shared_ptr<ix::ConnectionState> &connectionState,
+                                                     ix::WebSocket &webSocket, const ix::WebSocketMessagePtr &message) {
+            if (message->type == ix::WebSocketMessageType::Message) {
+                auto json_message = json::parse(message->str);
+                if (json_message.contains("command")) {
+                    if (json_message["command"] == "get_devices") {
+                        auto devices = audio_stream::get_devices_json(json_message["host_api"].get<std::string>());
+                        webSocket.sendText(devices.dump());
+                    }
+                }
+            }
+        });
+        ws_server.start();
+        periodic_timer timer(io_context, 1s, [&ws_server]() { ws_server.broadcast(json({{"type", "ping"}}).dump()); });
+
         io_context.run();
     } catch (std::exception &e) {
-        log.error("ERR: {}", e.what());
+        Log::error("ERR: {}", e.what());
     }
 }
