@@ -7,7 +7,6 @@
 #include <nlohmann/json.hpp>
 #include <portaudio.h>
 
-
 class audio_stream {
   public:
     struct AudioConfig {

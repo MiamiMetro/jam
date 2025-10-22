@@ -1,8 +1,8 @@
 #pragma once
 
+#include "logger.hpp"
 #include <opus.h>
 #include <vector>
-#include "logger.hpp"
 
 class opus_encoder_wrapper {
   private:
@@ -13,9 +13,7 @@ class opus_encoder_wrapper {
   public:
     opus_encoder_wrapper() = default;
 
-    ~opus_encoder_wrapper() {
-        destroy();
-    }
+    ~opus_encoder_wrapper() { destroy(); }
 
     // Prevent copying (Opus encoder is a resource)
     opus_encoder_wrapper(const opus_encoder_wrapper &) = delete;
@@ -65,8 +63,8 @@ class opus_encoder_wrapper {
         // Verify settings
         int32_t actual_bitrate;
         opus_encoder_ctl(_encoder, OPUS_GET_BITRATE(&actual_bitrate));
-        Log::info("Opus encoder created: {}ch, {}Hz, target={}bps, actual={}bps, complexity={}", 
-                                channels, sample_rate, bitrate, actual_bitrate, complexity);
+        Log::info("Opus encoder created: {}ch, {}Hz, target={}bps, actual={}bps, complexity={}", channels, sample_rate,
+                  bitrate, actual_bitrate, complexity);
 
         return true;
     }
@@ -89,7 +87,7 @@ class opus_encoder_wrapper {
 
         output.resize(512); // Buffer for high-quality music
         int encoded_bytes = opus_encode_float(_encoder, input, frame_size, output.data(), output.size());
-        
+
         if (encoded_bytes < 0) {
             Log::error("Opus encoding failed: {}", opus_strerror(encoded_bytes));
             output.clear();

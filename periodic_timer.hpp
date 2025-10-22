@@ -1,10 +1,10 @@
 #pragma once
 
+#include "logger.hpp"
 #include <asio.hpp>
 #include <chrono>
 #include <functional>
 #include <utility>
-#include "logger.hpp"
 
 class periodic_timer {
   private:
@@ -25,7 +25,8 @@ class periodic_timer {
     }
 
   public:
-    periodic_timer(asio::io_context &io_context, std::chrono::steady_clock::duration interval, std::function<void()> callback)
+    periodic_timer(asio::io_context &io_context, std::chrono::steady_clock::duration interval,
+                   std::function<void()> callback)
         : _timer(io_context), _interval(interval), _callback(std::move(callback)),
           _next_tick(std::chrono::steady_clock::now() + interval) {
         _timer.expires_at(_next_tick); // Use absolute time from the start

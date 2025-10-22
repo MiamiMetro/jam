@@ -1,10 +1,10 @@
 #pragma once
 #include <filesystem>
 #include <mutex>
-#include <spdlog/spdlog.h>
 #include <spdlog/async.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 class logger {
   public:
@@ -96,7 +96,7 @@ void logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
             std::filesystem::path path(file_path);
             if (!path.parent_path().empty())
                 std::filesystem::create_directories(path.parent_path());
-            
+
             // Check existing log file size before creating sink
             if (std::filesystem::exists(path)) {
                 auto file_size = std::filesystem::file_size(path);
@@ -110,12 +110,13 @@ void logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
                     fprintf(stdout, "Logger: Existing log file size: %.2f KB\n", size_kb);
                 } else {
                     // Size in bytes
-                    fprintf(stdout, "Logger: Existing log file size: %llu bytes\n", static_cast<unsigned long long>(file_size));
+                    fprintf(stdout, "Logger: Existing log file size: %llu bytes\n",
+                            static_cast<unsigned long long>(file_size));
                 }
             } else {
                 fprintf(stdout, "Logger: Creating new log file\n");
             }
-            
+
             m_file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, true);
             m_file_sink->set_pattern("[%Y-%m-%d %T.%e] [%^%l%$] %v");
         } catch (const std::exception &e) {
@@ -177,23 +178,19 @@ void logger::flush() {
 
 // Clean namespace for easy logging
 namespace Log {
-    template<typename... Args>
-    inline void info(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        ::logger::instance().info(fmt, std::forward<Args>(args)...);
-    }
-    
-    template<typename... Args>
-    inline void warn(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        ::logger::instance().warn(fmt, std::forward<Args>(args)...);
-    }
-    
-    template<typename... Args>
-    inline void error(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        ::logger::instance().error(fmt, std::forward<Args>(args)...);
-    }
-    
-    template<typename... Args>
-    inline void debug(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        ::logger::instance().debug(fmt, std::forward<Args>(args)...);
-    }
+template <typename... Args> inline void info(spdlog::format_string_t<Args...> fmt, Args &&...args) {
+    ::logger::instance().info(fmt, std::forward<Args>(args)...);
 }
+
+template <typename... Args> inline void warn(spdlog::format_string_t<Args...> fmt, Args &&...args) {
+    ::logger::instance().warn(fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args> inline void error(spdlog::format_string_t<Args...> fmt, Args &&...args) {
+    ::logger::instance().error(fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args> inline void debug(spdlog::format_string_t<Args...> fmt, Args &&...args) {
+    ::logger::instance().debug(fmt, std::forward<Args>(args)...);
+}
+} // namespace Log

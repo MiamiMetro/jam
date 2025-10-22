@@ -1,8 +1,8 @@
 #pragma once
 
+#include "logger.hpp"
 #include <opus.h>
 #include <vector>
-#include "logger.hpp"
 
 class opus_decoder_wrapper {
   private:
@@ -13,9 +13,7 @@ class opus_decoder_wrapper {
   public:
     opus_decoder_wrapper() = default;
 
-    ~opus_decoder_wrapper() {
-        destroy();
-    }
+    ~opus_decoder_wrapper() { destroy(); }
 
     // Prevent copying (Opus decoder maintains state)
     opus_decoder_wrapper(const opus_decoder_wrapper &) = delete;
@@ -73,7 +71,7 @@ class opus_decoder_wrapper {
 
         output.resize(frame_size * _channels);
         int decoded_samples_per_channel = opus_decode_float(_decoder, input, input_size, output.data(), frame_size, 0);
-        
+
         if (decoded_samples_per_channel < 0) {
             Log::error("Opus decoding failed: {}", opus_strerror(decoded_samples_per_channel));
             output.clear();
@@ -95,7 +93,7 @@ class opus_decoder_wrapper {
         output.resize(frame_size * _channels);
         // Pass nullptr to trigger PLC (packet loss concealment)
         int decoded_samples_per_channel = opus_decode_float(_decoder, nullptr, 0, output.data(), frame_size, 0);
-        
+
         if (decoded_samples_per_channel < 0) {
             Log::error("Opus PLC decoding failed: {}", opus_strerror(decoded_samples_per_channel));
             output.clear();

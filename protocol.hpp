@@ -3,9 +3,9 @@
 #include <cstdint>
 
 // Magic numbers for packet identification
-constexpr uint32_t PING_MAGIC = 0x50494E47; // 'PING'
-constexpr uint32_t CTRL_MAGIC = 0x4354524C; // 'CTRL'
-constexpr uint32_t ECHO_MAGIC = 0x4543484F; // 'ECHO'
+constexpr uint32_t PING_MAGIC = 0x50494E47;  // 'PING'
+constexpr uint32_t CTRL_MAGIC = 0x4354524C;  // 'CTRL'
+constexpr uint32_t ECHO_MAGIC = 0x4543484F;  // 'ECHO'
 constexpr uint32_t AUDIO_MAGIC = 0x41554449; // 'AUDI'
 
 #pragma pack(push, 1)
@@ -35,7 +35,7 @@ struct EchoHdr : MsgHdr {
 
 struct AudioHdr : MsgHdr {
     uint16_t encoded_bytes; // size of the encoded Opus data
-    char buf[512];  // Increased for music (was 128)
+    char buf[512];          // Increased for music (was 128)
 };
 
 #pragma pack(pop)
