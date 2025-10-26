@@ -1,63 +1,69 @@
 #pragma once
 
-#include "logger.hpp"
-#include "opus_decoder.hpp"
-#include "opus_encoder.hpp"
 #include <atomic>
 #include <nlohmann/json.hpp>
 #include <portaudio.h>
+#include "logger.h"
+#include "opus_decoder.h"
+#include "opus_encoder.h"
 
-class audio_stream {
-  public:
+class AudioStream {
+public:
     struct AudioConfig {
-        int sample_rate{};
-        int bitrate{};
-        int complexity{};
-        int frames_per_buffer{};
+        int   sample_rate{};
+        int   bitrate{};
+        int   complexity{};
+        int   frames_per_buffer{};
         float input_gain{};
         float output_gain{};
 
         AudioConfig()
-            : sample_rate(48000), bitrate(64000), complexity(2), frames_per_buffer(240), input_gain(1.0F),
+            : sample_rate(48000),
+              bitrate(64000),
+              complexity(2),
+              frames_per_buffer(240),
+              input_gain(1.0F),
               output_gain(1.0F) {}
     };
 
-    audio_stream() { Pa_Initialize(); }
+    AudioStream() {
+        Pa_Initialize();
+    }
 
-    ~audio_stream() {
-        if (_stream != nullptr) {
-            Pa_StopStream(_stream);
-            Pa_CloseStream(_stream);
+    ~AudioStream() {
+        if (stream_ != nullptr) {
+            Pa_StopStream(stream_);
+            Pa_CloseStream(stream_);
         }
 
         Pa_Terminate();
     }
 
-    static nlohmann::json get_devices_json(const std::string &hostApiName = "") {
-        nlohmann::json devices = nlohmann::json::array();
-        int numDevices = Pa_GetDeviceCount();
+    static nlohmann::json get_devices_json(const std::string& host_api_name = "") {
+        nlohmann::json devices    = nlohmann::json::array();
+        int            numDevices = Pa_GetDeviceCount();
 
         for (int i = 0; i < numDevices; ++i) {
-            const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(i);
-            if (deviceInfo == nullptr) {
+            const PaDeviceInfo* device_info = Pa_GetDeviceInfo(i);
+            if (device_info == nullptr) {
                 continue;
             }
 
-            const PaHostApiInfo *hostApiInfo = Pa_GetHostApiInfo(deviceInfo->hostApi);
-            std::string apiName = (hostApiInfo != nullptr) ? hostApiInfo->name : "Unknown API";
+            const PaHostApiInfo* hostApiInfo = Pa_GetHostApiInfo(device_info->hostApi);
+            std::string api_name = (hostApiInfo != nullptr) ? hostApiInfo->name : "Unknown API";
 
-            if (!hostApiName.empty() && apiName != hostApiName) {
+            if (!host_api_name.empty() && api_name != host_api_name) {
                 continue;
             }
 
             // Much cleaner and faster - no string concatenation!
             nlohmann::json device;
-            device["index"] = i;
-            device["name"] = deviceInfo->name;
-            device["maxInputChannels"] = deviceInfo->maxInputChannels;
-            device["maxOutputChannels"] = deviceInfo->maxOutputChannels;
-            device["defaultSampleRate"] = deviceInfo->defaultSampleRate;
-            device["hostApi"] = apiName;
+            device["index"]             = i;
+            device["name"]              = device_info->name;
+            device["maxInputChannels"]  = device_info->maxInputChannels;
+            device["maxOutputChannels"] = device_info->maxOutputChannels;
+            device["defaultSampleRate"] = device_info->defaultSampleRate;
+            device["hostApi"]           = api_name;
 
             devices.push_back(device);
         }
@@ -66,21 +72,21 @@ class audio_stream {
     }
 
     static nlohmann::json get_host_apis_json() {
-        nlohmann::json hostApis = nlohmann::json::array();
-        int numHostApis = Pa_GetHostApiCount();
+        nlohmann::json hostApis    = nlohmann::json::array();
+        int            numHostApis = Pa_GetHostApiCount();
 
         for (int i = 0; i < numHostApis; ++i) {
-            const PaHostApiInfo *hostApiInfo = Pa_GetHostApiInfo(i);
+            const PaHostApiInfo* hostApiInfo = Pa_GetHostApiInfo(i);
             if (hostApiInfo == nullptr) {
                 continue;
             }
 
             nlohmann::json api;
-            api["index"] = i;
-            api["name"] = hostApiInfo->name;
-            api["type"] = static_cast<int>(hostApiInfo->type);
-            api["deviceCount"] = hostApiInfo->deviceCount;
-            api["defaultInputDevice"] = hostApiInfo->defaultInputDevice;
+            api["index"]               = i;
+            api["name"]                = hostApiInfo->name;
+            api["type"]                = static_cast<int>(hostApiInfo->type);
+            api["deviceCount"]         = hostApiInfo->deviceCount;
+            api["defaultInputDevice"]  = hostApiInfo->defaultInputDevice;
             api["defaultOutputDevice"] = hostApiInfo->defaultOutputDevice;
 
             hostApis.push_back(api);
@@ -89,130 +95,149 @@ class audio_stream {
         return hostApis;
     }
 
-    static const PaDeviceInfo *get_device_info(int deviceIndex) {
-        const PaDeviceInfo *deviceInfo = Pa_GetDeviceInfo(deviceIndex);
-        if (deviceInfo == nullptr) {
-            Log::error("Invalid device index: {}", deviceIndex);
+    static const PaDeviceInfo* get_device_info(int device_index) {
+        const PaDeviceInfo* device_info = Pa_GetDeviceInfo(device_index);
+        if (device_info == nullptr) {
+            Log::error("Invalid device index: {}", device_index);
             return nullptr;
         }
-        return deviceInfo;
+        return device_info;
     }
 
-    static bool is_device_valid(int deviceIndex) {
-        return deviceIndex >= 0 && deviceIndex < Pa_GetDeviceCount() && Pa_GetDeviceInfo(deviceIndex) != nullptr;
+    static bool is_device_valid(int device_index) {
+        return device_index >= 0 && device_index < Pa_GetDeviceCount() &&
+               Pa_GetDeviceInfo(device_index) != nullptr;
     }
 
-    static void print_device_info(const PaDeviceInfo *inputInfo, const PaDeviceInfo *outputInfo) {
-        Log::info("Input Device: {} | API: {} | Max Input Channels: {} | Default Sample Rate: {}", inputInfo->name,
-                  (Pa_GetHostApiInfo(inputInfo->hostApi) != nullptr) ? Pa_GetHostApiInfo(inputInfo->hostApi)->name
-                                                                     : "Unknown",
-                  inputInfo->maxInputChannels, inputInfo->defaultSampleRate);
-        Log::info("Output Device: {} | API: {} | Max Output Channels: {} | Default Sample Rate: {}", outputInfo->name,
-                  (Pa_GetHostApiInfo(outputInfo->hostApi) != nullptr) ? Pa_GetHostApiInfo(outputInfo->hostApi)->name
-                                                                      : "Unknown",
-                  outputInfo->maxOutputChannels, outputInfo->defaultSampleRate);
+    static void print_device_info(const PaDeviceInfo* input_info, const PaDeviceInfo* output_info) {
+        Log::info("Input Device: {} | API: {} | Max Input Channels: {} | Default Sample Rate: {}",
+                  input_info->name,
+                  (Pa_GetHostApiInfo(input_info->hostApi) != nullptr)
+                      ? Pa_GetHostApiInfo(input_info->hostApi)->name
+                      : "Unknown",
+                  input_info->maxInputChannels, input_info->defaultSampleRate);
+        Log::info("Output Device: {} | API: {} | Max Output Channels: {} | Default Sample Rate: {}",
+                  output_info->name,
+                  (Pa_GetHostApiInfo(output_info->hostApi) != nullptr)
+                      ? Pa_GetHostApiInfo(output_info->hostApi)->name
+                      : "Unknown",
+                  output_info->maxOutputChannels, output_info->defaultSampleRate);
     }
 
-    bool start_audio_stream(PaDeviceIndex inputDevice, PaDeviceIndex outputDevice,
-                            const AudioConfig &config = AudioConfig{}, PaStreamCallback *callback = nullptr,
-                            void *userData = nullptr) {
+    bool start_audio_stream(PaDeviceIndex input_device, PaDeviceIndex output_device,
+                            const AudioConfig& config  = AudioConfig{},
+                            PaStreamCallback* callback = nullptr, void* user_data = nullptr) {
         // Validate devices
-        if (!is_device_valid(inputDevice) || !is_device_valid(outputDevice)) {
+        if (!is_device_valid(input_device) || !is_device_valid(output_device)) {
             Log::error("Invalid input or output device.");
             return false;
         }
 
-        const auto *inputInfo = get_device_info(inputDevice);
-        const auto *outputInfo = get_device_info(outputDevice);
+        const auto* input_info  = get_device_info(input_device);
+        const auto* output_info = get_device_info(output_device);
 
-        PaStreamParameters inputParameters = {inputDevice, std::min(inputInfo->maxInputChannels, 1), paFloat32,
-                                              inputInfo->defaultLowInputLatency, nullptr};
+        PaStreamParameters input_parameters = {input_device,
+                                               std::min(input_info->maxInputChannels, 1), paFloat32,
+                                               input_info->defaultLowInputLatency, nullptr};
 
-        PaStreamParameters outputParameters = {outputDevice, std::min(outputInfo->maxOutputChannels, 2), paFloat32,
-                                               outputInfo->defaultLowOutputLatency, nullptr};
+        PaStreamParameters output_parameters = {
+            output_device, std::min(output_info->maxOutputChannels, 2), paFloat32,
+            output_info->defaultLowOutputLatency, nullptr};
 
-        _input_channel_count = inputParameters.channelCount;
-        _output_channel_count = outputParameters.channelCount;
-        _current_config = config;
+        input_channel_count_  = input_parameters.channelCount;
+        output_channel_count_ = output_parameters.channelCount;
+        current_config_       = config;
 
-        print_device_info(inputInfo, outputInfo);
+        print_device_info(input_info, output_info);
         Log::info("Frames per buffer: {}", config.frames_per_buffer);
         Log::info("Sample rate: {} Hz", config.sample_rate);
         Log::info("Bitrate: {} bps", config.bitrate);
 
-        PaError err = Pa_OpenStream(&_stream, &inputParameters, &outputParameters, config.sample_rate,
-                                    config.frames_per_buffer, paNoFlag, callback, userData);
+        PaError err =
+            Pa_OpenStream(&stream_, &input_parameters, &output_parameters, config.sample_rate,
+                          config.frames_per_buffer, paNoFlag, callback, user_data);
         if (err != paNoError) {
             Log::error("Pa_OpenStream failed: {}", Pa_GetErrorText(err));
-            _stream = nullptr;
+            stream_ = nullptr;
             return false;
         }
-        err = Pa_StartStream(_stream);
+        err = Pa_StartStream(stream_);
         if (err != paNoError) {
             Log::error("Pa_StartStream failed: {}", Pa_GetErrorText(err));
-            Pa_CloseStream(_stream);
-            _stream = nullptr;
+            Pa_CloseStream(stream_);
+            stream_ = nullptr;
             return false;
         }
-        _stream_active.store(true, std::memory_order_relaxed);
+        stream_active_.store(true, std::memory_order_relaxed);
 
-        Log::info("{} input channel(s), {} output channel(s) at {} Hz", _input_channel_count, _output_channel_count,
-                  config.sample_rate);
+        Log::info("{} input channel(s), {} output channel(s) at {} Hz", input_channel_count_,
+                  output_channel_count_, config.sample_rate);
 
         // Create encoder and decoder with config
-        Log::info("Creating client encoder (mono) and decoder (stereo) with {} bps bitrate, complexity {}",
-                  config.bitrate, config.complexity);
-        _encoder.create(config.sample_rate, _input_channel_count, OPUS_APPLICATION_AUDIO, config.bitrate,
-                        config.complexity);
-        _decoder.create(config.sample_rate, _output_channel_count);
+        Log::info(
+            "Creating client encoder (mono) and decoder (stereo) with {} bps bitrate, complexity "
+            "{}",
+            config.bitrate, config.complexity);
+        encoder_.create(config.sample_rate, input_channel_count_, OPUS_APPLICATION_AUDIO,
+                        config.bitrate, config.complexity);
+        decoder_.create(config.sample_rate, output_channel_count_);
 
         return true;
     }
 
     void stop_audio_stream() {
-        _stream_active.store(false, std::memory_order_relaxed);
-        if (_stream != nullptr) {
-            Pa_StopStream(_stream);
-            Pa_CloseStream(_stream);
-            _stream = nullptr;
+        stream_active_.store(false, std::memory_order_relaxed);
+        if (stream_ != nullptr) {
+            Pa_StopStream(stream_);
+            Pa_CloseStream(stream_);
+            stream_ = nullptr;
         }
-        _encoder.destroy();
-        _decoder.destroy();
+        encoder_.destroy();
+        decoder_.destroy();
     }
 
     void print_latency_info() {
-        const PaStreamInfo *streamInfo = Pa_GetStreamInfo(_stream);
-        if (streamInfo != nullptr) {
+        const PaStreamInfo* stream_info = Pa_GetStreamInfo(stream_);
+        if (stream_info != nullptr) {
             static constexpr double SECONDS_TO_MILLISECONDS = 1000.0;
-            Log::info("Input latency:  {:.3f} ms", streamInfo->inputLatency * SECONDS_TO_MILLISECONDS);
-            Log::info("Output latency: {:.3f} ms", streamInfo->outputLatency * SECONDS_TO_MILLISECONDS);
-            Log::info("Sample rate:    {:.1f} Hz", streamInfo->sampleRate);
+            Log::info("Input latency:  {:.3f} ms",
+                      stream_info->inputLatency * SECONDS_TO_MILLISECONDS);
+            Log::info("Output latency: {:.3f} ms",
+                      stream_info->outputLatency * SECONDS_TO_MILLISECONDS);
+            Log::info("Sample rate:    {:.1f} Hz", stream_info->sampleRate);
         }
     }
 
-    void encode_opus(const float *input, int frameSize, std::vector<unsigned char> &output) {
-        _encoder.encode(input, frameSize, output);
+    void encode_opus(const float* input, int frame_size, std::vector<unsigned char>& output) {
+        encoder_.encode(input, frame_size, output);
     }
 
-    void decode_opus(const unsigned char *input, int inputSize, int frameSize, int channelCount,
-                     std::vector<float> &output) {
-        _decoder.decode(input, inputSize, frameSize, output);
+    void decode_opus(const unsigned char* input, int input_size, int frame_size, int channel_count,
+                     std::vector<float>& output) {
+        decoder_.decode(input, input_size, frame_size, output);
     }
 
-    int get_input_channel_count() const { return _input_channel_count; }
-    int get_output_channel_count() const { return _output_channel_count; }
-    bool is_stream_active() const { return _stream_active.load(std::memory_order_relaxed); }
+    int get_input_channel_count() const {
+        return input_channel_count_;
+    }
+    int get_output_channel_count() const {
+        return output_channel_count_;
+    }
+    bool is_stream_active() const {
+        return stream_active_.load(std::memory_order_relaxed);
+    }
 
-    // Simple configuration getter
-    AudioConfig get_config() const { return _current_config; }
+    AudioConfig get_config() const {
+        return current_config_;
+    }
 
-  private:
-    PaStream *_stream = nullptr;
-    opus_encoder_wrapper _encoder;
-    opus_decoder_wrapper _decoder;
-    std::atomic<bool> _stream_active{false};
-    AudioConfig _current_config;
+private:
+    PaStream*          stream_ = nullptr;
+    OpusEncoderWrapper encoder_;
+    OpusDecoderWrapper decoder_;
+    std::atomic<bool>  stream_active_{false};
+    AudioConfig        current_config_;
 
-    int _input_channel_count;
-    int _output_channel_count;
+    int input_channel_count_;
+    int output_channel_count_;
 };

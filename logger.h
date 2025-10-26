@@ -6,21 +6,22 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
-class logger {
-  public:
+class Logger {
+public:
     // Non-copyable singleton
-    logger(const logger &) = delete;
-    logger &operator=(const logger &) = delete;
+    Logger(const Logger&)            = delete;
+    Logger& operator=(const Logger&) = delete;
 
     // Access singleton instance
-    static logger &instance() {
-        static logger inst;
+    static Logger& instance() {
+        static Logger inst;
         return inst;
     }
 
     // Initialize logger
     void init(bool use_stdout = true, bool use_stderr = true, bool use_file = false,
-              const std::string &file_path = "logs/app.log", spdlog::level::level_enum lvl = spdlog::level::debug);
+              const std::string&        file_path = "logs/app.log",
+              spdlog::level::level_enum lvl       = spdlog::level::debug);
 
     // Enable / disable sinks dynamically (thread-safe)
     void enable_stdout(bool enable);
@@ -28,70 +29,78 @@ class logger {
     void enable_file(bool enable);
 
     // Core logging API
-    template <typename... Args> void info(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-        if (m_logger)
-            m_logger->info(fmt, std::forward<Args>(args)...);
+    template <typename... Args>
+    void info(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+        if (logger_) {
+            logger_->info(fmt, std::forward<Args>(args)...);
+        }
     }
 
-    template <typename... Args> void warn(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-        if (m_logger)
-            m_logger->warn(fmt, std::forward<Args>(args)...);
+    template <typename... Args>
+    void warn(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+        if (logger_) {
+            logger_->warn(fmt, std::forward<Args>(args)...);
+        }
     }
 
-    template <typename... Args> void error(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-        if (m_logger)
-            m_logger->error(fmt, std::forward<Args>(args)...);
+    template <typename... Args>
+    void error(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+        if (logger_) {
+            logger_->error(fmt, std::forward<Args>(args)...);
+        }
     }
 
-    template <typename... Args> void debug(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-        if (m_logger)
-            m_logger->debug(fmt, std::forward<Args>(args)...);
+    template <typename... Args>
+    void debug(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+        if (logger_) {
+            logger_->debug(fmt, std::forward<Args>(args)...);
+        }
     }
 
     void flush();
 
-  private:
-    logger() = default;
-    ~logger() = default;
+private:
+    Logger()  = default;
+    ~Logger() = default;
 
     void rebuild_logger_locked();
 
-    std::mutex m_mutex;
-    std::shared_ptr<spdlog::logger> m_logger;
+    std::mutex                      mutex_;
+    std::shared_ptr<spdlog::logger> logger_;
 
-    std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_stdout_sink;
-    std::shared_ptr<spdlog::sinks::stderr_color_sink_mt> m_stderr_sink;
-    std::shared_ptr<spdlog::sinks::basic_file_sink_mt> m_file_sink;
+    std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> stdout_sink_;
+    std::shared_ptr<spdlog::sinks::stderr_color_sink_mt> stderr_sink_;
+    std::shared_ptr<spdlog::sinks::basic_file_sink_mt>   file_sink_;
 
-    bool m_stdout_enabled = true;
-    bool m_stderr_enabled = true;
-    bool m_file_enabled = false;
+    bool stdout_enabled_ = true;
+    bool stderr_enabled_ = true;
+    bool file_enabled_   = false;
 
-    spdlog::level::level_enum m_level = spdlog::level::debug;
+    spdlog::level::level_enum level_ = spdlog::level::debug;
 };
 
-void logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::string &file_path,
+void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::string& file_path,
                   spdlog::level::level_enum lvl) {
-    std::scoped_lock lock(m_mutex);
-    m_stdout_enabled = use_stdout;
-    m_stderr_enabled = use_stderr;
-    m_file_enabled = use_file;
-    m_level = lvl;
+    std::scoped_lock lock(mutex_);
+    stdout_enabled_ = use_stdout;
+    stderr_enabled_ = use_stderr;
+    file_enabled_   = use_file;
+    level_          = lvl;
 
     // Prepare sinks
-    if (use_stdout && !m_stdout_sink) {
-        m_stdout_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        m_stdout_sink->set_pattern("[%T] [%^%l%$] %v");
-        m_stdout_sink->set_level(spdlog::level::debug);
+    if (use_stdout && !stdout_sink_) {
+        stdout_sink_ = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        stdout_sink_->set_pattern("[%T] [%^%l%$] %v");
+        stdout_sink_->set_level(spdlog::level::debug);
     }
 
-    if (use_stderr && !m_stderr_sink) {
-        m_stderr_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
-        m_stderr_sink->set_pattern("[%T] [%^%l%$] %v");
-        m_stderr_sink->set_level(spdlog::level::warn);
+    if (use_stderr && !stderr_sink_) {
+        stderr_sink_ = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+        stderr_sink_->set_pattern("[%T] [%^%l%$] %v");
+        stderr_sink_->set_level(spdlog::level::warn);
     }
 
-    if (use_file && !m_file_sink) {
+    if (use_file && !file_sink_) {
         try {
             std::filesystem::path path(file_path);
             if (!path.parent_path().empty())
@@ -117,10 +126,11 @@ void logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
                 fprintf(stdout, "Logger: Creating new log file\n");
             }
 
-            m_file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, true);
-            m_file_sink->set_pattern("[%Y-%m-%d %T.%e] [%^%l%$] %v");
-        } catch (const std::exception &e) {
-            fprintf(stderr, "Logger: failed to create log file (%s): %s\n", file_path.c_str(), e.what());
+            file_sink_ = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, true);
+            file_sink_->set_pattern("[%Y-%m-%d %T.%e] [%^%l%$] %v");
+        } catch (const std::exception& e) {
+            fprintf(stderr, "Logger: failed to create log file (%s): %s\n", file_path.c_str(),
+                    e.what());
         }
     }
 
@@ -128,69 +138,78 @@ void logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
     spdlog::init_thread_pool(8192, 1);
     rebuild_logger_locked();
 
-    spdlog::set_default_logger(m_logger);
+    spdlog::set_default_logger(logger_);
     spdlog::flush_every(std::chrono::milliseconds(3000));
 }
 
-void logger::rebuild_logger_locked() {
+void Logger::rebuild_logger_locked() {
     std::vector<spdlog::sink_ptr> sinks;
-    if (m_stdout_enabled && m_stdout_sink)
-        sinks.push_back(m_stdout_sink);
-    if (m_stderr_enabled && m_stderr_sink)
-        sinks.push_back(m_stderr_sink);
-    if (m_file_enabled && m_file_sink)
-        sinks.push_back(m_file_sink);
+    if (stdout_enabled_ && stdout_sink_) {
+        sinks.push_back(stdout_sink_);
+    }
+    if (stderr_enabled_ && stderr_sink_) {
+        sinks.push_back(stderr_sink_);
+    }
+    if (file_enabled_ && file_sink_) {
+        sinks.push_back(file_sink_);
+    }
 
     if (sinks.empty()) {
-        m_logger.reset();
+        logger_.reset();
         return;
     }
 
-    m_logger = std::make_shared<spdlog::async_logger>("core", sinks.begin(), sinks.end(), spdlog::thread_pool(),
-                                                      spdlog::async_overflow_policy::block);
-    m_logger->set_level(m_level);
-    m_logger->flush_on(spdlog::level::warn);
+    logger_ = std::make_shared<spdlog::async_logger>("core", sinks.begin(), sinks.end(),
+                                                     spdlog::thread_pool(),
+                                                     spdlog::async_overflow_policy::block);
+    logger_->set_level(level_);
+    logger_->flush_on(spdlog::level::warn);
 }
 
-void logger::enable_stdout(bool enable) {
-    std::scoped_lock lock(m_mutex);
-    m_stdout_enabled = enable;
+void Logger::enable_stdout(bool enable) {
+    std::scoped_lock lock(mutex_);
+    stdout_enabled_ = enable;
     rebuild_logger_locked();
 }
 
-void logger::enable_stderr(bool enable) {
-    std::scoped_lock lock(m_mutex);
-    m_stderr_enabled = enable;
+void Logger::enable_stderr(bool enable) {
+    std::scoped_lock lock(mutex_);
+    stderr_enabled_ = enable;
     rebuild_logger_locked();
 }
 
-void logger::enable_file(bool enable) {
-    std::scoped_lock lock(m_mutex);
-    m_file_enabled = enable;
+void Logger::enable_file(bool enable) {
+    std::scoped_lock lock(mutex_);
+    file_enabled_ = enable;
     rebuild_logger_locked();
 }
 
-void logger::flush() {
-    std::scoped_lock lock(m_mutex);
-    if (m_logger)
-        m_logger->flush();
+void Logger::flush() {
+    std::scoped_lock lock(mutex_);
+    if (logger_) {
+        logger_->flush();
+    }
 }
 
 // Clean namespace for easy logging
 namespace Log {
-template <typename... Args> inline void info(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-    ::logger::instance().info(fmt, std::forward<Args>(args)...);
+template <typename... Args>
+inline void info(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+    ::Logger::instance().info(fmt, std::forward<Args>(args)...);
 }
 
-template <typename... Args> inline void warn(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-    ::logger::instance().warn(fmt, std::forward<Args>(args)...);
+template <typename... Args>
+inline void warn(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+    ::Logger::instance().warn(fmt, std::forward<Args>(args)...);
 }
 
-template <typename... Args> inline void error(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-    ::logger::instance().error(fmt, std::forward<Args>(args)...);
+template <typename... Args>
+inline void error(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+    ::Logger::instance().error(fmt, std::forward<Args>(args)...);
 }
 
-template <typename... Args> inline void debug(spdlog::format_string_t<Args...> fmt, Args &&...args) {
-    ::logger::instance().debug(fmt, std::forward<Args>(args)...);
+template <typename... Args>
+inline void debug(spdlog::format_string_t<Args...> fmt, Args&&... args) {
+    ::Logger::instance().debug(fmt, std::forward<Args>(args)...);
 }
-} // namespace Log
+}  // namespace Log

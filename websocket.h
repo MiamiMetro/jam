@@ -4,52 +4,58 @@
 #include <nlohmann/json.hpp>
 #include <unordered_map>
 
-#include "logger.hpp"
+#include "logger.h"
 
-class websocket {
-    using OnClientMessageCallback =
-        std::function<void(const std::shared_ptr<ix::ConnectionState> &connectionState, ix::WebSocket &webSocket,
-                           const ix::WebSocketMessagePtr &message)>;
+using OnClientMessageCallback =
+    std::function<void(const std::shared_ptr<ix::ConnectionState>& connection_state,
+                       ix::WebSocket& web_socket, const ix::WebSocketMessagePtr& message)>;
 
-  public:
-    websocket(short port, const OnClientMessageCallback &callback = nullptr) : _server(port) {
+class WebSocket {
+public:
+    WebSocket(short port, const OnClientMessageCallback& callback = nullptr) : server_(port) {
         if (callback != nullptr) {
-            setOnClientMessageCallback(callback);
+            set_on_client_message_callback(callback);
         }
     }
 
-    bool start() { return _server.listenAndStart(); }
-    void stop() { _server.stop(); }
-    void broadcast(const std::string &message) {
-        for (const auto &client : _clients) {
+    bool start() {
+        return server_.listenAndStart();
+    }
+    void stop() {
+        server_.stop();
+    }
+    void broadcast(const std::string& message) {
+        for (const auto& client: clients_) {
             client.second->send(message, false, [](int current, int total) -> bool {
                 Log::info("Sending message: {} of {}", current, total);
                 return true;
             });
         }
     }
-    void setOnClientMessageCallback(const OnClientMessageCallback &callback) {
-        _server.setOnClientMessageCallback([this, callback](const std::shared_ptr<ix::ConnectionState> &connectionState,
-                                                            ix::WebSocket &webSocket,
-                                                            const ix::WebSocketMessagePtr &message) {
-            _client_handler(connectionState, webSocket, message);
-            callback(connectionState, webSocket, message);
-        });
+    void set_on_client_message_callback(const OnClientMessageCallback& callback) {
+        server_.setOnClientMessageCallback(
+            [this, callback](const std::shared_ptr<ix::ConnectionState>& connection_state,
+                             ix::WebSocket& web_socket, const ix::WebSocketMessagePtr& message) {
+                client_handler_(connection_state, web_socket, message);
+                callback(connection_state, web_socket, message);
+            });
     }
 
-  private:
-    ix::WebSocketServer _server;
-    std::unordered_map<std::string, std::shared_ptr<ix::WebSocket>> _clients;
-    const OnClientMessageCallback _client_handler = [this](const std::shared_ptr<ix::ConnectionState> &connectionState,
-                                                           ix::WebSocket &webSocket,
-                                                           const ix::WebSocketMessagePtr &message) {
-        if (message->type == ix::WebSocketMessageType::Open) {
-            Log::info("New connection from {}:{}", connectionState->getRemoteIp(), connectionState->getRemotePort());
-            _clients[connectionState->getId()] =
-                std::shared_ptr<ix::WebSocket>(&webSocket, [](ix::WebSocket *) { /* no-op deleter */ });
-        } else if (message->type == ix::WebSocketMessageType::Close) {
-            Log::info("Connection closed from {}:{}", connectionState->getRemoteIp(), connectionState->getRemotePort());
-            _clients.erase(connectionState->getId());
-        }
-    };
+private:
+    ix::WebSocketServer                                             server_;
+    std::unordered_map<std::string, std::shared_ptr<ix::WebSocket>> clients_;
+    const OnClientMessageCallback                                   client_handler_ =
+        [this](const std::shared_ptr<ix::ConnectionState>& connection_state,
+               ix::WebSocket& web_socket, const ix::WebSocketMessagePtr& message) {
+            if (message->type == ix::WebSocketMessageType::Open) {
+                Log::info("New connection from {}:{}", connection_state->getRemoteIp(),
+                          connection_state->getRemotePort());
+                clients_[connection_state->getId()] = std::shared_ptr<ix::WebSocket>(
+                    &web_socket, [](ix::WebSocket*) { /* no-op deleter */ });
+            } else if (message->type == ix::WebSocketMessageType::Close) {
+                Log::info("Connection closed from {}:{}", connection_state->getRemoteIp(),
+                          connection_state->getRemotePort());
+                clients_.erase(connection_state->getId());
+            }
+        };
 };

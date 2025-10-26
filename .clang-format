@@ -1,5 +1,58 @@
-BasedOnStyle: LLVM
+BasedOnStyle: Google
+Language: Cpp
+
+# --- Core Formatting ---
 IndentWidth: 4
-ColumnLimit: 120
+TabWidth: 4
 UseTab: Never
+ColumnLimit: 100
+
+# --- Braces & Layout ---
 BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+
+# --- Indentation Rules ---
+NamespaceIndentation: None
+AccessModifierOffset: -4
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+
+# --- Spacing ---
+SpacesBeforeTrailingComments: 2
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+SpaceBeforeCtorInitializerColon: true
+Cpp11BracedListStyle: true
+
+# --- Includes ---
+IncludeBlocks: Preserve
+SortIncludes: true
+IncludeCategories:
+  - Regex: '^<.*>'
+    Priority: 1
+  - Regex: '^".*"'
+    Priority: 2
+
+# --- Naming (for clangd diagnostics, optional if you use clang-tidy) ---
+# Clang-format doesn't enforce naming by itself, but if clangd uses clang-tidy,
+# these are good guidelines to pair with it.
+# Use these in .clang-tidy if needed:
+# Naming:
+#   VariableCase: lower_case
+#   MemberVariableSuffix: "_"
+#   FunctionCase: lower_case
+#   ClassCase: PascalCase
+#   ConstantCase: UPPER_CASE
+
+# --- Misc ---
+ReflowComments: true
+DerivePointerAlignment: false
+PointerAlignment: Left
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+AlignTrailingComments: true
+SortUsingDeclarations: true
+SpaceBeforeRangeBasedForLoopColon: false
+KeepEmptyLinesAtTheStartOfBlocks: false
