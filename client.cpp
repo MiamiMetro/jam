@@ -547,17 +547,22 @@ int main() {
                     auto json_message = json::parse(message->str);
                     if (json_message.contains("command")) {
                         if (json_message["command"] == "get_devices") {
-                            auto devices = AudioStream::get_devices_json(
-                                json_message["host_api"].get<std::string>());
-                            webSocket.sendText(devices.dump());
+                            if (json_message.contains("host_api")) {
+                                auto devices = AudioStream::get_devices_json(
+                                    json_message["host_api"].get<std::string>());
+                                webSocket.sendText(devices.dump());
+                            } else {
+                                auto devices = AudioStream::get_devices_json();
+                                webSocket.sendText(devices.dump());
+                            }
                         }
                     }
                 }
             });
         ws_server.start();
-        PeriodicTimer timer(io_context, 1s, [&ws_server]() {
-            ws_server.broadcast(json({{"type", "ping"}}).dump());
-        });
+        // PeriodicTimer timer(io_context, 1s, [&ws_server]() {
+        //     ws_server.broadcast(json({{"type", "ping"}}).dump());
+        // });
 
         io_context.run();
     } catch (std::exception& e) {
