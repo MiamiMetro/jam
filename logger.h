@@ -1,7 +1,18 @@
 #pragma once
+#include <chrono>
+#include <cstdio>
+#include <exception>
 #include <filesystem>
+#include <memory>
 #include <mutex>
+#include <print>
+#include <string>
+#include <vector>
+
 #include <spdlog/async.h>
+#include <spdlog/async_logger.h>
+#include <spdlog/common.h>
+#include <spdlog/logger.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
@@ -103,27 +114,28 @@ void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
     if (use_file && !file_sink_) {
         try {
             std::filesystem::path path(file_path);
-            if (!path.parent_path().empty())
+            if (!path.parent_path().empty()) {
                 std::filesystem::create_directories(path.parent_path());
+            }
 
             // Check existing log file size before creating sink
             if (std::filesystem::exists(path)) {
                 auto file_size = std::filesystem::file_size(path);
-                if (file_size >= 1024 * 1024) {
+                if (file_size >= static_cast<long long>(1024) * 1024) {
                     // Size in MB
                     double size_mb = static_cast<double>(file_size) / (1024.0 * 1024.0);
-                    fprintf(stdout, "Logger: Existing log file size: %.2f MB\n", size_mb);
+                    std::println(stdout, "Logger: Existing log file size: {:.2f} MB", size_mb);
                 } else if (file_size >= 1024) {
                     // Size in KB
                     double size_kb = static_cast<double>(file_size) / 1024.0;
-                    fprintf(stdout, "Logger: Existing log file size: %.2f KB\n", size_kb);
+                    std::println(stdout, "Logger: Existing log file size: {:.2f} KB", size_kb);
                 } else {
                     // Size in bytes
-                    fprintf(stdout, "Logger: Existing log file size: %llu bytes\n",
-                            static_cast<unsigned long long>(file_size));
+                    std::println(stdout, "Logger: Existing log file size: {} bytes",
+                                 static_cast<unsigned long long>(file_size));
                 }
             } else {
-                fprintf(stdout, "Logger: Creating new log file\n");
+                std::println(stdout, "Logger: Creating new log file");
             }
 
             file_sink_ = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, true);

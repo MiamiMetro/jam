@@ -1,9 +1,14 @@
 #pragma once
 
-#include <asio.hpp>
 #include <chrono>
 #include <functional>
+#include <system_error>
 #include <utility>
+
+#include <asio.hpp>
+#include <asio/io_context.hpp>
+#include <asio/steady_timer.hpp>
+
 #include "logger.h"
 
 class PeriodicTimer {
@@ -12,8 +17,8 @@ public:
                   std::function<void()> callback)
         : timer_(io_context),
           interval_(interval),
-          callback_(std::move(callback)),
-          next_tick_(std::chrono::steady_clock::now() + interval) {
+          next_tick_(std::chrono::steady_clock::now() + interval),
+          callback_(std::move(callback)) {
         timer_.expires_at(next_tick_);  // Use absolute time from the start
         timer_.async_wait([this](std::error_code error_code) { on_timeout(error_code); });
     }

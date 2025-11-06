@@ -1,0 +1,47 @@
+CompileFlags:
+  Add:
+    - -std=c++23
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+    - -DWIN32
+    - -D_WINDOWS
+    - -D_WIN32_WINNT=0x0A00
+    - -DASIO_STANDALONE
+    - -DASIO_HAS_STD_ADDRESSOF
+    - -DASIO_HAS_STD_ARRAY
+    - -DASIO_HAS_CSTDINT
+    - -DASIO_HAS_STD_SHARED_PTR
+    - -DASIO_HAS_STD_TYPE_TRAITS
+    - -I.
+    - -Ibuild/_deps/asio-src/asio/include
+    - -Ibuild/_deps/portaudio-src/include
+    - -Ibuild/_deps/opus-src/include
+    - -Ibuild/_deps/concurrentqueue-src
+    - -Ibuild/_deps/ixwebsocket-src
+    - -Ibuild/_deps/json-src/include
+    - -Ibuild/_deps/spdlog-src/include
+  Remove:
+    - -w
+
+Diagnostics:
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
+  ClangTidy:
+    Add:
+      - modernize-*
+      - performance-*
+      - readability-*
+      - bugprone-*
+    Remove:
+      - modernize-use-trailing-return-type
+      - readability-identifier-length
+
+Index:
+  Background: Build
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+

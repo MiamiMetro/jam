@@ -1,14 +1,31 @@
 #include <algorithm>
 #include <array>
-#include <asio.hpp>
 #include <atomic>
 #include <chrono>
-#include <concurrentqueue.h>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <nlohmann/json.hpp>
+#include <exception>
+#include <memory>
 #include <opus.h>
 #include <portaudio.h>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include <asio.hpp>
+#include <asio/buffer.hpp>
+#include <asio/io_context.hpp>
+#include <asio/ip/udp.hpp>
+#include <concurrentqueue.h>
+#include <ixwebsocket/IXConnectionState.h>
+#include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXWebSocketMessage.h>
+#include <ixwebsocket/IXWebSocketMessageType.h>
+#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
+#include <spdlog/common.h>
 
 #include "audio_stream.h"
 #include "logger.h"
@@ -25,14 +42,14 @@ public:
     Client(asio::io_context& io_context, const std::string& server_address, short server_port)
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
-          ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
-          alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
+          is_connected_(false),
+          echo_enabled_(false),
           jitter_buffer_ready_(false),
           jitter_buffer_min_packets_(2),
           jitter_buffer_target_packets_(4),
           jitter_buffer_max_packets_(16),
-          is_connected_(false),
-          echo_enabled_(false) {
+          ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
+          alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }) {
         Log::info("Client local port: {}", socket_.local_endpoint().port());
 
         // Start audio stream with configuration
@@ -172,7 +189,7 @@ public:
         }
 
         socket_.async_send_to(asio::buffer(data, len), server_endpoint_,
-                              [this](std::error_code error_code, std::size_t) {
+                              [](std::error_code error_code, std::size_t) {
                                   if (error_code) {
                                       Log::error("send error: {}", error_code.message());
                                   }
@@ -200,7 +217,7 @@ private:
         send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
     }
 
-    void handle_ping_message(std::size_t bytes) {
+    void handle_ping_message(std::size_t /*bytes*/) {
         SyncHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(SyncHdr));
 
@@ -218,7 +235,7 @@ private:
         Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
     }
 
-    void handle_echo_message(std::size_t bytes) {
+    void handle_echo_message(std::size_t /*bytes*/) {
         EchoHdr ehdr{};
         std::memcpy(&ehdr, recv_buf_.data(), sizeof(EchoHdr));
         static int echo_count = 0;
@@ -252,8 +269,7 @@ private:
     void decode_audio_data(const unsigned char* audio_data, uint16_t encoded_bytes,
                            std::vector<float>& decoded_data) {
         // Decode the received Opus data
-        audio_.decode_opus(audio_data, encoded_bytes, 240, audio_.get_output_channel_count(),
-                           decoded_data);
+        audio_.decode_opus(audio_data, encoded_bytes, 240, decoded_data);
 
         // Diagnostic: Check decoded size periodically
         static int decode_count = 0;
@@ -539,26 +555,25 @@ int main() {
         asio::io_context io_context;
         Client           client_instance(io_context, "127.0.0.1", 9999);
 
-        WebSocket ws_server(
-            9969,
-            [&client_instance](const std::shared_ptr<ix::ConnectionState>& connectionState,
+        WebSocket ws_server(9969,
+                            [](const std::shared_ptr<ix::ConnectionState>& /*connectionState*/,
                                ix::WebSocket& webSocket, const ix::WebSocketMessagePtr& message) {
-                if (message->type == ix::WebSocketMessageType::Message) {
-                    auto json_message = json::parse(message->str);
-                    if (json_message.contains("command")) {
-                        if (json_message["command"] == "get_devices") {
-                            if (json_message.contains("host_api")) {
-                                auto devices = AudioStream::get_devices_json(
-                                    json_message["host_api"].get<std::string>());
-                                webSocket.sendText(devices.dump());
-                            } else {
-                                auto devices = AudioStream::get_devices_json();
-                                webSocket.sendText(devices.dump());
-                            }
-                        }
-                    }
-                }
-            });
+                                if (message->type == ix::WebSocketMessageType::Message) {
+                                    auto json_message = json::parse(message->str);
+                                    if (json_message.contains("command")) {
+                                        if (json_message["command"] == "get_devices") {
+                                            if (json_message.contains("host_api")) {
+                                                auto devices = AudioStream::get_devices_json(
+                                                    json_message["host_api"].get<std::string>());
+                                                webSocket.sendText(devices.dump());
+                                            } else {
+                                                auto devices = AudioStream::get_devices_json();
+                                                webSocket.sendText(devices.dump());
+                                            }
+                                        }
+                                    }
+                                }
+                            });
         ws_server.start();
         // PeriodicTimer timer(io_context, 1s, [&ws_server]() {
         //     ws_server.broadcast(json({{"type", "ping"}}).dump());

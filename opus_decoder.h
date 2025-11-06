@@ -1,7 +1,10 @@
 #pragma once
 
-#include <opus.h>
 #include <vector>
+
+#include <opus.h>
+#include <opus_defines.h>
+
 #include "logger.h"
 
 class OpusDecoderWrapper {
@@ -67,7 +70,7 @@ public:
             return false;
         }
 
-        output.resize(frame_size * channels_);
+        output.resize(static_cast<long long>(frame_size) * channels_);
         int decoded_samples_per_channel =
             opus_decode_float(decoder_, input, input_size, output.data(), frame_size, 0);
 
@@ -77,7 +80,7 @@ public:
             return false;
         }
 
-        output.resize(decoded_samples_per_channel * channels_);
+        output.resize(static_cast<long long>(decoded_samples_per_channel) * channels_);
         return true;
     }
 
@@ -89,7 +92,7 @@ public:
             return false;
         }
 
-        output.resize(frame_size * channels_);
+        output.resize(static_cast<long long>(frame_size) * channels_);
         // Pass nullptr to trigger PLC (packet loss concealment)
         int decoded_samples_per_channel =
             opus_decode_float(decoder_, nullptr, 0, output.data(), frame_size, 0);
@@ -100,7 +103,7 @@ public:
             return false;
         }
 
-        output.resize(decoded_samples_per_channel * channels_);
+        output.resize(static_cast<long long>(decoded_samples_per_channel) * channels_);
         return true;
     }
 

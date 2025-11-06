@@ -1,12 +1,25 @@
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <functional>
+#include <string_view>
+#include <system_error>
+#include <unordered_map>
+#include <vector>
+
 #include <asio.hpp>
+#include <asio/buffer.hpp>
+#include <asio/io_context.hpp>
+#include <asio/ip/udp.hpp>
 #include <concurrentqueue.h>
 #include <opus.h>
-#include <unordered_map>
+#include <spdlog/common.h>
 
 #include "logger.h"
-#include "opus_decoder.h"
-#include "opus_encoder.h"
 #include "periodic_timer.h"
 #include "protocol.h"
 
@@ -23,7 +36,6 @@ public:
         // Server encoder: sends stereo to clients (2 ch)
         // Complexity 2 matches Jamulus for lower CPU usage
         Log::info("Creating server encoder: 2ch (stereo), 48kHz, complexity=2");
-        encoder_.create(48000, 2, OPUS_APPLICATION_AUDIO, 128000, 2);
     }
 
     ~Server() {
@@ -83,7 +95,7 @@ private:
     }
 
     void handle_ping_message(std::size_t bytes) {
-        if (bytes < sizeof(SyncHdr) || clients_.find(remote_endpoint_) == clients_.end()) {
+        if (bytes < sizeof(SyncHdr) || !clients_.contains(remote_endpoint_)) {
             do_receive();
             return;
         }
@@ -133,7 +145,7 @@ private:
     }
 
     void handle_echo_message(std::size_t bytes) {
-        if (bytes < sizeof(EchoHdr) || clients_.find(remote_endpoint_) == clients_.end()) {
+        if (bytes < sizeof(EchoHdr) || !clients_.contains(remote_endpoint_)) {
             do_receive();
             return;
         }
@@ -142,8 +154,7 @@ private:
     }
 
     void handle_audio_message(std::size_t bytes) {
-        if (bytes < sizeof(MsgHdr) + sizeof(uint16_t) ||
-            clients_.find(remote_endpoint_) == clients_.end()) {
+        if (bytes < sizeof(MsgHdr) + sizeof(uint16_t) || !clients_.contains(remote_endpoint_)) {
             do_receive();
             return;
         }
@@ -202,83 +213,7 @@ private:
         send(&ahdr, packet_size, endpoint);
     }
 
-    void broadcast_timer_callback() {
-        // Only broadcast if we have clients
-        if (clients_.empty()) {
-            return;
-        }
-
-        // Constants for audio processing
-        constexpr int FRAME_SIZE        = 240;  // 5ms at 48kHz (matches Jamulus)
-        constexpr int SAMPLE_RATE       = 48000;
-        constexpr int INPUT_CHANNELS    = 1;  // Clients send mono
-        constexpr int OUTPUT_CHANNELS   = 2;  // Server sends stereo
-        constexpr int SAMPLES_PER_FRAME = FRAME_SIZE * OUTPUT_CHANNELS;
-
-        // Create stereo mix buffer (initialized to silence)
-        std::vector<float> stereo_mix(SAMPLES_PER_FRAME, 0.0F);
-        int                active_clients = 0;
-
-        // Process each client's audio
-        for (auto& [endpoint, client_info]: clients_) {
-            std::vector<unsigned char> audio_packet;
-
-            // Try to get the latest audio packet from this client
-            if (client_info.audio_queue.try_dequeue(audio_packet)) {
-                // Decode the client's mono audio
-                std::vector<float> mono_audio;
-                if (client_info.decoder.decode(audio_packet.data(), audio_packet.size(), FRAME_SIZE,
-                                               mono_audio)) {
-                    // Upmix mono to stereo and add to mix
-                    if (mono_audio.size() == FRAME_SIZE) {
-                        for (int i = 0; i < FRAME_SIZE; ++i) {
-                            float sample = mono_audio[i];
-                            // Simple upmix: duplicate mono to both stereo channels
-                            stereo_mix[(i * 2)] += sample;      // Left channel
-                            stereo_mix[(i * 2) + 1] += sample;  // Right channel
-                        }
-                        active_clients++;
-                    }
-                }
-            } else {
-                // No audio packet available - use packet loss concealment
-                std::vector<float> plc_audio;
-                if (client_info.decoder.decode_plc(FRAME_SIZE, plc_audio)) {
-                    if (plc_audio.size() == FRAME_SIZE) {
-                        for (int i = 0; i < FRAME_SIZE; ++i) {
-                            float sample = plc_audio[i];
-                            stereo_mix[(i * 2)] += sample;      // Left channel
-                            stereo_mix[(i * 2) + 1] += sample;  // Right channel
-                        }
-                    }
-                }
-            }
-        }
-
-        // Apply gain control to prevent clipping (simple normalization)
-        if (active_clients > 0) {
-            float gain = 1.0F / static_cast<float>(active_clients);
-            for (float& sample: stereo_mix) {
-                sample *= gain;
-            }
-        }
-
-        // Encode the stereo mix
-        std::vector<unsigned char> encoded_mix;
-        if (encoder_.encode(stereo_mix.data(), FRAME_SIZE, encoded_mix)) {
-            // Broadcast to all clients
-            for (const auto& [endpoint, client_info]: clients_) {
-                send_audio_to_client(endpoint, encoded_mix);
-            }
-        }
-
-        // Optional: Print stats periodically (reduced frequency to lower CPU overhead)
-        static int callback_count = 0;
-        if (++callback_count % 2000 == 0) {  // Every 10 seconds (2000 * 5ms = 10000ms)
-            Log::info("Broadcast: {} clients, {} active, mix size: {} bytes", clients_.size(),
-                      active_clients, encoded_mix.size());
-        }
-    }
+    void broadcast_timer_callback() {}
 
     struct endpoint_hash {
         size_t operator()(const udp::endpoint& endpoint) const {
@@ -299,12 +234,6 @@ private:
     struct ClientInfo {
         std::chrono::steady_clock::time_point                   last_alive;
         moodycamel::ConcurrentQueue<std::vector<unsigned char>> audio_queue;
-        OpusDecoderWrapper decoder;  // Per-client decoder (maintains state)
-
-        ClientInfo() {
-            // Each client sends mono audio at 48kHz
-            decoder.create(48000, 1);
-        }
 
         void push_audio_packet(const std::vector<unsigned char>& packet) {
             if (audio_queue.size_approx() >= 16) {
@@ -320,9 +249,7 @@ private:
     std::unordered_map<udp::endpoint, ClientInfo, endpoint_hash> clients_;
 
     std::array<char, 1024> recv_buf_;
-    std::array<char, 1024> audio_tx_buf_;
     udp::endpoint          remote_endpoint_;
-    OpusEncoderWrapper     encoder_;  // Shared encoder for all clients
 
     PeriodicTimer alive_check_timer_;
     PeriodicTimer broadcast_timer_;

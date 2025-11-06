@@ -1,7 +1,11 @@
 #pragma once
 
-#include <opus.h>
+#include <cstdint>
 #include <vector>
+
+#include <opus.h>
+#include <opus_defines.h>
+
 #include "logger.h"
 
 class OpusEncoderWrapper {

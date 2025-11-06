@@ -1,8 +1,15 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <string>
+#include <vector>
+
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
+#include <opus_defines.h>
 #include <portaudio.h>
+
 #include "logger.h"
 #include "opus_decoder.h"
 #include "opus_encoder.h"
@@ -212,7 +219,7 @@ public:
         encoder_.encode(input, frame_size, output);
     }
 
-    void decode_opus(const unsigned char* input, int input_size, int frame_size, int channel_count,
+    void decode_opus(const unsigned char* input, int input_size, int frame_size,
                      std::vector<float>& output) {
         decoder_.decode(input, input_size, frame_size, output);
     }
