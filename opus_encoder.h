@@ -1,15 +1,24 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
 #include <opus.h>
 #include <opus_defines.h>
+#include <opus_types.h>
 
 #include "logger.h"
 
 class OpusEncoderWrapper {
 public:
+    using SampleRate = int;
+    using Channels   = int;
+    using Bitrate    = int;
+    using Complexity = int;
+
+    static constexpr size_t ENCODE_BUFFER_SIZE = 512;
+
     OpusEncoderWrapper() = default;
 
     ~OpusEncoderWrapper() {
@@ -37,8 +46,9 @@ public:
         return *this;
     }
 
-    bool create(int sample_rate, int channels, int application = OPUS_APPLICATION_AUDIO,
-                int bitrate = 256000, int complexity = 5) {
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters) - Parameters are semantically distinct
+    bool create(SampleRate sample_rate, Channels channels, opus_int32 application, Bitrate bitrate,
+                Complexity complexity) {
         destroy();  // Clean up any existing encoder
 
         int err;
@@ -87,9 +97,9 @@ public:
             return false;
         }
 
-        output.resize(512);  // Buffer for high-quality music
-        int encoded_bytes =
-            opus_encode_float(encoder_, input, frame_size, output.data(), output.size());
+        output.resize(ENCODE_BUFFER_SIZE);
+        int encoded_bytes = opus_encode_float(encoder_, input, frame_size, output.data(),
+                                              static_cast<opus_int32>(output.size()));
 
         if (encoded_bytes < 0) {
             Log::error("Opus encoding failed: {}", opus_strerror(encoded_bytes));

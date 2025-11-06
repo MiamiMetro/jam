@@ -19,6 +19,12 @@
 
 class Logger {
 public:
+    // Constants
+    static constexpr long long BYTES_PER_KB      = 1024LL;
+    static constexpr double    BYTES_PER_KB_DBL  = 1024.0;
+    static constexpr size_t    THREAD_POOL_SIZE  = 8192;
+    static constexpr int       FLUSH_INTERVAL_MS = 3000;
+
     // Non-copyable singleton
     Logger(const Logger&)            = delete;
     Logger& operator=(const Logger&) = delete;
@@ -121,13 +127,14 @@ void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
             // Check existing log file size before creating sink
             if (std::filesystem::exists(path)) {
                 auto file_size = std::filesystem::file_size(path);
-                if (file_size >= static_cast<long long>(1024) * 1024) {
+                if (file_size >= BYTES_PER_KB * BYTES_PER_KB) {
                     // Size in MB
-                    double size_mb = static_cast<double>(file_size) / (1024.0 * 1024.0);
+                    double size_mb =
+                        static_cast<double>(file_size) / (BYTES_PER_KB_DBL * BYTES_PER_KB_DBL);
                     std::println(stdout, "Logger: Existing log file size: {:.2f} MB", size_mb);
-                } else if (file_size >= 1024) {
+                } else if (file_size >= BYTES_PER_KB) {
                     // Size in KB
-                    double size_kb = static_cast<double>(file_size) / 1024.0;
+                    double size_kb = static_cast<double>(file_size) / BYTES_PER_KB_DBL;
                     std::println(stdout, "Logger: Existing log file size: {:.2f} KB", size_kb);
                 } else {
                     // Size in bytes
@@ -147,11 +154,11 @@ void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
     }
 
     // Build and configure async logger
-    spdlog::init_thread_pool(8192, 1);
+    spdlog::init_thread_pool(THREAD_POOL_SIZE, 1);
     rebuild_logger_locked();
 
     spdlog::set_default_logger(logger_);
-    spdlog::flush_every(std::chrono::milliseconds(3000));
+    spdlog::flush_every(std::chrono::milliseconds(FLUSH_INTERVAL_MS));
 }
 
 void Logger::rebuild_logger_locked() {

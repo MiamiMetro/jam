@@ -1,12 +1,22 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
-// Magic numbers for packet identification
+// Packet identification magic numbers
 constexpr uint32_t PING_MAGIC  = 0x50494E47;  // 'PING'
 constexpr uint32_t CTRL_MAGIC  = 0x4354524C;  // 'CTRL'
 constexpr uint32_t ECHO_MAGIC  = 0x4543484F;  // 'ECHO'
 constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
+
+// Buffer sizes
+constexpr size_t ECHO_DATA_SIZE = 256;
+constexpr size_t AUDIO_BUF_SIZE = 512;
+
+// Type aliases
+template <size_t N>
+using Bytes = std::array<char, N>;
 
 #pragma pack(push, 1)
 
@@ -30,12 +40,12 @@ struct CtrlHdr : MsgHdr {
 };
 
 struct EchoHdr : MsgHdr {
-    char data[256];
+    Bytes<ECHO_DATA_SIZE> data;
 };
 
 struct AudioHdr : MsgHdr {
-    uint16_t encoded_bytes;  // size of the encoded Opus data
-    char     buf[512];       // Increased for music (was 128)
+    uint16_t              encoded_bytes;  // size of the encoded Opus data
+    Bytes<AUDIO_BUF_SIZE> buf;
 };
 
 #pragma pack(pop)

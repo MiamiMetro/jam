@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -9,14 +8,11 @@
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
-#include <vector>
 
 #include <asio.hpp>
 #include <asio/buffer.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
-#include <concurrentqueue.h>
-#include <opus.h>
 #include <spdlog/common.h>
 
 #include "logger.h"
@@ -28,14 +24,16 @@ using namespace std::chrono_literals;
 
 class Server {
 public:
+    static constexpr auto   ALIVE_CHECK_INTERVAL = 5s;
+    static constexpr auto   CLIENT_TIMEOUT       = 15s;
+    static constexpr size_t RECV_BUF_SIZE        = 1024;
+
     Server(asio::io_context& io_context, short port)
         : socket_(io_context, udp::endpoint(udp::v4(), port)),
-          alive_check_timer_(io_context, 5s, [this]() { alive_check_timer_callback(); }),
-          broadcast_timer_(io_context, 5000us, [this]() { broadcast_timer_callback(); }) {
+          alive_check_timer_(io_context, ALIVE_CHECK_INTERVAL,
+                             [this]() { alive_check_timer_callback(); }) {
         do_receive();
-        // Server encoder: sends stereo to clients (2 ch)
-        // Complexity 2 matches Jamulus for lower CPU usage
-        Log::info("Creating server encoder: 2ch (stereo), 48kHz, complexity=2");
+        Log::info("SFU server ready: forwarding audio between clients");
     }
 
     ~Server() {
@@ -166,24 +164,28 @@ private:
         // Verify we received all the data
         size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
         if (bytes < expected_size) {
-            Log::error("Incomplete audio packet: got {}, expected {}", bytes, expected_size);
+            Log::error("Incomplete audio packet: got {}, expected {} (encoded_bytes={})", bytes,
+                       expected_size, encoded_bytes);
             do_receive();
             return;
         }
 
-        // Extract audio data (starts after magic + encoded_bytes field)
-        const unsigned char* audio_data = reinterpret_cast<const unsigned char*>(
-            recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint16_t));
+        // Additional safety check: ensure encoded_bytes is reasonable
+        if (encoded_bytes > AUDIO_BUF_SIZE) {
+            Log::error("Invalid audio packet: encoded_bytes {} exceeds max {}", encoded_bytes,
+                       AUDIO_BUF_SIZE);
+            do_receive();
+            return;
+        }
 
-        std::vector<unsigned char> audio_data_vec(audio_data, audio_data + encoded_bytes);
-
-        clients_[remote_endpoint_].push_audio_packet(audio_data_vec);
+        // SFU: Forward audio packet to all other clients (not back to sender)
+        forward_audio_to_others(remote_endpoint_, recv_buf_.data(), bytes);
     }
 
     void alive_check_timer_callback() {
         auto now = std::chrono::steady_clock::now();
         for (auto it = clients_.begin(); it != clients_.end();) {
-            if (now - it->second.last_alive > 15s) {
+            if (now - it->second.last_alive > CLIENT_TIMEOUT) {
                 Log::info("Client {}:{} timed out", it->first.address().to_string(),
                           it->first.port());
                 it = clients_.erase(it);
@@ -193,27 +195,15 @@ private:
         }
     }
 
-    void send_audio_to_client(const udp::endpoint&              endpoint,
-                              const std::vector<unsigned char>& encoded_audio) {
-        if (encoded_audio.empty()) {
-            return;
+    void forward_audio_to_others(const udp::endpoint& sender, void* packet_data,
+                                 std::size_t packet_size) {
+        // Forward the audio packet to all clients except the sender
+        for (const auto& [endpoint, client_info]: clients_) {
+            if (endpoint != sender) {
+                send(packet_data, packet_size, endpoint);
+            }
         }
-
-        // Create audio packet header
-        AudioHdr ahdr{};
-        ahdr.magic         = AUDIO_MAGIC;
-        ahdr.encoded_bytes = static_cast<uint16_t>(encoded_audio.size());
-
-        // Copy encoded audio data to the header buffer
-        size_t copy_size = std::min(encoded_audio.size(), sizeof(ahdr.buf));
-        std::memcpy(ahdr.buf, encoded_audio.data(), copy_size);
-
-        // Send the packet
-        size_t packet_size = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
-        send(&ahdr, packet_size, endpoint);
     }
-
-    void broadcast_timer_callback() {}
 
     struct endpoint_hash {
         size_t operator()(const udp::endpoint& endpoint) const {
@@ -232,41 +222,32 @@ private:
     };
 
     struct ClientInfo {
-        std::chrono::steady_clock::time_point                   last_alive;
-        moodycamel::ConcurrentQueue<std::vector<unsigned char>> audio_queue;
-
-        void push_audio_packet(const std::vector<unsigned char>& packet) {
-            if (audio_queue.size_approx() >= 16) {
-                std::vector<unsigned char> discarded;
-                audio_queue.try_dequeue(discarded);  // discard oldest
-            }
-            audio_queue.enqueue(packet);
-        }
+        std::chrono::steady_clock::time_point last_alive;
     };
 
     udp::socket socket_;
 
     std::unordered_map<udp::endpoint, ClientInfo, endpoint_hash> clients_;
 
-    std::array<char, 1024> recv_buf_;
-    udp::endpoint          remote_endpoint_;
+    std::array<char, RECV_BUF_SIZE> recv_buf_;
+    udp::endpoint                   remote_endpoint_;
 
     PeriodicTimer alive_check_timer_;
-    PeriodicTimer broadcast_timer_;
 };
 
 int main() {
     try {
+        constexpr short SERVER_PORT = 9999;
+
         auto& log = Logger::instance();
         log.init(true, false, false, "", spdlog::level::warn);
 
         asio::io_context io_context;
-        Server           srv(io_context, 9999);
+        Server           srv(io_context, SERVER_PORT);
 
-        log.info("Echo server listening on 127.0.0.1:9999");
-        log.info("Broadcast timer running at 5ms intervals (48kHz, 240 frames)");
+        log.info("SFU server listening on 127.0.0.1:{}", SERVER_PORT);
+        log.info("Forwarding audio packets between clients");
 
-        // Just run the io_context - timers handle everything!
         io_context.run();
     } catch (std::exception& e) {
         Log::error("ERR: {}", e.what());

@@ -17,6 +17,13 @@
 class AudioStream {
 public:
     struct AudioConfig {
+        static constexpr int   DEFAULT_SAMPLE_RATE       = 48000;
+        static constexpr int   DEFAULT_BITRATE           = 64000;
+        static constexpr int   DEFAULT_COMPLEXITY        = 2;
+        static constexpr int   DEFAULT_FRAMES_PER_BUFFER = 240;
+        static constexpr float DEFAULT_INPUT_GAIN        = 1.0F;
+        static constexpr float DEFAULT_OUTPUT_GAIN       = 1.0F;
+
         int   sample_rate{};
         int   bitrate{};
         int   complexity{};
@@ -25,12 +32,12 @@ public:
         float output_gain{};
 
         AudioConfig()
-            : sample_rate(48000),
-              bitrate(64000),
-              complexity(2),
-              frames_per_buffer(240),
-              input_gain(1.0F),
-              output_gain(1.0F) {}
+            : sample_rate(DEFAULT_SAMPLE_RATE),
+              bitrate(DEFAULT_BITRATE),
+              complexity(DEFAULT_COMPLEXITY),
+              frames_per_buffer(DEFAULT_FRAMES_PER_BUFFER),
+              input_gain(DEFAULT_INPUT_GAIN),
+              output_gain(DEFAULT_OUTPUT_GAIN) {}
     };
 
     AudioStream() {

@@ -12,6 +12,9 @@
 ```
 class PlayerCharacter {
 public:
+    // Public constants
+    static constexpr int MAX_HEALTH = 100;
+
     // Constructors / destructors
     PlayerCharacter();
     ~PlayerCharacter();
@@ -20,12 +23,9 @@ public:
     void take_damage(int amount);
     void heal(int amount);
 
-    // Public constants (if any)
-    static const int MAX_HEALTH = 100;
-
 protected:
     // Protected hooks
-    void on_damage_taken();
+    virtual void on_damage_taken();
 
 private:
     // Private helpers

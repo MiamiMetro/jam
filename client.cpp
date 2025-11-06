@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -159,12 +160,23 @@ public:
 
         if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
             handle_ping_message(bytes);
+        } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
+            handle_ctrl_message(bytes);
         } else if (hdr.magic == ECHO_MAGIC && bytes >= sizeof(EchoHdr)) {
             handle_echo_message(bytes);
         } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint16_t)) {
             handle_audio_message(bytes);
         } else {
-            Log::warn("Unknown message: {}", std::string(recv_buf_.data(), bytes));
+            // Log unknown message with hex dump for debugging
+            std::string hex_dump;
+            hex_dump.reserve(bytes * 3);
+            for (size_t i = 0; i < std::min(bytes, size_t(32)); ++i) {
+                char hex[4];
+                std::snprintf(hex, sizeof(hex), "%02x ", static_cast<unsigned char>(recv_buf_[i]));
+                hex_dump += hex;
+            }
+            Log::warn("Unknown message (magic=0x{:08x}, bytes={}, hex={}...)", hdr.magic, bytes,
+                      hex_dump);
         }
 
         do_receive();  // keep listening
@@ -228,18 +240,25 @@ private:
         auto offset =
             ((hdr.t2_server_recv - hdr.t1_client_send) + (hdr.t3_server_send - current_time)) / 2;
 
-        double rtt_ms    = rtt / 1e6;
-        double offset_ms = offset / 1e6;
+        double rtt_ms    = static_cast<double>(rtt) / 1e6;
+        double offset_ms = static_cast<double>(offset) / 1e6;
 
         // print live stats
         Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
+    }
+
+    void handle_ctrl_message(std::size_t /*bytes*/) {
+        CtrlHdr chdr{};
+        std::memcpy(&chdr, recv_buf_.data(), sizeof(CtrlHdr));
+        // Client doesn't need to process CTRL messages from server
+        // (server processes them, client just sends them)
     }
 
     void handle_echo_message(std::size_t /*bytes*/) {
         EchoHdr ehdr{};
         std::memcpy(&ehdr, recv_buf_.data(), sizeof(EchoHdr));
         static int echo_count = 0;
-        Log::info("Echo {} from server: {}", ++echo_count, std::string(ehdr.data));
+        Log::info("Echo {} from server: {}", ++echo_count, std::string(ehdr.data.data()));
     }
 
     void handle_audio_message(std::size_t bytes) {
@@ -248,7 +267,16 @@ private:
         size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
 
         if (bytes < expected_size) {
-            Log::error("Incomplete audio packet: got {}, expected {}", bytes, expected_size);
+            Log::error("Incomplete audio packet: got {}, expected {} (encoded_bytes={})", bytes,
+                       expected_size, encoded_bytes);
+            do_receive();
+            return;
+        }
+
+        // Additional safety check: ensure encoded_bytes is reasonable
+        if (encoded_bytes > AUDIO_BUF_SIZE) {
+            Log::error("Invalid audio packet: encoded_bytes {} exceeds max {}", encoded_bytes,
+                       AUDIO_BUF_SIZE);
             do_receive();
             return;
         }
@@ -279,7 +307,7 @@ private:
                        decode_count, decoded_data.size(), (240 * audio_.get_output_channel_count()),
                        size_errors);
         }
-        if (decoded_data.size() != 240 * audio_.get_output_channel_count()) {
+        if (decoded_data.size() != 240ULL * audio_.get_output_channel_count()) {
             size_errors++;
         }
     }
@@ -475,8 +503,8 @@ private:
                 AudioHdr ahdr{};
                 ahdr.magic         = AUDIO_MAGIC;
                 ahdr.encoded_bytes = static_cast<uint16_t>(state.encoded_data.size());
-                std::memcpy(ahdr.buf, state.encoded_data.data(),
-                            std::min(state.encoded_data.size(), sizeof(ahdr.buf)));
+                std::memcpy(ahdr.buf.data(), state.encoded_data.data(),
+                            std::min(state.encoded_data.size(), ahdr.buf.size()));
                 size_t packetSize = sizeof(MsgHdr) + sizeof(uint16_t) + ahdr.encoded_bytes;
                 client_ptr->send(&ahdr, packetSize);
             }
