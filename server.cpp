@@ -72,12 +72,15 @@ public:
         do_receive();  // start next receive immediately
     }
 
-    void send(void* data, std::size_t len, const udp::endpoint& target) {
+    // Send with optional shared_ptr to keep data alive during async operation
+    void send(void* data, std::size_t len, const udp::endpoint& target,
+              const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
         socket_.async_send_to(asio::buffer(data, len), target,
-                              [](std::error_code error_code, std::size_t) {
+                              [keep_alive](std::error_code error_code, std::size_t) {
                                   if (error_code) {
                                       Log::error("send error: {}", error_code.message());
                                   }
+                                  // keep_alive keeps the data alive until send completes
                               });
     }
 
@@ -177,7 +180,11 @@ private:
         std::memcpy(recv_buf_.data() + sizeof(MsgHdr), &sender_id, sizeof(uint32_t));
 
         // SFU: Forward audio packet to all other clients (not back to sender)
-        forward_audio_to_others(remote_endpoint_, recv_buf_.data(), bytes);
+        // Copy packet data before forwarding since recv_buf_ will be reused immediately
+        // by do_receive() and async sends are still pending
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
+                                                                        recv_buf_.data() + bytes);
+        forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
     }
 
     void alive_check_timer_callback() {
@@ -193,12 +200,14 @@ private:
         }
     }
 
-    void forward_audio_to_others(const udp::endpoint& sender, void* packet_data,
-                                 std::size_t packet_size) {
+    void forward_audio_to_others(
+        const udp::endpoint& sender, void* packet_data, std::size_t packet_size,
+        const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
         // Forward the audio packet to all clients except the sender
+        // keep_alive ensures packet data remains valid during async sends
         for (const auto& [endpoint, client_info]: clients_) {
             if (endpoint != sender) {
-                send(packet_data, packet_size, endpoint);
+                send(packet_data, packet_size, endpoint, keep_alive);
             }
         }
     }
@@ -221,13 +230,13 @@ private:
 
     struct ClientInfo {
         std::chrono::steady_clock::time_point last_alive;
-        uint32_t                               client_id;  // Unique ID for this client
+        uint32_t                              client_id;  // Unique ID for this client
     };
 
     udp::socket socket_;
 
     std::unordered_map<udp::endpoint, ClientInfo, endpoint_hash> clients_;
-    uint32_t                                                     next_client_id_ = 1;  // Start from 1, 0 is invalid
+    uint32_t next_client_id_ = 1;  // Start from 1, 0 is invalid
 
     std::array<char, RECV_BUF_SIZE> recv_buf_;
     udp::endpoint                   remote_endpoint_;

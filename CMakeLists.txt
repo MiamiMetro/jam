@@ -54,13 +54,7 @@ FetchContent_Declare(
     GIT_TAG        v1.16.0
 )
 
-FetchContent_MakeAvailable(
-    asio_src
-    portaudio
-    opus
-    concurrentqueue_src
-    spdlog
-)
+FetchContent_MakeAvailable(asio_src portaudio opus concurrentqueue spdlog))
 
 target_compile_definitions(spdlog PUBLIC SPDLOG_USE_STD_FORMAT)
 

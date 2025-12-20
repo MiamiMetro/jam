@@ -50,7 +50,12 @@ public:
         config.input_gain        = 1.0F;
         config.output_gain       = 1.0F;
 
-        start_audio_stream(17, 15, config);
+        // Check audio stream initialization - fail gracefully if it fails
+        if (!start_audio_stream(17, 15, config)) {
+            Log::error("Failed to initialize audio stream - client will not function correctly");
+            // Continue anyway, but audio_config_ will be zero-initialized
+            // This prevents crashes but the client won't work properly
+        }
         // start_audio_stream(38, 40, config);
         // Connect to server
         start_connection(server_address, server_port);
@@ -102,7 +107,7 @@ public:
 
             // Initialize Opus encoder for sending own audio
             if (!audio_encoder_.create(config.sample_rate, audio_.get_input_channel_count(),
-                                      OPUS_APPLICATION_VOIP, config.bitrate, config.complexity)) {
+                                       OPUS_APPLICATION_VOIP, config.bitrate, config.complexity)) {
                 Log::error("Failed to create Opus encoder");
                 return false;
             }
@@ -132,6 +137,7 @@ public:
         if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
             handle_ping_message(bytes);
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
+            //  do nothing
         } else if (hdr.magic == AUDIO_MAGIC &&
                    bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) {
             handle_audio_message(bytes);
@@ -158,12 +164,15 @@ public:
                                    });
     }
 
-    void send(void* data, std::size_t len) {
+    // Send with optional shared_ptr to keep data alive during async operation
+    void send(void* data, std::size_t len,
+              const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
         socket_.async_send_to(asio::buffer(data, len), server_endpoint_,
-                              [](std::error_code error_code, std::size_t) {
+                              [keep_alive](std::error_code error_code, std::size_t) {
                                   if (error_code) {
                                       Log::error("send error: {}", error_code.message());
                                   }
+                                  // keep_alive keeps the data alive until send completes
                               });
     }
 
@@ -263,7 +272,8 @@ private:
 
         std::vector<float> decoded_data;
         if (encoded_bytes > 0) {
-            // Use configured frame size instead of hardcoded value to match audio callback expectations
+            // Use configured frame size instead of hardcoded value to match audio callback
+            // expectations
             int frame_size = audio_config_.frames_per_buffer;
             if (!participant.decoder->decode(audio_data, encoded_bytes, frame_size, decoded_data)) {
                 Log::warn("Failed to decode audio from participant {} (frame_size={})", sender_id,
@@ -281,7 +291,8 @@ private:
                 participant.last_packet_time = std::chrono::steady_clock::now();
 
                 // Mark buffer as ready once we have enough packets
-                if (!participant.buffer_ready && queue_size >= participant.jitter_buffer_min_packets) {
+                if (!participant.buffer_ready &&
+                    queue_size >= participant.jitter_buffer_min_packets) {
                     participant.buffer_ready = true;
                     Log::info("Jitter buffer ready for participant {} ({} packets)", sender_id,
                               queue_size);
@@ -301,13 +312,13 @@ private:
                               PaStreamCallbackFlags /*unused*/, void* user_data) {
         const auto* input_buffer  = static_cast<const float*>(input);
         auto*       output_buffer = static_cast<float*>(output);
-        auto*       client         = static_cast<Client*>(user_data);
+        auto*       client        = static_cast<Client*>(user_data);
 
         if (output_buffer == nullptr) {
             return paContinue;
         }
 
-        const size_t out_channels = client->audio_.get_output_channel_count();
+        const size_t out_channels  = client->audio_.get_output_channel_count();
         const size_t bytes_to_copy = frame_count * out_channels * sizeof(float);
 
         // Initialize output buffer to silence
@@ -315,14 +326,36 @@ private:
 
         // Mix audio from all active participants (thread-safe iteration)
         std::lock_guard<std::mutex> lock(client->participant_audio_mutex_);
-        for (auto& [participant_id, participant] : client->participant_audio_) {
+        for (auto& [participant_id, participant]: client->participant_audio_) {
             if (participant.is_muted || !participant.buffer_ready) {
                 continue;
             }
 
             std::vector<float> audio_frame;
-            
+
             if (participant.audio_queue.try_dequeue(audio_frame)) {
+                // Calculate audio level (RMS - Root Mean Square) for voice activity detection
+                float sum_squares = 0.0F;
+                for (float sample: audio_frame) {
+                    sum_squares += sample * sample;
+                }
+                float rms = std::sqrt(sum_squares / static_cast<float>(audio_frame.size()));
+                participant.current_level = rms;
+
+                // Voice Activity Detection (simple threshold-based)
+                constexpr float SPEAKING_THRESHOLD = 0.01F;  // Adjust based on your audio levels
+                bool            was_speaking       = participant.is_speaking;
+                participant.is_speaking            = rms > SPEAKING_THRESHOLD;
+
+                if (participant.is_speaking && !was_speaking) {
+                    // Just started speaking
+                    Log::info("Participant {} started speaking (level: {:.4f})", participant_id,
+                              rms);
+                } else if (!participant.is_speaking && was_speaking) {
+                    // Just stopped speaking
+                    Log::info("Participant {} stopped speaking", participant_id);
+                }
+
                 // Validate decoded data size
                 size_t expected_samples = frame_count * out_channels;
                 if (audio_frame.size() == expected_samples) {
@@ -343,8 +376,9 @@ private:
                     // Size mismatch - log warning occasionally
                     static int mismatch_count = 0;
                     if (++mismatch_count % 100 == 0) {
-                        Log::warn("Audio size mismatch: participant {}, got {} samples, expected {}",
-                                  participant_id, audio_frame.size(), expected_samples);
+                        Log::warn(
+                            "Audio size mismatch: participant {}, got {} samples, expected {}",
+                            participant_id, audio_frame.size(), expected_samples);
                     }
                 }
             } else {
@@ -352,13 +386,18 @@ private:
                 size_t current_queue_size = participant.audio_queue.size_approx();
                 if (current_queue_size == 0 && participant.buffer_ready) {
                     participant.buffer_ready = false;
-                    Log::warn("Jitter buffer underrun for participant {}! Rebuffering... (queue: {} packets)",
-                              participant_id, current_queue_size);
+                    Log::warn(
+                        "Jitter buffer underrun for participant {}! Rebuffering... (queue: {} "
+                        "packets)",
+                        participant_id, current_queue_size);
                 } else if (participant.buffer_ready) {
                     // Log underrun with queue size info (use per-participant counter)
                     if (++participant.underrun_count % 20 == 0) {
-                        Log::warn("Jitter buffer underrun for participant {} (queue: {} packets, min: {})",
-                                  participant_id, current_queue_size, participant.jitter_buffer_min_packets);
+                        Log::warn(
+                            "Jitter buffer underrun for participant {} (queue: {} packets, min: "
+                            "{})",
+                            participant_id, current_queue_size,
+                            participant.jitter_buffer_min_packets);
                     }
                 }
             }
@@ -367,8 +406,8 @@ private:
         // Encode and send own audio (always send to maintain timing, even if silence)
         if (client->audio_encoder_.is_initialized() && client->audio_.is_stream_active()) {
             std::vector<unsigned char> encoded_data;
-            bool encode_success = false;
-            
+            bool                       encode_success = false;
+
             if (input_buffer != nullptr) {
                 // Silence detection: Check if input has significant audio
                 static constexpr float SILENCE_THRESHOLD = 0.001F;  // -60dB
@@ -377,24 +416,24 @@ private:
                     float abs_sample = std::fabs(input_buffer[i]);
                     max_sample       = std::max(abs_sample, max_sample);
                 }
-                
+
                 if (max_sample > SILENCE_THRESHOLD) {
                     // Encode actual audio
-                    encode_success = client->audio_encoder_.encode(input_buffer, static_cast<int>(frame_count),
-                                                                   encoded_data);
+                    encode_success = client->audio_encoder_.encode(
+                        input_buffer, static_cast<int>(frame_count), encoded_data);
                 } else {
                     // Encode silence to maintain packet timing
                     std::vector<float> silence_frame(frame_count, 0.0F);
-                    encode_success = client->audio_encoder_.encode(silence_frame.data(), static_cast<int>(frame_count),
-                                                                  encoded_data);
+                    encode_success = client->audio_encoder_.encode(
+                        silence_frame.data(), static_cast<int>(frame_count), encoded_data);
                 }
             } else {
                 // No input device - encode silence to maintain timing
                 std::vector<float> silence_frame(frame_count, 0.0F);
-                encode_success = client->audio_encoder_.encode(silence_frame.data(), static_cast<int>(frame_count),
-                                                              encoded_data);
+                encode_success = client->audio_encoder_.encode(
+                    silence_frame.data(), static_cast<int>(frame_count), encoded_data);
             }
-            
+
             // Always send packets (even silence) to maintain timing and prevent buffer underruns
             // Note: Opus may return empty encoded_data for silence, but we should still send
             // a minimal packet to maintain timing. However, if encoding failed, skip sending.
@@ -402,27 +441,28 @@ private:
                 // Opus can encode silence as empty or very small packets - send them anyway
                 // encoded_bytes = 0 is valid and indicates a silence packet
                 uint16_t encoded_bytes = static_cast<uint16_t>(encoded_data.size());
-                
+
                 // Always send packet (even if encoded_bytes == 0 for silence) to maintain timing
                 if (encoded_bytes <= AUDIO_BUF_SIZE) {
                     // Construct packet in a buffer: magic + sender_id + encoded_bytes + data
                     std::vector<unsigned char> packet;
                     packet.reserve(sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) +
-                                  encoded_bytes);
+                                   encoded_bytes);
 
                     // Write magic
                     uint32_t magic = AUDIO_MAGIC;
                     packet.insert(packet.end(), reinterpret_cast<unsigned char*>(&magic),
-                                 reinterpret_cast<unsigned char*>(&magic) + sizeof(uint32_t));
+                                  reinterpret_cast<unsigned char*>(&magic) + sizeof(uint32_t));
 
                     // Write sender_id (0, server will overwrite)
                     uint32_t sender_id = 0;
                     packet.insert(packet.end(), reinterpret_cast<unsigned char*>(&sender_id),
-                                 reinterpret_cast<unsigned char*>(&sender_id) + sizeof(uint32_t));
+                                  reinterpret_cast<unsigned char*>(&sender_id) + sizeof(uint32_t));
 
                     // Write encoded_bytes (may be 0 for silence)
-                    packet.insert(packet.end(), reinterpret_cast<unsigned char*>(&encoded_bytes),
-                                 reinterpret_cast<unsigned char*>(&encoded_bytes) + sizeof(uint16_t));
+                    packet.insert(
+                        packet.end(), reinterpret_cast<unsigned char*>(&encoded_bytes),
+                        reinterpret_cast<unsigned char*>(&encoded_bytes) + sizeof(uint16_t));
 
                     // Write encoded audio data (if any - Opus may encode silence as empty)
                     if (encoded_bytes > 0) {
@@ -431,7 +471,11 @@ private:
                     // If encoded_bytes == 0, we still send the packet header to maintain timing
 
                     // Send the complete packet (header + optional data)
-                    client->send(packet.data(), packet.size());
+                    // Copy packet data to persistent storage before async send
+                    // to avoid dangling pointer when callback returns
+                    auto packet_copy =
+                        std::make_shared<std::vector<unsigned char>>(std::move(packet));
+                    client->send(packet_copy->data(), packet_copy->size(), packet_copy);
                 }
             }
         }
@@ -447,24 +491,26 @@ private:
     std::array<unsigned char, 128> sync_tx_buf_;
     std::array<unsigned char, 128> ctrl_tx_buf_;
 
-    AudioStream audio_;
-    OpusEncoderWrapper audio_encoder_;
+    AudioStream              audio_;
+    OpusEncoderWrapper       audio_encoder_;
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
 
     // Per-participant audio buffers
     struct ParticipantAudio {
         moodycamel::ConcurrentQueue<std::vector<float>> audio_queue;
-        std::unique_ptr<OpusDecoderWrapper>              decoder;
+        std::unique_ptr<OpusDecoderWrapper>             decoder;
         bool                                            is_muted = false;
         float                                           gain     = 1.0F;
         std::chrono::steady_clock::time_point           last_packet_time;
         size_t                                          jitter_buffer_min_packets = 2;
         bool                                            buffer_ready              = false;
-        int                                             underrun_count            = 0;  // Track underruns per participant
+        int   underrun_count = 0;      // Track underruns per participant
+        float current_level  = 0.0F;   // RMS audio level
+        bool  is_speaking    = false;  // Voice activity detection
     };
 
     // Thread-safe access to participant_audio_ map
-    std::mutex participant_audio_mutex_;
+    std::mutex                                     participant_audio_mutex_;
     std::unordered_map<uint32_t, ParticipantAudio> participant_audio_;
 
     PeriodicTimer ping_timer_;

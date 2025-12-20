@@ -38,7 +38,7 @@ public:
               output_gain(DEFAULT_OUTPUT_GAIN) {}
     };
 
-    AudioStream() {
+    AudioStream() : input_channel_count_(0), output_channel_count_(0) {
         Pa_Initialize();
     }
 
