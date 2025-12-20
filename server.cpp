@@ -121,9 +121,10 @@ private:
 
         switch (chdr.type) {
             case CtrlHdr::Cmd::JOIN:
-                Log::info("Client JOIN: {}:{}", remote_endpoint_.address().to_string(),
-                          remote_endpoint_.port());
+                Log::info("Client JOIN: {}:{} (ID: {})", remote_endpoint_.address().to_string(),
+                          remote_endpoint_.port(), next_client_id_);
                 clients_[remote_endpoint_].last_alive = now;
+                clients_[remote_endpoint_].client_id  = next_client_id_++;
                 break;
             case CtrlHdr::Cmd::LEAVE:
                 Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
@@ -141,17 +142,22 @@ private:
     }
 
     void handle_audio_message(std::size_t bytes) {
-        if (bytes < sizeof(MsgHdr) + sizeof(uint16_t) || !clients_.contains(remote_endpoint_)) {
+        if (bytes < sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) ||
+            !clients_.contains(remote_endpoint_)) {
             do_receive();
             return;
         }
 
-        // Read only the header fields we need
+        // Get sender's client ID
+        uint32_t sender_id = clients_[remote_endpoint_].client_id;
+
+        // Read encoded_bytes (after sender_id field)
         uint16_t encoded_bytes;
-        std::memcpy(&encoded_bytes, recv_buf_.data() + sizeof(MsgHdr), sizeof(uint16_t));
+        std::memcpy(&encoded_bytes, recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint32_t),
+                    sizeof(uint16_t));
 
         // Verify we received all the data
-        size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
+        size_t expected_size = sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) + encoded_bytes;
         if (bytes < expected_size) {
             Log::error("Incomplete audio packet: got {}, expected {} (encoded_bytes={})", bytes,
                        expected_size, encoded_bytes);
@@ -166,6 +172,9 @@ private:
             do_receive();
             return;
         }
+
+        // Embed sender_id in the packet (client may not have sent it, or we override it)
+        std::memcpy(recv_buf_.data() + sizeof(MsgHdr), &sender_id, sizeof(uint32_t));
 
         // SFU: Forward audio packet to all other clients (not back to sender)
         forward_audio_to_others(remote_endpoint_, recv_buf_.data(), bytes);
@@ -212,11 +221,13 @@ private:
 
     struct ClientInfo {
         std::chrono::steady_clock::time_point last_alive;
+        uint32_t                               client_id;  // Unique ID for this client
     };
 
     udp::socket socket_;
 
     std::unordered_map<udp::endpoint, ClientInfo, endpoint_hash> clients_;
+    uint32_t                                                     next_client_id_ = 1;  // Start from 1, 0 is invalid
 
     std::array<char, RECV_BUF_SIZE> recv_buf_;
     udp::endpoint                   remote_endpoint_;
@@ -229,7 +240,7 @@ int main() {
         constexpr short SERVER_PORT = 9999;
 
         auto& log = Logger::instance();
-        log.init(true, false, false, "", spdlog::level::warn);
+        log.init(true, false, false, "", spdlog::level::debug);
 
         asio::io_context io_context;
         Server           srv(io_context, SERVER_PORT);

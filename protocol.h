@@ -38,7 +38,8 @@ struct CtrlHdr : MsgHdr {
 };
 
 struct AudioHdr : MsgHdr {
-    uint16_t              encoded_bytes;  // size of the encoded Opus data
+    uint32_t              sender_id;     // Unique sender identifier
+    uint16_t              encoded_bytes; // size of the encoded Opus data
     Bytes<AUDIO_BUF_SIZE> buf;
 };
 

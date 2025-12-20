@@ -1,12 +1,16 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 
 #include <asio.hpp>
@@ -20,6 +24,8 @@
 
 #include "audio_stream.h"
 #include "logger.h"
+#include "opus_decoder.h"
+#include "opus_encoder.h"
 #include "periodic_timer.h"
 #include "protocol.h"
 
@@ -92,6 +98,14 @@ public:
             audio_.start_audio_stream(input_device, output_device, config, audio_callback, this);
         if (success) {
             audio_.print_latency_info();
+            audio_config_ = config;  // Store config for decoder initialization
+
+            // Initialize Opus encoder for sending own audio
+            if (!audio_encoder_.create(config.sample_rate, audio_.get_input_channel_count(),
+                                      OPUS_APPLICATION_VOIP, config.bitrate, config.complexity)) {
+                Log::error("Failed to create Opus encoder");
+                return false;
+            }
         }
         return success;
     }
@@ -118,7 +132,8 @@ public:
         if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
             handle_ping_message(bytes);
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
-        } else if (hdr.magic == AUDIO_MAGIC && bytes >= sizeof(MsgHdr) + sizeof(uint16_t)) {
+        } else if (hdr.magic == AUDIO_MAGIC &&
+                   bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) {
             handle_audio_message(bytes);
         } else {
             // Log unknown message with hex dump for debugging
@@ -192,10 +207,20 @@ private:
     }
 
     void handle_audio_message(std::size_t bytes) {
-        uint16_t encoded_bytes;
-        std::memcpy(&encoded_bytes, recv_buf_.data() + sizeof(MsgHdr), sizeof(uint16_t));
-        size_t expected_size = sizeof(MsgHdr) + sizeof(uint16_t) + encoded_bytes;
+        if (bytes < sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) {
+            do_receive();
+            return;
+        }
 
+        // Extract sender_id and encoded_bytes
+        uint32_t sender_id;
+        std::memcpy(&sender_id, recv_buf_.data() + sizeof(MsgHdr), sizeof(uint32_t));
+
+        uint16_t encoded_bytes;
+        std::memcpy(&encoded_bytes, recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint32_t),
+                    sizeof(uint16_t));
+
+        size_t expected_size = sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) + encoded_bytes;
         if (bytes < expected_size) {
             Log::error("Incomplete audio packet: got {}, expected {} (encoded_bytes={})", bytes,
                        expected_size, encoded_bytes);
@@ -211,14 +236,63 @@ private:
             return;
         }
 
+        // Get or create participant audio buffer (thread-safe)
+        std::lock_guard<std::mutex> lock(participant_audio_mutex_);
+        if (!participant_audio_.contains(sender_id)) {
+            ParticipantAudio new_participant;
+            new_participant.decoder = std::make_unique<OpusDecoderWrapper>();
+            // Initialize decoder with same config as encoder (sample_rate, channels)
+            // Use input channel count since participants send mono (1 channel)
+            if (!new_participant.decoder->create(audio_config_.sample_rate,
+                                                 audio_.get_input_channel_count())) {
+                Log::error("Failed to create decoder for participant {} ({}Hz, {}ch)", sender_id,
+                           audio_config_.sample_rate, audio_.get_input_channel_count());
+                do_receive();
+                return;
+            }
+            participant_audio_[sender_id] = std::move(new_participant);
+            Log::info("New participant {} joined (decoder: {}Hz, {}ch)", sender_id,
+                      audio_config_.sample_rate, audio_.get_input_channel_count());
+        }
+
+        auto& participant = participant_audio_[sender_id];
+
+        // Decode audio
         const unsigned char* audio_data = reinterpret_cast<const unsigned char*>(
-            recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint16_t));
+            recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
 
         std::vector<float> decoded_data;
         if (encoded_bytes > 0) {
+            // Use configured frame size instead of hardcoded value to match audio callback expectations
+            int frame_size = audio_config_.frames_per_buffer;
+            if (!participant.decoder->decode(audio_data, encoded_bytes, frame_size, decoded_data)) {
+                Log::warn("Failed to decode audio from participant {} (frame_size={})", sender_id,
+                          frame_size);
+                do_receive();
+                return;
+            }
         }
 
+        // Queue decoded audio for this participant
         if (!decoded_data.empty()) {
+            size_t queue_size = participant.audio_queue.size_approx();
+            if (queue_size < 16) {
+                participant.audio_queue.enqueue(std::move(decoded_data));
+                participant.last_packet_time = std::chrono::steady_clock::now();
+
+                // Mark buffer as ready once we have enough packets
+                if (!participant.buffer_ready && queue_size >= participant.jitter_buffer_min_packets) {
+                    participant.buffer_ready = true;
+                    Log::info("Jitter buffer ready for participant {} ({} packets)", sender_id,
+                              queue_size);
+                }
+            } else {
+                // Buffer overflow - drop oldest packet
+                std::vector<float> discarded;
+                participant.audio_queue.try_dequeue(discarded);
+                participant.audio_queue.enqueue(std::move(decoded_data));
+                participant.last_packet_time = std::chrono::steady_clock::now();
+            }
         }
     }
 
@@ -227,6 +301,140 @@ private:
                               PaStreamCallbackFlags /*unused*/, void* user_data) {
         const auto* input_buffer  = static_cast<const float*>(input);
         auto*       output_buffer = static_cast<float*>(output);
+        auto*       client         = static_cast<Client*>(user_data);
+
+        if (output_buffer == nullptr) {
+            return paContinue;
+        }
+
+        const size_t out_channels = client->audio_.get_output_channel_count();
+        const size_t bytes_to_copy = frame_count * out_channels * sizeof(float);
+
+        // Initialize output buffer to silence
+        std::memset(output_buffer, 0, bytes_to_copy);
+
+        // Mix audio from all active participants (thread-safe iteration)
+        std::lock_guard<std::mutex> lock(client->participant_audio_mutex_);
+        for (auto& [participant_id, participant] : client->participant_audio_) {
+            if (participant.is_muted || !participant.buffer_ready) {
+                continue;
+            }
+
+            std::vector<float> audio_frame;
+            
+            if (participant.audio_queue.try_dequeue(audio_frame)) {
+                // Validate decoded data size
+                size_t expected_samples = frame_count * out_channels;
+                if (audio_frame.size() == expected_samples) {
+                    // Mix into output with participant's gain
+                    for (size_t i = 0; i < audio_frame.size(); ++i) {
+                        output_buffer[i] += audio_frame[i] * participant.gain;
+                    }
+                } else if (audio_frame.size() == frame_count) {
+                    // Mono input, stereo output - duplicate channel
+                    for (size_t i = 0; i < frame_count; ++i) {
+                        float sample = audio_frame[i] * participant.gain;
+                        output_buffer[(i * out_channels) + 0] += sample;  // Left
+                        if (out_channels > 1) {
+                            output_buffer[(i * out_channels) + 1] += sample;  // Right
+                        }
+                    }
+                } else {
+                    // Size mismatch - log warning occasionally
+                    static int mismatch_count = 0;
+                    if (++mismatch_count % 100 == 0) {
+                        Log::warn("Audio size mismatch: participant {}, got {} samples, expected {}",
+                                  participant_id, audio_frame.size(), expected_samples);
+                    }
+                }
+            } else {
+                // Underrun - failed to dequeue
+                size_t current_queue_size = participant.audio_queue.size_approx();
+                if (current_queue_size == 0 && participant.buffer_ready) {
+                    participant.buffer_ready = false;
+                    Log::warn("Jitter buffer underrun for participant {}! Rebuffering... (queue: {} packets)",
+                              participant_id, current_queue_size);
+                } else if (participant.buffer_ready) {
+                    // Log underrun with queue size info (use per-participant counter)
+                    if (++participant.underrun_count % 20 == 0) {
+                        Log::warn("Jitter buffer underrun for participant {} (queue: {} packets, min: {})",
+                                  participant_id, current_queue_size, participant.jitter_buffer_min_packets);
+                    }
+                }
+            }
+        }
+
+        // Encode and send own audio (always send to maintain timing, even if silence)
+        if (client->audio_encoder_.is_initialized() && client->audio_.is_stream_active()) {
+            std::vector<unsigned char> encoded_data;
+            bool encode_success = false;
+            
+            if (input_buffer != nullptr) {
+                // Silence detection: Check if input has significant audio
+                static constexpr float SILENCE_THRESHOLD = 0.001F;  // -60dB
+                float                  max_sample        = 0.0F;
+                for (unsigned long i = 0; i < frame_count; ++i) {
+                    float abs_sample = std::fabs(input_buffer[i]);
+                    max_sample       = std::max(abs_sample, max_sample);
+                }
+                
+                if (max_sample > SILENCE_THRESHOLD) {
+                    // Encode actual audio
+                    encode_success = client->audio_encoder_.encode(input_buffer, static_cast<int>(frame_count),
+                                                                   encoded_data);
+                } else {
+                    // Encode silence to maintain packet timing
+                    std::vector<float> silence_frame(frame_count, 0.0F);
+                    encode_success = client->audio_encoder_.encode(silence_frame.data(), static_cast<int>(frame_count),
+                                                                  encoded_data);
+                }
+            } else {
+                // No input device - encode silence to maintain timing
+                std::vector<float> silence_frame(frame_count, 0.0F);
+                encode_success = client->audio_encoder_.encode(silence_frame.data(), static_cast<int>(frame_count),
+                                                              encoded_data);
+            }
+            
+            // Always send packets (even silence) to maintain timing and prevent buffer underruns
+            // Note: Opus may return empty encoded_data for silence, but we should still send
+            // a minimal packet to maintain timing. However, if encoding failed, skip sending.
+            if (encode_success) {
+                // Opus can encode silence as empty or very small packets - send them anyway
+                // encoded_bytes = 0 is valid and indicates a silence packet
+                uint16_t encoded_bytes = static_cast<uint16_t>(encoded_data.size());
+                
+                // Always send packet (even if encoded_bytes == 0 for silence) to maintain timing
+                if (encoded_bytes <= AUDIO_BUF_SIZE) {
+                    // Construct packet in a buffer: magic + sender_id + encoded_bytes + data
+                    std::vector<unsigned char> packet;
+                    packet.reserve(sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) +
+                                  encoded_bytes);
+
+                    // Write magic
+                    uint32_t magic = AUDIO_MAGIC;
+                    packet.insert(packet.end(), reinterpret_cast<unsigned char*>(&magic),
+                                 reinterpret_cast<unsigned char*>(&magic) + sizeof(uint32_t));
+
+                    // Write sender_id (0, server will overwrite)
+                    uint32_t sender_id = 0;
+                    packet.insert(packet.end(), reinterpret_cast<unsigned char*>(&sender_id),
+                                 reinterpret_cast<unsigned char*>(&sender_id) + sizeof(uint32_t));
+
+                    // Write encoded_bytes (may be 0 for silence)
+                    packet.insert(packet.end(), reinterpret_cast<unsigned char*>(&encoded_bytes),
+                                 reinterpret_cast<unsigned char*>(&encoded_bytes) + sizeof(uint16_t));
+
+                    // Write encoded audio data (if any - Opus may encode silence as empty)
+                    if (encoded_bytes > 0) {
+                        packet.insert(packet.end(), encoded_data.begin(), encoded_data.end());
+                    }
+                    // If encoded_bytes == 0, we still send the packet header to maintain timing
+
+                    // Send the complete packet (header + optional data)
+                    client->send(packet.data(), packet.size());
+                }
+            }
+        }
 
         return paContinue;
     }
@@ -240,6 +448,24 @@ private:
     std::array<unsigned char, 128> ctrl_tx_buf_;
 
     AudioStream audio_;
+    OpusEncoderWrapper audio_encoder_;
+    AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
+
+    // Per-participant audio buffers
+    struct ParticipantAudio {
+        moodycamel::ConcurrentQueue<std::vector<float>> audio_queue;
+        std::unique_ptr<OpusDecoderWrapper>              decoder;
+        bool                                            is_muted = false;
+        float                                           gain     = 1.0F;
+        std::chrono::steady_clock::time_point           last_packet_time;
+        size_t                                          jitter_buffer_min_packets = 2;
+        bool                                            buffer_ready              = false;
+        int                                             underrun_count            = 0;  // Track underruns per participant
+    };
+
+    // Thread-safe access to participant_audio_ map
+    std::mutex participant_audio_mutex_;
+    std::unordered_map<uint32_t, ParticipantAudio> participant_audio_;
 
     PeriodicTimer ping_timer_;
     PeriodicTimer alive_timer_;
