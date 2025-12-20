@@ -7,11 +7,9 @@
 // Packet identification magic numbers
 constexpr uint32_t PING_MAGIC  = 0x50494E47;  // 'PING'
 constexpr uint32_t CTRL_MAGIC  = 0x4354524C;  // 'CTRL'
-constexpr uint32_t ECHO_MAGIC  = 0x4543484F;  // 'ECHO'
 constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
 
 // Buffer sizes
-constexpr size_t ECHO_DATA_SIZE = 256;
 constexpr size_t AUDIO_BUF_SIZE = 512;
 
 // Type aliases
@@ -37,10 +35,6 @@ struct CtrlHdr : MsgHdr {
         LEAVE = 2,
         ALIVE = 3,
     } type;
-};
-
-struct EchoHdr : MsgHdr {
-    Bytes<ECHO_DATA_SIZE> data;
 };
 
 struct AudioHdr : MsgHdr {

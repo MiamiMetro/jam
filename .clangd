@@ -14,12 +14,10 @@ CompileFlags:
     - -DASIO_HAS_STD_SHARED_PTR
     - -DASIO_HAS_STD_TYPE_TRAITS
     - -I.
-    - -Ibuild/_deps/asio-src/asio/include
+    - -Ibuild/_deps/asio_src-src/asio/include
     - -Ibuild/_deps/portaudio-src/include
     - -Ibuild/_deps/opus-src/include
-    - -Ibuild/_deps/concurrentqueue-src
-    - -Ibuild/_deps/ixwebsocket-src
-    - -Ibuild/_deps/json-src/include
+    - -Ibuild/_deps/concurrentqueue_src-src
     - -Ibuild/_deps/spdlog-src/include
   Remove:
     - -w
@@ -36,6 +34,8 @@ Diagnostics:
     Remove:
       - modernize-use-trailing-return-type
       - readability-identifier-length
+      - readability-magic-numbers
+      - bugprone-easily-swappable-parameters
 
 Index:
   Background: Build

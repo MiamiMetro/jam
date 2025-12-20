@@ -65,8 +65,6 @@ public:
             handle_ping_message(bytes);
         } else if (hdr.magic == CTRL_MAGIC) {
             handle_ctrl_message(bytes);
-        } else if (hdr.magic == ECHO_MAGIC) {
-            handle_echo_message(bytes);
         } else if (hdr.magic == AUDIO_MAGIC) {
             handle_audio_message(bytes);
         }
@@ -140,15 +138,6 @@ private:
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
                 break;
         }
-    }
-
-    void handle_echo_message(std::size_t bytes) {
-        if (bytes < sizeof(EchoHdr) || !clients_.contains(remote_endpoint_)) {
-            do_receive();
-            return;
-        }
-        // Echo back the received message
-        send(recv_buf_.data(), bytes, remote_endpoint_);
     }
 
     void handle_audio_message(std::size_t bytes) {

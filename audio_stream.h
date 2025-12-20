@@ -5,8 +5,6 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-#include <nlohmann/json_fwd.hpp>
 #include <opus_defines.h>
 #include <portaudio.h>
 
@@ -51,62 +49,6 @@ public:
         }
 
         Pa_Terminate();
-    }
-
-    static nlohmann::json get_devices_json(const std::string& host_api_name = "") {
-        nlohmann::json devices    = nlohmann::json::array();
-        int            numDevices = Pa_GetDeviceCount();
-
-        for (int i = 0; i < numDevices; ++i) {
-            const PaDeviceInfo* device_info = Pa_GetDeviceInfo(i);
-            if (device_info == nullptr) {
-                continue;
-            }
-
-            const PaHostApiInfo* hostApiInfo = Pa_GetHostApiInfo(device_info->hostApi);
-            std::string api_name = (hostApiInfo != nullptr) ? hostApiInfo->name : "Unknown API";
-
-            if (!host_api_name.empty() && api_name != host_api_name) {
-                continue;
-            }
-
-            // Much cleaner and faster - no string concatenation!
-            nlohmann::json device;
-            device["index"]             = i;
-            device["name"]              = device_info->name;
-            device["maxInputChannels"]  = device_info->maxInputChannels;
-            device["maxOutputChannels"] = device_info->maxOutputChannels;
-            device["defaultSampleRate"] = device_info->defaultSampleRate;
-            device["hostApi"]           = api_name;
-
-            devices.push_back(device);
-        }
-
-        return devices;
-    }
-
-    static nlohmann::json get_host_apis_json() {
-        nlohmann::json hostApis    = nlohmann::json::array();
-        int            numHostApis = Pa_GetHostApiCount();
-
-        for (int i = 0; i < numHostApis; ++i) {
-            const PaHostApiInfo* hostApiInfo = Pa_GetHostApiInfo(i);
-            if (hostApiInfo == nullptr) {
-                continue;
-            }
-
-            nlohmann::json api;
-            api["index"]               = i;
-            api["name"]                = hostApiInfo->name;
-            api["type"]                = static_cast<int>(hostApiInfo->type);
-            api["deviceCount"]         = hostApiInfo->deviceCount;
-            api["defaultInputDevice"]  = hostApiInfo->defaultInputDevice;
-            api["defaultOutputDevice"] = hostApiInfo->defaultOutputDevice;
-
-            hostApis.push_back(api);
-        }
-
-        return hostApis;
     }
 
     static const PaDeviceInfo* get_device_info(int device_index) {
@@ -155,7 +97,7 @@ public:
                                                input_info->defaultLowInputLatency, nullptr};
 
         PaStreamParameters output_parameters = {
-            output_device, std::min(output_info->maxOutputChannels, 2), paFloat32,
+            output_device, std::min(output_info->maxOutputChannels, 1), paFloat32,
             output_info->defaultLowOutputLatency, nullptr};
 
         input_channel_count_  = input_parameters.channelCount;
@@ -187,15 +129,6 @@ public:
         Log::info("{} input channel(s), {} output channel(s) at {} Hz", input_channel_count_,
                   output_channel_count_, config.sample_rate);
 
-        // Create encoder and decoder with config
-        Log::info(
-            "Creating client encoder (mono) and decoder (stereo) with {} bps bitrate, complexity "
-            "{}",
-            config.bitrate, config.complexity);
-        encoder_.create(config.sample_rate, input_channel_count_, OPUS_APPLICATION_AUDIO,
-                        config.bitrate, config.complexity);
-        decoder_.create(config.sample_rate, output_channel_count_);
-
         return true;
     }
 
@@ -206,8 +139,6 @@ public:
             Pa_CloseStream(stream_);
             stream_ = nullptr;
         }
-        encoder_.destroy();
-        decoder_.destroy();
     }
 
     void print_latency_info() {
@@ -220,15 +151,6 @@ public:
                       stream_info->outputLatency * SECONDS_TO_MILLISECONDS);
             Log::info("Sample rate:    {:.1f} Hz", stream_info->sampleRate);
         }
-    }
-
-    void encode_opus(const float* input, int frame_size, std::vector<unsigned char>& output) {
-        encoder_.encode(input, frame_size, output);
-    }
-
-    void decode_opus(const unsigned char* input, int input_size, int frame_size,
-                     std::vector<float>& output) {
-        decoder_.decode(input, input_size, frame_size, output);
     }
 
     int get_input_channel_count() const {
@@ -246,11 +168,9 @@ public:
     }
 
 private:
-    PaStream*          stream_ = nullptr;
-    OpusEncoderWrapper encoder_;
-    OpusDecoderWrapper decoder_;
-    std::atomic<bool>  stream_active_{false};
-    AudioConfig        current_config_;
+    PaStream*         stream_ = nullptr;
+    std::atomic<bool> stream_active_{false};
+    AudioConfig       current_config_;
 
     int input_channel_count_;
     int output_channel_count_;
