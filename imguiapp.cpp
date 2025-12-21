@@ -1,6 +1,4 @@
-#include "ImGuiApp.h"
-
-#include <GL/gl.h>
+#include "imguiapp.h"
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -38,11 +36,14 @@ ImGuiApp::ImGuiApp(int width, int height, const char* title, bool vsync, int tar
         return;
     }
 
-    // GL 3.3 + GLSL 130
-    const char* glsl_version = "#version 130";
+    // GL 3.2 + GLSL 150 (required for macOS)
+    const char* glsl_version = "#version 150";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);  // Required on macOS
+#endif
 
     // Create window
     m_Window = glfwCreateWindow(width, height, title, nullptr, nullptr);

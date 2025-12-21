@@ -51,6 +51,30 @@ public:
         Pa_Terminate();
     }
 
+    static const void print_all_devices() {
+        int device_count = Pa_GetDeviceCount();
+        if (device_count < 0) {
+            Log::error("Pa_GetDeviceCount returned error: {}", Pa_GetErrorText(device_count));
+            return;
+        }
+
+        Log::info("Available audio devices:");
+        for (int i = 0; i < device_count; ++i) {
+            const PaDeviceInfo* device_info = Pa_GetDeviceInfo(i);
+            if (device_info != nullptr) {
+                Log::info(
+                    "Device {}: {} | API: {} | Max Input Channels: {} | Max Output Channels: "
+                    "{} | Default Sample Rate: {}",
+                    i, device_info->name,
+                    (Pa_GetHostApiInfo(device_info->hostApi) != nullptr)
+                        ? Pa_GetHostApiInfo(device_info->hostApi)->name
+                        : "Unknown",
+                    device_info->maxInputChannels, device_info->maxOutputChannels,
+                    device_info->defaultSampleRate);
+            }
+        }
+    }
+
     static const PaDeviceInfo* get_device_info(int device_index) {
         const PaDeviceInfo* device_info = Pa_GetDeviceInfo(device_index);
         if (device_info == nullptr) {
@@ -161,6 +185,7 @@ public:
 
     LatencyInfo get_latency_info() const {
         LatencyInfo info{};
+
         const PaStreamInfo* stream_info = Pa_GetStreamInfo(stream_);
         if (stream_info != nullptr) {
             static constexpr double SECONDS_TO_MILLISECONDS = 1000.0;

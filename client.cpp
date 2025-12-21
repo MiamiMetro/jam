@@ -26,7 +26,7 @@
 #include <portaudio.h>
 #include <spdlog/common.h>
 
-#include "ImGuiApp.h"
+#include "imguiapp.h"
 #include "audio_stream.h"
 #include "logger.h"
 #include "opus_decoder.h"
@@ -63,6 +63,7 @@ public:
             // Note: audio_config_ is now set even if validation fails, but the stream won't work
             // Remote audio decoding will fail gracefully with error messages
         }
+        audio_.print_all_devices();
         // start_audio_stream(38, 40, config);
         // Connect to server
         start_connection(server_address, server_port);
@@ -1026,7 +1027,13 @@ int main() {
 
         Client client_instance(io_context, "127.0.0.1", 9999);
 
-        std::thread ui_thread([&io_context, &client_instance]() {
+        // Run io_context in background thread (GLFW must be on main thread on macOS)
+        std::thread io_thread([&io_context]() {
+            io_context.run();
+        });
+
+        // Run UI on main thread (required for GLFW on macOS)
+        {
             // Enable VSync for efficient FPS limiting (hardware-accelerated)
             ImGuiApp app(900, 500, "Jam", true, 60);
 
@@ -1038,18 +1045,16 @@ int main() {
                 io_context.stop();
             });
             app.Run();
-        });
-
-        // Run io_context until window closes
-        io_context.run();
+        }
 
         // Clean up Client resources before exit
         client_instance.stop_audio_stream();
         client_instance.stop_connection();
 
-        // Wait for UI thread to finish
-        if (ui_thread.joinable()) {
-            ui_thread.join();
+        // Stop io_context and wait for network thread to finish
+        io_context.stop();
+        if (io_thread.joinable()) {
+            io_thread.join();
         }
     } catch (std::exception& e) {
         Log::error("ERR: {}", e.what());
