@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -10,7 +11,9 @@
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <asio.hpp>
@@ -18,13 +21,16 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
 #include <concurrentqueue.h>
+#include <imgui.h>
 #include <opus.h>
 #include <portaudio.h>
 #include <spdlog/common.h>
 
+#include "ImGuiApp.h"
 #include "audio_stream.h"
 #include "logger.h"
 #include "opus_decoder.h"
+#include "opus_defines.h"
 #include "opus_encoder.h"
 #include "periodic_timer.h"
 #include "protocol.h"
@@ -38,7 +44,8 @@ public:
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
-          alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }) {
+          alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
+          cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
         Log::info("Client local port: {}", socket_.local_endpoint().port());
 
         // Start audio stream with configuration
@@ -53,13 +60,42 @@ public:
         // Check audio stream initialization - fail gracefully if it fails
         if (!start_audio_stream(17, 15, config)) {
             Log::error("Failed to initialize audio stream - client will not function correctly");
-            // Continue anyway, but audio_config_ will be zero-initialized
-            // This prevents crashes but the client won't work properly
+            // Note: audio_config_ is now set even if validation fails, but the stream won't work
+            // Remote audio decoding will fail gracefully with error messages
         }
         // start_audio_stream(38, 40, config);
         // Connect to server
         start_connection(server_address, server_port);
     }
+
+    // Participant data structure (merged from ParticipantAudio and ParticipantInfo)
+    struct ParticipantData {
+        // Audio processing
+        moodycamel::ConcurrentQueue<std::vector<float>> audio_queue;
+        std::unique_ptr<OpusDecoderWrapper>             decoder;
+
+        // Participant state
+        bool                                  is_muted = false;
+        float                                 gain     = 1.0F;
+        std::chrono::steady_clock::time_point last_packet_time;
+        size_t                                jitter_buffer_min_packets = 2;
+        bool                                  buffer_ready              = false;
+        int                                   underrun_count            = 0;
+        float                                 current_level             = 0.0F;  // RMS audio level
+        bool                                  is_speaking = false;  // Voice activity detection
+    };
+
+    // Lightweight view for UI (snapshot of ParticipantData)
+    struct ParticipantInfo {
+        uint32_t id;
+        bool     is_speaking;
+        bool     is_muted;
+        float    audio_level;
+        float    gain;
+        bool     buffer_ready;
+        size_t   queue_size;
+        int      underrun_count;
+    };
 
     // Start connection to server (or switch to new server)
     void start_connection(const std::string& server_address, short server_port) {
@@ -90,6 +126,13 @@ public:
     void stop_connection() {
         Log::info("Disconnecting from server...");
 
+        // Send LEAVE message
+        CtrlHdr chdr{};
+        chdr.magic = CTRL_MAGIC;
+        chdr.type  = CtrlHdr::Cmd::LEAVE;
+        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
+        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+
         // Cancel pending async operations
         socket_.cancel();
 
@@ -98,25 +141,89 @@ public:
 
     bool start_audio_stream(PaDeviceIndex input_device, PaDeviceIndex output_device,
                             const AudioStream::AudioConfig& config = AudioStream::AudioConfig{}) {
+        // Store config FIRST before any validation that could cause early return
+        // This ensures audio_config_ is always set, even if validation fails
+        audio_config_ = config;
+
+        // Get input channel count from device info before creating encoder
+        // (audio_.get_input_channel_count() returns 0 before stream starts)
+        const auto* input_info = AudioStream::get_device_info(input_device);
+        if (input_info == nullptr) {
+            Log::error("Invalid input device");
+            return false;
+        }
+        int input_channels = std::min(input_info->maxInputChannels, 1);  // Mono input
+
+        // Initialize Opus encoder for sending own audio BEFORE starting stream
+        // This prevents data race where callback might access encoder during initialization
+        if (!audio_encoder_.create(config.sample_rate, input_channels, OPUS_APPLICATION_VOIP,
+                                   config.bitrate, config.complexity)) {
+            Log::error("Failed to create Opus encoder");
+            return false;
+        }
+
         Log::info("Starting audio stream...");
         bool success =
             audio_.start_audio_stream(input_device, output_device, config, audio_callback, this);
         if (success) {
             audio_.print_latency_info();
-            audio_config_ = config;  // Store config for decoder initialization
-
-            // Initialize Opus encoder for sending own audio
-            if (!audio_encoder_.create(config.sample_rate, audio_.get_input_channel_count(),
-                                       OPUS_APPLICATION_VOIP, config.bitrate, config.complexity)) {
-                Log::error("Failed to create Opus encoder");
-                return false;
-            }
+        } else {
+            // Clean up encoder if stream start failed
+            audio_encoder_.destroy();
         }
         return success;
     }
 
     void stop_audio_stream() {
         audio_.stop_audio_stream();
+    }
+
+    // Getters for UI access
+    std::string get_server_address() const {
+        return server_endpoint_.address().to_string();
+    }
+
+    unsigned short get_server_port() const {
+        return server_endpoint_.port();
+    }
+
+    unsigned short get_local_port() const {
+        return socket_.local_endpoint().port();
+    }
+
+    size_t get_participant_count() const {
+        std::lock_guard<std::mutex> lock(participant_audio_mutex_);
+        return participant_audio_.size();
+    }
+
+    bool is_audio_stream_active() const {
+        return audio_.is_stream_active();
+    }
+
+    std::vector<ParticipantInfo> get_participant_info() const {
+        std::lock_guard<std::mutex>  lock(participant_audio_mutex_);
+        std::vector<ParticipantInfo> info;
+        info.reserve(participant_audio_.size());
+
+        for (const auto& [id, participant]: participant_audio_) {
+            ParticipantInfo p_info{};
+            p_info.id             = id;
+            p_info.is_speaking    = participant.is_speaking;
+            p_info.is_muted       = participant.is_muted;
+            p_info.audio_level    = participant.current_level;
+            p_info.gain           = participant.gain;
+            p_info.buffer_ready   = participant.buffer_ready;
+            p_info.queue_size     = participant.audio_queue.size_approx();
+            p_info.underrun_count = participant.underrun_count;
+            info.push_back(p_info);
+        }
+
+        return info;
+    }
+
+    // Get own audio level (for displaying user's own microphone level)
+    float get_own_audio_level() const {
+        return own_audio_level_.load();
     }
 
     void on_receive(std::error_code error_code, std::size_t bytes) {
@@ -137,7 +244,7 @@ public:
         if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
             handle_ping_message(bytes);
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
-            //  do nothing
+            handle_ctrl_message(bytes);
         } else if (hdr.magic == AUDIO_MAGIC &&
                    bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) {
             handle_audio_message(bytes);
@@ -197,6 +304,54 @@ private:
         send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
     }
 
+    void handle_ctrl_message(std::size_t bytes) {
+        if (bytes < sizeof(CtrlHdr)) {
+            return;
+        }
+
+        CtrlHdr chdr{};
+        std::memcpy(&chdr, recv_buf_.data(), sizeof(CtrlHdr));
+
+        switch (chdr.type) {
+            case CtrlHdr::Cmd::PARTICIPANT_LEAVE: {
+                uint32_t participant_id = chdr.participant_id;
+                remove_participant(participant_id);
+                Log::info("Participant {} left (server notification)", participant_id);
+                break;
+            }
+            default:
+                // Other CTRL messages (JOIN, LEAVE, ALIVE) are not handled by clients
+                break;
+        }
+    }
+
+    void remove_participant(uint32_t participant_id) {
+        std::lock_guard<std::mutex> lock(participant_audio_mutex_);
+        auto                        it = participant_audio_.find(participant_id);
+        if (it != participant_audio_.end()) {
+            participant_audio_.erase(it);
+            Log::debug("Removed participant {} from client", participant_id);
+        }
+    }
+
+    void cleanup_timer_callback() {
+        // Remove participants who haven't sent packets in a while (backup cleanup)
+        auto           now                 = std::chrono::steady_clock::now();
+        constexpr auto PARTICIPANT_TIMEOUT = 20s;  // Longer than server timeout (15s)
+
+        std::lock_guard<std::mutex> lock(participant_audio_mutex_);
+        for (auto it = participant_audio_.begin(); it != participant_audio_.end();) {
+            if (now - it->second.last_packet_time > PARTICIPANT_TIMEOUT) {
+                Log::info(
+                    "Removing stale participant {} (no packets for {}s)", it->first,
+                    std::chrono::duration_cast<std::chrono::seconds>(PARTICIPANT_TIMEOUT).count());
+                it = participant_audio_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     void handle_ping_message(std::size_t /*bytes*/) {
         SyncHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(SyncHdr));
@@ -248,7 +403,17 @@ private:
         // Get or create participant audio buffer (thread-safe)
         std::lock_guard<std::mutex> lock(participant_audio_mutex_);
         if (!participant_audio_.contains(sender_id)) {
-            ParticipantAudio new_participant;
+            // Validate audio_config_ before using it (protects against uninitialized config)
+            if (audio_config_.sample_rate == 0 || audio_config_.frames_per_buffer == 0) {
+                Log::error(
+                    "Cannot create decoder for participant {}: audio config not initialized "
+                    "(sample_rate={}, frames_per_buffer={})",
+                    sender_id, audio_config_.sample_rate, audio_config_.frames_per_buffer);
+                do_receive();
+                return;
+            }
+
+            ParticipantData new_participant;
             new_participant.decoder = std::make_unique<OpusDecoderWrapper>();
             // Initialize decoder with same config as encoder (sample_rate, channels)
             // Use input channel count since participants send mono (1 channel)
@@ -259,7 +424,9 @@ private:
                 do_receive();
                 return;
             }
-            participant_audio_[sender_id] = std::move(new_participant);
+            // Initialize last_packet_time to current time to prevent immediate cleanup
+            new_participant.last_packet_time = std::chrono::steady_clock::now();
+            participant_audio_[sender_id]    = std::move(new_participant);
             Log::info("New participant {} joined (decoder: {}Hz, {}ch)", sender_id,
                       audio_config_.sample_rate, audio_.get_input_channel_count());
         }
@@ -274,7 +441,16 @@ private:
         if (encoded_bytes > 0) {
             // Use configured frame size instead of hardcoded value to match audio callback
             // expectations
+            // Validate frame_size before using it
             int frame_size = audio_config_.frames_per_buffer;
+            if (frame_size == 0) {
+                Log::error(
+                    "Cannot decode audio from participant {}: invalid frame_size (audio "
+                    "config not initialized)",
+                    sender_id);
+                do_receive();
+                return;
+            }
             if (!participant.decoder->decode(audio_data, encoded_bytes, frame_size, decoded_data)) {
                 Log::warn("Failed to decode audio from participant {} (frame_size={})", sender_id,
                           frame_size);
@@ -349,11 +525,11 @@ private:
 
                 if (participant.is_speaking && !was_speaking) {
                     // Just started speaking
-                    Log::info("Participant {} started speaking (level: {:.4f})", participant_id,
-                              rms);
+                    Log::debug("Participant {} started speaking (level: {:.4f})", participant_id,
+                               rms);
                 } else if (!participant.is_speaking && was_speaking) {
                     // Just stopped speaking
-                    Log::info("Participant {} stopped speaking", participant_id);
+                    Log::debug("Participant {} stopped speaking", participant_id);
                 }
 
                 // Validate decoded data size
@@ -409,6 +585,14 @@ private:
             bool                       encode_success = false;
 
             if (input_buffer != nullptr) {
+                // Calculate RMS (Root Mean Square) for own audio level
+                float sum_squares = 0.0F;
+                for (unsigned long i = 0; i < frame_count; ++i) {
+                    sum_squares += input_buffer[i] * input_buffer[i];
+                }
+                float rms = std::sqrt(sum_squares / static_cast<float>(frame_count));
+                client->own_audio_level_.store(rms);
+
                 // Silence detection: Check if input has significant audio
                 static constexpr float SILENCE_THRESHOLD = 0.001F;  // -60dB
                 float                  max_sample        = 0.0F;
@@ -495,27 +679,118 @@ private:
     OpusEncoderWrapper       audio_encoder_;
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
 
-    // Per-participant audio buffers
-    struct ParticipantAudio {
-        moodycamel::ConcurrentQueue<std::vector<float>> audio_queue;
-        std::unique_ptr<OpusDecoderWrapper>             decoder;
-        bool                                            is_muted = false;
-        float                                           gain     = 1.0F;
-        std::chrono::steady_clock::time_point           last_packet_time;
-        size_t                                          jitter_buffer_min_packets = 2;
-        bool                                            buffer_ready              = false;
-        int   underrun_count = 0;      // Track underruns per participant
-        float current_level  = 0.0F;   // RMS audio level
-        bool  is_speaking    = false;  // Voice activity detection
-    };
-
     // Thread-safe access to participant_audio_ map
-    std::mutex                                     participant_audio_mutex_;
-    std::unordered_map<uint32_t, ParticipantAudio> participant_audio_;
+    mutable std::mutex                            participant_audio_mutex_;
+    std::unordered_map<uint32_t, ParticipantData> participant_audio_;
+
+    // Own audio level tracking (thread-safe with atomic)
+    std::atomic<float> own_audio_level_{0.0F};
 
     PeriodicTimer ping_timer_;
     PeriodicTimer alive_timer_;
+    PeriodicTimer cleanup_timer_;
 };
+
+void DrawClientUI(Client& client) {
+    // Show demo window (can be closed) - only call when open
+    // Closed by default for better performance
+    static bool demo_open = false;
+    if (demo_open) {
+        ImGui::ShowDemoWindow(&demo_open);
+    }
+
+    // Your custom windows here
+    bool window_open = true;
+
+    if (ImGui::Begin("Client Info", &window_open)) {
+        ImGui::Text("Hello from GLFW + OpenGL3!");
+        ImGui::Separator();
+        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+        ImGui::Text("Frame Time: %.3f ms", 1000.0F / ImGui::GetIO().Framerate);
+
+        ImGui::Separator();
+        ImGui::Text("Connection:");
+        ImGui::Text("  Server: %s:%u", client.get_server_address().c_str(),
+                    client.get_server_port());
+        ImGui::Text("  Local Port: %u", client.get_local_port());
+        ImGui::Text("  Participants: %zu", client.get_participant_count());
+        ImGui::Text("  Audio Stream: %s", client.is_audio_stream_active() ? "Active" : "Inactive");
+
+        ImGui::Separator();
+        ImGui::Text("You:");
+        float own_level = client.get_own_audio_level();
+        ImGui::Text("  Audio Level: %.3f", own_level);
+        if (own_level > 0.01F) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), " [Speaking]");
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Participants:");
+
+        auto participants = client.get_participant_info();
+        if (participants.empty()) {
+            ImGui::Text("  No other participants");
+        } else {
+            if (ImGui::BeginTable(
+                    "Participants", 6,
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 50.0F);
+                ImGui::TableSetupColumn("Speaking", ImGuiTableColumnFlags_WidthFixed, 80.0F);
+                ImGui::TableSetupColumn("Level", ImGuiTableColumnFlags_WidthFixed, 80.0F);
+                ImGui::TableSetupColumn("Gain", ImGuiTableColumnFlags_WidthFixed, 60.0F);
+                ImGui::TableSetupColumn("Queue", ImGuiTableColumnFlags_WidthFixed, 60.0F);
+                ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableHeadersRow();
+
+                for (const auto& p: participants) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", p.id);
+
+                    ImGui::TableNextColumn();
+                    if (p.is_speaking) {
+                        ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), "Yes");
+                    } else {
+                        ImGui::TextColored(ImVec4(0.5F, 0.5F, 0.5F, 1.0F), "No");
+                    }
+
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", p.audio_level);
+                    // Visual level bar
+                    ImGui::SameLine();
+                    float bar_width = ImGui::GetContentRegionAvail().x;
+                    ImGui::ProgressBar(p.audio_level, ImVec2(bar_width * 0.3F, 0.0F), "");
+
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f", p.gain);
+
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%zu", p.queue_size);
+
+                    ImGui::TableNextColumn();
+                    std::string status;
+                    if (p.is_muted) {
+                        status += "[Muted] ";
+                    }
+                    if (!p.buffer_ready) {
+                        status += "[Buffering] ";
+                    }
+                    if (p.underrun_count > 0) {
+                        status += "[Underruns: " + std::to_string(p.underrun_count) + "] ";
+                    }
+                    if (status.empty()) {
+                        status = "OK";
+                    }
+                    ImGui::Text("%s", status.c_str());
+                }
+
+                ImGui::EndTable();
+            }
+        }
+    }
+    ImGui::End();
+}
 
 int main() {
     try {
@@ -526,7 +801,31 @@ int main() {
 
         Client client_instance(io_context, "127.0.0.1", 9999);
 
+        std::thread ui_thread([&io_context, &client_instance]() {
+            // Enable VSync for efficient FPS limiting (hardware-accelerated)
+            ImGuiApp app(640, 480, "Jam", true, 60);
+
+            // Clean lambda - just delegates to separate function
+            app.SetDrawCallback([&client_instance]() { DrawClientUI(client_instance); });
+
+            app.SetCloseCallback([&io_context]() {
+                // Stop io_context to exit the application
+                io_context.stop();
+            });
+            app.Run();
+        });
+
+        // Run io_context until window closes
         io_context.run();
+
+        // Clean up Client resources before exit
+        client_instance.stop_audio_stream();
+        client_instance.stop_connection();
+
+        // Wait for UI thread to finish
+        if (ui_thread.joinable()) {
+            ui_thread.join();
+        }
     } catch (std::exception& e) {
         Log::error("ERR: {}", e.what());
     }

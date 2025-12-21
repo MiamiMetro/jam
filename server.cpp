@@ -5,9 +5,11 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <vector>
 
 #include <asio.hpp>
 #include <asio/buffer.hpp>
@@ -129,13 +131,21 @@ private:
                 clients_[remote_endpoint_].last_alive = now;
                 clients_[remote_endpoint_].client_id  = next_client_id_++;
                 break;
-            case CtrlHdr::Cmd::LEAVE:
+            case CtrlHdr::Cmd::LEAVE: {
                 Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
                           remote_endpoint_.port());
+                uint32_t leaving_client_id = clients_[remote_endpoint_].client_id;
                 clients_.erase(remote_endpoint_);
+                // Broadcast participant leave to all other clients
+                broadcast_participant_leave(leaving_client_id);
                 break;
+            }
             case CtrlHdr::Cmd::ALIVE:
                 clients_[remote_endpoint_].last_alive = now;
+                break;
+            case CtrlHdr::Cmd::PARTICIPANT_LEAVE:
+                // Clients shouldn't send this, only server broadcasts it
+                Log::warn("Client sent PARTICIPANT_LEAVE (should only come from server)");
                 break;
             default:
                 Log::warn("Unknown CTRL cmd: {} from {}:{}", static_cast<int>(chdr.type),
@@ -145,36 +155,56 @@ private:
     }
 
     void handle_audio_message(std::size_t bytes) {
-        if (bytes < sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) ||
-            !clients_.contains(remote_endpoint_)) {
+        // Minimum size check first (magic + sender_id + encoded_bytes)
+        constexpr size_t MIN_AUDIO_PACKET_SIZE =
+            sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+        if (bytes < MIN_AUDIO_PACKET_SIZE) {
+            // Too small to even read the header - silently drop
             do_receive();
             return;
         }
 
-        // Get sender's client ID
-        uint32_t sender_id = clients_[remote_endpoint_].client_id;
+        // Auto-register client if not known (handles case where server starts after clients)
+        if (!clients_.contains(remote_endpoint_)) {
+            auto now = std::chrono::steady_clock::now();
+            Log::info("Auto-registering client from audio packet: {}:{} (ID: {})",
+                      remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                      next_client_id_);
+            clients_[remote_endpoint_].last_alive = now;
+            clients_[remote_endpoint_].client_id  = next_client_id_++;
+        }
 
         // Read encoded_bytes (after sender_id field)
         uint16_t encoded_bytes;
         std::memcpy(&encoded_bytes, recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint32_t),
                     sizeof(uint16_t));
 
-        // Verify we received all the data
-        size_t expected_size = sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) + encoded_bytes;
-        if (bytes < expected_size) {
-            Log::error("Incomplete audio packet: got {}, expected {} (encoded_bytes={})", bytes,
-                       expected_size, encoded_bytes);
+        // Validate encoded_bytes is reasonable FIRST (before using it in calculations)
+        if (encoded_bytes > AUDIO_BUF_SIZE) {
+            // Silently drop - likely corrupted packet (encoded_bytes is garbage)
             do_receive();
             return;
         }
 
-        // Additional safety check: ensure encoded_bytes is reasonable
-        if (encoded_bytes > AUDIO_BUF_SIZE) {
-            Log::error("Invalid audio packet: encoded_bytes {} exceeds max {}", encoded_bytes,
-                       AUDIO_BUF_SIZE);
+        // Calculate expected size and check for corruption
+        size_t expected_size = MIN_AUDIO_PACKET_SIZE + encoded_bytes;
+        if (bytes < expected_size) {
+            size_t missing_bytes = expected_size - bytes;
+
+            // If missing more than 2 bytes, it's likely a corrupted/incomplete packet
+            // Silently drop to avoid log spam (UDP can have packet loss/fragmentation)
+            if (missing_bytes > 2) {
+                do_receive();
+                return;
+            }
+
+            // Very minor mismatch (1-2 bytes) - might be edge case, still drop
             do_receive();
             return;
         }
+
+        // Get sender's client ID
+        uint32_t sender_id = clients_[remote_endpoint_].client_id;
 
         // Embed sender_id in the packet (client may not have sent it, or we override it)
         std::memcpy(recv_buf_.data() + sizeof(MsgHdr), &sender_id, sizeof(uint32_t));
@@ -191,12 +221,31 @@ private:
         auto now = std::chrono::steady_clock::now();
         for (auto it = clients_.begin(); it != clients_.end();) {
             if (now - it->second.last_alive > CLIENT_TIMEOUT) {
-                Log::info("Client {}:{} timed out", it->first.address().to_string(),
-                          it->first.port());
-                it = clients_.erase(it);
+                Log::info("Client {}:{} timed out (ID: {})", it->first.address().to_string(),
+                          it->first.port(), it->second.client_id);
+                uint32_t timed_out_id = it->second.client_id;
+                it                    = clients_.erase(it);
+                // Broadcast participant leave to all other clients
+                broadcast_participant_leave(timed_out_id);
             } else {
                 ++it;
             }
+        }
+    }
+
+    void broadcast_participant_leave(uint32_t participant_id) {
+        // Broadcast to all clients that a participant has left
+        CtrlHdr chdr{};
+        chdr.magic          = CTRL_MAGIC;
+        chdr.type           = CtrlHdr::Cmd::PARTICIPANT_LEAVE;
+        chdr.participant_id = participant_id;
+
+        // Create shared_ptr to keep buffer alive during async sends
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
+        std::memcpy(buf->data(), &chdr, sizeof(CtrlHdr));
+
+        for (const auto& [endpoint, client_info]: clients_) {
+            send(buf->data(), sizeof(CtrlHdr), endpoint, buf);
         }
     }
 

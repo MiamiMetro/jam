@@ -31,10 +31,12 @@ struct SyncHdr : MsgHdr {
 
 struct CtrlHdr : MsgHdr {
     enum class Cmd : uint8_t {
-        JOIN  = 1,
-        LEAVE = 2,
-        ALIVE = 3,
+        JOIN              = 1,
+        LEAVE             = 2,
+        ALIVE             = 3,
+        PARTICIPANT_LEAVE = 4,  // Server broadcasts when participant leaves
     } type;
+    uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
 
 struct AudioHdr : MsgHdr {

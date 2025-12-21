@@ -19,6 +19,9 @@ CompileFlags:
     - -Ibuild/_deps/opus-src/include
     - -Ibuild/_deps/concurrentqueue_src-src
     - -Ibuild/_deps/spdlog-src/include
+    - -Ibuild/_deps/imgui-src
+    - -Ibuild/_deps/imgui-src/backends
+    - -Ibuild/_deps/glfw-src/include
   Remove:
     - -w
 
