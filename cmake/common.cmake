@@ -1,5 +1,10 @@
 # Common dependencies and setup for both server and client
 
+if(_JAM_COMMON_INCLUDED)
+    return()
+endif()
+set(_JAM_COMMON_INCLUDED TRUE)
+
 # ============================================================
 # Platform / Asio config
 # ============================================================
