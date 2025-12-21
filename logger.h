@@ -5,7 +5,6 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
-#include <print>
 #include <string>
 #include <vector>
 
@@ -131,18 +130,18 @@ void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
                     // Size in MB
                     double size_mb =
                         static_cast<double>(file_size) / (BYTES_PER_KB_DBL * BYTES_PER_KB_DBL);
-                    std::println(stdout, "Logger: Existing log file size: {:.2f} MB", size_mb);
+                    fprintf(stdout, "Logger: Existing log file size: %.2f MB", size_mb);
                 } else if (file_size >= BYTES_PER_KB) {
                     // Size in KB
                     double size_kb = static_cast<double>(file_size) / BYTES_PER_KB_DBL;
-                    std::println(stdout, "Logger: Existing log file size: {:.2f} KB", size_kb);
+                    fprintf(stdout, "Logger: Existing log file size: %.2f KB", size_kb);
                 } else {
                     // Size in bytes
-                    std::println(stdout, "Logger: Existing log file size: {} bytes",
-                                 static_cast<unsigned long long>(file_size));
+                    fprintf(stdout, "Logger: Existing log file size: %llu bytes",
+                            static_cast<unsigned long long>(file_size));
                 }
             } else {
-                std::println(stdout, "Logger: Creating new log file");
+                fprintf(stdout, "Logger: Creating new log file");
             }
 
             file_sink_ = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, true);
