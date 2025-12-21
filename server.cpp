@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -45,20 +46,29 @@ public:
     static constexpr size_t RECV_BUF_SIZE        = 1024;
 
     Server(asio::io_context& io_context, short port, const std::string& srt_host = "127.0.0.1",
-           int srt_port = 9000)
+           int srt_port = 9000, bool broadcast_enabled = true)
         : socket_(io_context, udp::endpoint(udp::v4(), port)),
           alive_check_timer_(io_context, ALIVE_CHECK_INTERVAL,
                              [this]() { alive_check_timer_callback(); }),
           mix_timer_(io_context, 10ms, [this]() { mix_and_send_timer_callback(); }),
-          srt_client_(io_context, srt_host, srt_port) {
-        // Try to connect SRT
-        if (!srt_client_.connect()) {
-            Log::warn("Initial SRT connection failed. Will retry in background...");
-            srt_client_.start_reconnect();
+          srt_client_(io_context, srt_host, srt_port),
+          broadcast_enabled_(broadcast_enabled),
+          srt_connection_attempts_(0) {
+        if (broadcast_enabled_) {
+            // Try to connect SRT
+            if (!srt_client_.connect()) {
+                srt_connection_attempts_ = 1;
+                Log::warn(
+                    "Initial SRT connection failed (attempt 1/3). Will retry in background...");
+                srt_client_.start_reconnect(2);  // 2 more attempts (total 3)
+            } else {
+                Log::info("SFU server ready: decoding, mixing, and broadcasting audio via SRT");
+            }
+        } else {
+            Log::info("SFU server ready: forwarding audio between clients (broadcasting disabled)");
         }
-        do_receive();
-        Log::info("SFU server ready: decoding, mixing, and broadcasting audio via SRT");
         Log::info("Mix timer initialized (10ms interval)");
+        do_receive();
     }
 
     ~Server() {
@@ -250,12 +260,36 @@ private:
         // Get sender's client ID
         uint32_t sender_id = clients_[remote_endpoint_].client_id;
 
+        // Embed sender_id in the packet (client may not have sent it, or we override it)
+        std::memcpy(recv_buf_.data() + sizeof(MsgHdr), &sender_id, sizeof(uint32_t));
+
+        // SFU: Forward audio packet to all other clients (not back to sender)
+        // Copy packet data before forwarding since recv_buf_ will be reused immediately
+        // by do_receive() and async sends are still pending
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
+                                                                        recv_buf_.data() + bytes);
+        forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
+
+        // Only decode and mix if broadcasting is enabled AND SRT is connected
+        if (!broadcast_enabled_) {
+            return;  // Skip decode/mix if broadcasting is disabled
+        }
+
+        if (!srt_client_.is_connected()) {
+            static int skip_count = 0;
+            if (++skip_count % 1000 == 0) {
+                Log::debug("SRT not connected, skipping audio decode/mix ({} packets skipped)",
+                           skip_count);
+            }
+            return;  // Skip decode/mix if SRT is not connected
+        }
+
         // Log first few audio packets
         static std::unordered_map<udp::endpoint, int, endpoint_hash> packet_counts;
         int& count = packet_counts[remote_endpoint_];
         if (++count <= 5 || count % 100 == 0) {
-            Log::info("Received audio packet from client {} ({} bytes, {} encoded)", sender_id,
-                      bytes, encoded_bytes);
+            Log::debug("Received audio packet from client {} ({} bytes, {} encoded)", sender_id,
+                       bytes, encoded_bytes);
         }
 
         // Extract Opus encoded data
@@ -313,20 +347,10 @@ private:
             // Debug: log occasionally
             static int decode_count = 0;
             if (++decode_count % 100 == 0 || decode_count <= 5) {
-                Log::info("Decoded {} packets from client {}, buffer size: {} samples",
-                          decode_count, sender_id, buffer.size());
+                Log::debug("Decoded {} packets from client {}, buffer size: {} samples",
+                           decode_count, sender_id, buffer.size());
             }
         }
-
-        // Embed sender_id in the packet (client may not have sent it, or we override it)
-        std::memcpy(recv_buf_.data() + sizeof(MsgHdr), &sender_id, sizeof(uint32_t));
-
-        // SFU: Forward audio packet to all other clients (not back to sender)
-        // Copy packet data before forwarding since recv_buf_ will be reused immediately
-        // by do_receive() and async sends are still pending
-        auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
-                                                                        recv_buf_.data() + bytes);
-        forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
     }
 
     void alive_check_timer_callback() {
@@ -355,6 +379,35 @@ private:
     }
 
     void mix_and_send_timer_callback() {
+        // Early exit if broadcasting is disabled or SRT is not connected
+        if (!broadcast_enabled_) {
+            return;  // Skip mixing if broadcasting is disabled
+        }
+
+        if (!srt_client_.is_connected()) {
+            // Wait for reconnect thread to finish (3 attempts total), then disable broadcasting
+            static int consecutive_failures = 0;
+            consecutive_failures++;
+
+            // After ~15 seconds (1500 calls at 10ms interval), disable if still not connected
+            // This gives the reconnect thread time to complete its 3 attempts with backoff
+            if (consecutive_failures > 1500 && broadcast_enabled_) {
+                Log::warn("SRT connection failed after 3 attempts. Disabling broadcasting.");
+                broadcast_enabled_   = false;
+                consecutive_failures = 0;
+                return;
+            }
+
+            static int skip_count = 0;
+            if (++skip_count % 1000 == 0) {
+                Log::debug("SRT not connected, skipping mix/send ({} times)", skip_count);
+            }
+            return;  // Skip mixing if SRT is not connected
+        }
+
+        // Reset counter on successful connection (consecutive_failures is reset in the failure path
+        // above)
+
         // Mix all client buffers and send via SRT
         constexpr size_t FRAME_SAMPLES =
             static_cast<size_t>(FRAME_SIZE) * static_cast<size_t>(CHANNELS);
@@ -397,7 +450,7 @@ private:
                 }
                 static int mix_count = 0;
                 if (++mix_count % 100 == 0 || mix_count <= 5) {
-                    Log::info("Mixed {} clients, sending frame", active_clients);
+                    Log::debug("Mixed {} clients, sending frame", active_clients);
                 }
             } else {
                 // No active clients with data - send silence
@@ -409,15 +462,7 @@ private:
             }
         }
 
-        // Always send a frame (even if silence) to maintain timing
-        if (!srt_client_.is_connected()) {
-            static int skip_count = 0;
-            if (++skip_count % 1000 == 0) {
-                Log::debug("SRT socket not connected, skipping send");
-            }
-            return;
-        }
-
+        // Send mixed frame via SRT (connection already checked at start of function)
         int result = srt_client_.send(mixed_frame.data(), FRAME_BYTES);
         if (result == SRT_ERROR) {
             // Error already logged by SrtClient, and reconnection started if needed
@@ -426,7 +471,7 @@ private:
             // Successfully sent - log occasionally for debugging
             static int send_count = 0;
             if (++send_count % 100 == 0 || send_count <= 10) {
-                Log::info("Sent {} SRT frames ({} bytes each)", send_count, result);
+                Log::debug("Sent {} SRT frames ({} bytes each)", send_count, result);
             }
         } else {
             // result == 0 shouldn't happen with non-blocking send, but log it
@@ -498,7 +543,9 @@ private:
     PeriodicTimer mix_timer_;
 
     // SRT client
-    SrtClient srt_client_;
+    SrtClient         srt_client_;
+    std::atomic<bool> broadcast_enabled_;
+    std::atomic<int>  srt_connection_attempts_;
 
     // Per-client decoders and PCM buffers
     std::mutex                                                           client_decoders_mutex_;
@@ -513,11 +560,11 @@ int main() {
         constexpr short SERVER_PORT = 9999;
 
         auto& log = Logger::instance();
-        log.init(true, false, false, "", spdlog::level::debug);
+        log.init(true, false, false, "", spdlog::level::info);
 
         asio::io_context io_context;
 
-        Server srv(io_context, SERVER_PORT);
+        Server srv(io_context, SERVER_PORT, "127.0.0.1", 9000, false);
 
         log.info("SFU server listening on 127.0.0.1:{}", SERVER_PORT);
         log.info("Forwarding audio packets between clients");

@@ -112,9 +112,10 @@ public:
         return status == SRTS_CONNECTED;
     }
 
-    void start_reconnect() {
+    void start_reconnect(int max_attempts = -1) {
         if (!reconnect_thread_.joinable()) {
-            reconnect_thread_ = std::thread([this]() { reconnect_with_backoff(); });
+            reconnect_thread_ =
+                std::thread([this, max_attempts]() { reconnect_with_backoff(max_attempts); });
         }
     }
 
@@ -203,11 +204,18 @@ private:
         return true;
     }
 
-    void reconnect_with_backoff() {
+    void reconnect_with_backoff(int max_attempts = -1) {
         int       backoff_ms     = 100;
         const int max_backoff_ms = 5000;
+        int       attempts       = 0;
 
         while (running_) {
+            attempts++;
+            if (max_attempts > 0 && attempts > max_attempts) {
+                Log::warn("SRT reconnection stopped after {} attempts", max_attempts);
+                return;
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
 
             {
