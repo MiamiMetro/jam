@@ -141,6 +141,12 @@ public:
         }
     }
 
+    struct LatencyInfo {
+        double input_latency_ms  = 0.0;
+        double output_latency_ms = 0.0;
+        double sample_rate       = 0.0;
+    };
+
     void print_latency_info() {
         const PaStreamInfo* stream_info = Pa_GetStreamInfo(stream_);
         if (stream_info != nullptr) {
@@ -151,6 +157,18 @@ public:
                       stream_info->outputLatency * SECONDS_TO_MILLISECONDS);
             Log::info("Sample rate:    {:.1f} Hz", stream_info->sampleRate);
         }
+    }
+
+    LatencyInfo get_latency_info() const {
+        LatencyInfo info{};
+        const PaStreamInfo* stream_info = Pa_GetStreamInfo(stream_);
+        if (stream_info != nullptr) {
+            static constexpr double SECONDS_TO_MILLISECONDS = 1000.0;
+            info.input_latency_ms  = stream_info->inputLatency * SECONDS_TO_MILLISECONDS;
+            info.output_latency_ms = stream_info->outputLatency * SECONDS_TO_MILLISECONDS;
+            info.sample_rate       = stream_info->sampleRate;
+        }
+        return info;
     }
 
     int get_input_channel_count() const {

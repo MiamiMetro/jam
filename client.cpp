@@ -154,6 +154,27 @@ public:
         }
         int input_channels = std::min(input_info->maxInputChannels, 1);  // Mono input
 
+        // Get output device info
+        const auto* output_info = AudioStream::get_device_info(output_device);
+        if (output_info == nullptr) {
+            Log::error("Invalid output device");
+            return false;
+        }
+
+        // Store device info
+        device_info_.input_device_name  = input_info->name;
+        device_info_.input_api           = (Pa_GetHostApiInfo(input_info->hostApi) != nullptr)
+                                               ? Pa_GetHostApiInfo(input_info->hostApi)->name
+                                               : "Unknown";
+        device_info_.input_channels      = input_channels;
+        device_info_.input_sample_rate   = input_info->defaultSampleRate;
+        device_info_.output_device_name  = output_info->name;
+        device_info_.output_api          = (Pa_GetHostApiInfo(output_info->hostApi) != nullptr)
+                                               ? Pa_GetHostApiInfo(output_info->hostApi)->name
+                                               : "Unknown";
+        device_info_.output_channels     = std::min(output_info->maxOutputChannels, 1);
+        device_info_.output_sample_rate  = output_info->defaultSampleRate;
+
         // Initialize Opus encoder for sending own audio BEFORE starting stream
         // This prevents data race where callback might access encoder during initialization
         if (!audio_encoder_.create(config.sample_rate, input_channels, OPUS_APPLICATION_VOIP,
@@ -161,6 +182,13 @@ public:
             Log::error("Failed to create Opus encoder");
             return false;
         }
+
+        // Store encoder info (get actual bitrate from encoder)
+        encoder_info_.channels       = input_channels;
+        encoder_info_.sample_rate    = config.sample_rate;
+        encoder_info_.bitrate        = config.bitrate;
+        encoder_info_.complexity     = config.complexity;
+        encoder_info_.actual_bitrate = audio_encoder_.get_actual_bitrate();
 
         Log::info("Starting audio stream...");
         bool success =
@@ -224,6 +252,46 @@ public:
     // Get own audio level (for displaying user's own microphone level)
     float get_own_audio_level() const {
         return own_audio_level_.load();
+    }
+
+    // Device and encoder info structure
+    struct DeviceInfo {
+        std::string input_device_name;
+        std::string input_api;
+        int         input_channels;
+        double      input_sample_rate;
+        std::string output_device_name;
+        std::string output_api;
+        int         output_channels;
+        double      output_sample_rate;
+    };
+
+    struct EncoderInfo {
+        int channels;
+        int sample_rate;
+        int bitrate;
+        int actual_bitrate;
+        int complexity;
+    };
+
+    DeviceInfo get_device_info() const {
+        return device_info_;
+    }
+
+    EncoderInfo get_encoder_info() const {
+        return encoder_info_;
+    }
+
+    AudioStream::LatencyInfo get_latency_info() const {
+        return audio_.get_latency_info();
+    }
+
+    double get_rtt_ms() const {
+        return rtt_ms_.load(std::memory_order_relaxed);
+    }
+
+    AudioStream::AudioConfig get_audio_config() const {
+        return audio_config_;
     }
 
     void on_receive(std::error_code error_code, std::size_t bytes) {
@@ -365,6 +433,9 @@ private:
 
         double rtt_ms    = static_cast<double>(rtt) / 1e6;
         double offset_ms = static_cast<double>(offset) / 1e6;
+
+        // Store RTT for GUI display (thread-safe atomic update)
+        rtt_ms_.store(rtt_ms, std::memory_order_relaxed);
 
         // print live stats
         Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
@@ -686,6 +757,13 @@ private:
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
 
+    // RTT tracking (thread-safe with atomic)
+    std::atomic<double> rtt_ms_{0.0};
+
+    // Device and encoder info storage
+    DeviceInfo  device_info_;
+    EncoderInfo encoder_info_;
+
     PeriodicTimer ping_timer_;
     PeriodicTimer alive_timer_;
     PeriodicTimer cleanup_timer_;
@@ -700,29 +778,100 @@ void DrawClientUI(Client& client) {
     }
 
     // Your custom windows here
-    bool window_open = true;
 
-    if (ImGui::Begin("Client Info", &window_open)) {
+    if (ImGui::Begin("Client Info")) {
         ImGui::Text("Hello from GLFW + OpenGL3!");
         ImGui::Separator();
+
+        // FPS and Frame Time side by side
         ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+        ImGui::SameLine(150.0F);
         ImGui::Text("Frame Time: %.3f ms", 1000.0F / ImGui::GetIO().Framerate);
 
         ImGui::Separator();
         ImGui::Text("Connection:");
-        ImGui::Text("  Server: %s:%u", client.get_server_address().c_str(),
-                    client.get_server_port());
-        ImGui::Text("  Local Port: %u", client.get_local_port());
-        ImGui::Text("  Participants: %zu", client.get_participant_count());
-        ImGui::Text("  Audio Stream: %s", client.is_audio_stream_active() ? "Active" : "Inactive");
+        if (ImGui::BeginTable("Connection", 2, ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("Server: %s:%u", client.get_server_address().c_str(),
+                        client.get_server_port());
+            ImGui::TableNextColumn();
+            ImGui::Text("Local Port: %u", client.get_local_port());
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("Participants: %zu", client.get_participant_count());
+            ImGui::TableNextColumn();
+            ImGui::Text("Audio Stream: %s",
+                        client.is_audio_stream_active() ? "Active" : "Inactive");
+            ImGui::EndTable();
+        }
 
         ImGui::Separator();
-        ImGui::Text("You:");
-        float own_level = client.get_own_audio_level();
-        ImGui::Text("  Audio Level: %.3f", own_level);
-        if (own_level > 0.01F) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), " [Speaking]");
+        ImGui::Text("Audio Devices:");
+        auto device_info = client.get_device_info();
+        if (ImGui::BeginTable("AudioDevices", 2, ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("Input: %s", device_info.input_device_name.c_str());
+            ImGui::Text("  API: %s", device_info.input_api.c_str());
+            ImGui::Text("  Channels: %d", device_info.input_channels);
+            ImGui::Text("  Sample Rate: %.0f Hz", device_info.input_sample_rate);
+            ImGui::TableNextColumn();
+            ImGui::Text("Output: %s", device_info.output_device_name.c_str());
+            ImGui::Text("  API: %s", device_info.output_api.c_str());
+            ImGui::Text("  Channels: %d", device_info.output_channels);
+            ImGui::Text("  Sample Rate: %.0f Hz", device_info.output_sample_rate);
+            ImGui::EndTable();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Audio Config:");
+        auto audio_config = client.get_audio_config();
+        auto encoder_info = client.get_encoder_info();
+        auto latency_info = client.get_latency_info();
+        if (ImGui::BeginTable("AudioConfig", 3, ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("Stream Config");
+            ImGui::Text("  Frames/buffer: %d", audio_config.frames_per_buffer);
+            ImGui::Text("  Sample rate: %d Hz", encoder_info.sample_rate);
+            ImGui::Text("  Bitrate: %d bps", encoder_info.bitrate);
+            ImGui::Text("  Channels: %d in, %d out", device_info.input_channels,
+                        device_info.output_channels);
+            ImGui::TableNextColumn();
+            ImGui::Text("Latency");
+            ImGui::Text("  Input: %.3f ms", latency_info.input_latency_ms);
+            ImGui::Text("  Output: %.3f ms", latency_info.output_latency_ms);
+            ImGui::Text("  Sample rate: %.1f Hz", latency_info.sample_rate);
+            ImGui::TableNextColumn();
+            ImGui::Text("Opus Encoder");
+            ImGui::Text("  %dch, %dHz", encoder_info.channels, encoder_info.sample_rate);
+            ImGui::Text("  Target: %d bps", encoder_info.bitrate);
+            ImGui::Text("  Actual: %d bps", encoder_info.actual_bitrate);
+            ImGui::Text("  Complexity: %d", encoder_info.complexity);
+            ImGui::EndTable();
+        }
+
+        ImGui::Separator();
+        if (ImGui::BeginTable("NetworkYou", 2, ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("Network:");
+            double rtt = client.get_rtt_ms();
+            if (rtt > 0.0) {
+                ImGui::Text("  RTT: %.3f ms", rtt);
+            } else {
+                ImGui::Text("  RTT: -- ms (no ping)");
+            }
+            ImGui::TableNextColumn();
+            ImGui::Text("You:");
+            float own_level = client.get_own_audio_level();
+            ImGui::Text("  Audio Level: %.3f", own_level);
+            if (own_level > 0.01F) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), " [Speaking]");
+            }
+            ImGui::EndTable();
         }
 
         ImGui::Separator();
@@ -799,11 +948,11 @@ int main() {
 
         asio::io_context io_context;
 
-        Client client_instance(io_context, "127.0.0.1", 9999);
+        Client client_instance(io_context, "jam.welor.fun", 9999);
 
         std::thread ui_thread([&io_context, &client_instance]() {
             // Enable VSync for efficient FPS limiting (hardware-accelerated)
-            ImGuiApp app(640, 480, "Jam", true, 60);
+            ImGuiApp app(900, 500, "Jam", true, 60);
 
             // Clean lambda - just delegates to separate function
             app.SetDrawCallback([&client_instance]() { DrawClientUI(client_instance); });

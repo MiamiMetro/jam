@@ -120,6 +120,14 @@ public:
     int get_sample_rate() const {
         return sample_rate_;
     }
+    int get_actual_bitrate() const {
+        if (encoder_ == nullptr) {
+            return 0;
+        }
+        int32_t actual_bitrate;
+        opus_encoder_ctl(encoder_, OPUS_GET_BITRATE(&actual_bitrate));
+        return actual_bitrate;
+    }
 
 private:
     OpusEncoder* encoder_     = nullptr;
