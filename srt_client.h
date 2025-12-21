@@ -119,6 +119,15 @@ public:
         }
     }
 
+    void disconnect() {
+        std::lock_guard<std::mutex> lock(sock_mutex_);
+        if (sock_ != SRT_INVALID_SOCK) {
+            srt_close(sock_);
+            sock_ = SRT_INVALID_SOCK;
+            Log::info("Disconnected from SRT endpoint {}:{}", host_, port_);
+        }
+    }
+
 private:
     static bool init_srt() {
         srt_startup();

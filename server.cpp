@@ -46,7 +46,7 @@ public:
     static constexpr size_t RECV_BUF_SIZE        = 1024;
 
     Server(asio::io_context& io_context, short port, const std::string& srt_host = "127.0.0.1",
-           int srt_port = 9000, bool broadcast_enabled = true)
+           int srt_port = 9000, bool broadcast_enabled = false)
         : socket_(io_context, udp::endpoint(udp::v4(), port)),
           alive_check_timer_(io_context, ALIVE_CHECK_INTERVAL,
                              [this]() { alive_check_timer_callback(); }),
@@ -171,6 +171,12 @@ private:
                 clients_.erase(remote_endpoint_);
                 // Broadcast participant leave to all other clients
                 broadcast_participant_leave(leaving_client_id);
+                // Check if no participants left and disable broadcast
+                if (clients_.empty() && broadcast_enabled_.load()) {
+                    Log::info("No participants left, disabling broadcast");
+                    broadcast_enabled_.store(false);
+                    srt_client_.disconnect();
+                }
                 break;
             }
             case CtrlHdr::Cmd::ALIVE:
@@ -180,6 +186,40 @@ private:
                 // Clients shouldn't send this, only server broadcasts it
                 Log::warn("Client sent PARTICIPANT_LEAVE (should only come from server)");
                 break;
+            case CtrlHdr::Cmd::BROADCAST_ENABLE: {
+                Log::info("Client {}:{} requested broadcast enable", remote_endpoint_.address().to_string(),
+                          remote_endpoint_.port());
+                if (!broadcast_enabled_.load()) {
+                    broadcast_enabled_.store(true);
+                    // Try to connect SRT if not already connected
+                    if (!srt_client_.is_connected()) {
+                        if (!srt_client_.connect()) {
+                            srt_connection_attempts_ = 1;
+                            Log::warn("SRT connection failed (attempt 1/3). Will retry in background...");
+                            srt_client_.start_reconnect(2);  // 2 more attempts (total 3)
+                        } else {
+                            Log::info("Broadcast enabled: SRT connected");
+                        }
+                    } else {
+                        Log::info("Broadcast enabled: SRT already connected");
+                    }
+                } else {
+                    Log::info("Broadcast already enabled");
+                }
+                break;
+            }
+            case CtrlHdr::Cmd::BROADCAST_DISABLE: {
+                Log::info("Client {}:{} requested broadcast disable", remote_endpoint_.address().to_string(),
+                          remote_endpoint_.port());
+                if (broadcast_enabled_.load()) {
+                    broadcast_enabled_.store(false);
+                    srt_client_.disconnect();
+                    Log::info("Broadcast disabled");
+                } else {
+                    Log::info("Broadcast already disabled");
+                }
+                break;
+            }
             default:
                 Log::warn("Unknown CTRL cmd: {} from {}:{}", static_cast<int>(chdr.type),
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
@@ -372,6 +412,12 @@ private:
                 it = clients_.erase(it);
                 // Broadcast participant leave to all other clients
                 broadcast_participant_leave(timed_out_id);
+                // Check if no participants left and disable broadcast
+                if (clients_.empty() && broadcast_enabled_.load()) {
+                    Log::info("No participants left, disabling broadcast");
+                    broadcast_enabled_.store(false);
+                    srt_client_.disconnect();
+                }
             } else {
                 ++it;
             }
@@ -564,7 +610,7 @@ int main() {
 
         asio::io_context io_context;
 
-        Server srv(io_context, SERVER_PORT, "127.0.0.1", 9000, false);
+        Server srv(io_context, SERVER_PORT);
 
         log.info("SFU server listening on 127.0.0.1:{}", SERVER_PORT);
         log.info("Forwarding audio packets between clients");

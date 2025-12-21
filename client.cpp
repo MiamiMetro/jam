@@ -139,6 +139,24 @@ public:
         Log::info("Disconnected (no longer sending/receiving)");
     }
 
+    void enable_broadcast() {
+        Log::info("Requesting broadcast enable...");
+        CtrlHdr chdr{};
+        chdr.magic = CTRL_MAGIC;
+        chdr.type  = CtrlHdr::Cmd::BROADCAST_ENABLE;
+        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
+        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+    }
+
+    void disable_broadcast() {
+        Log::info("Requesting broadcast disable...");
+        CtrlHdr chdr{};
+        chdr.magic = CTRL_MAGIC;
+        chdr.type  = CtrlHdr::Cmd::BROADCAST_DISABLE;
+        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
+        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+    }
+
     bool start_audio_stream(PaDeviceIndex input_device, PaDeviceIndex output_device,
                             const AudioStream::AudioConfig& config = AudioStream::AudioConfig{}) {
         // Store config FIRST before any validation that could cause early return
@@ -847,6 +865,16 @@ void DrawClientUI(Client& client) {
             const bool audio_active = client.is_audio_stream_active();
             ImGui::Text("Audio Stream: %s", audio_active ? active_text : inactive_text);
             ImGui::EndTable();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Broadcast Control:");
+        if (ImGui::Button("Enable Broadcast")) {
+            client.enable_broadcast();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Disable Broadcast")) {
+            client.disable_broadcast();
         }
 
         ImGui::Separator();
