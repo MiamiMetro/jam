@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -9,9 +8,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -22,23 +21,11 @@
 #include <spdlog/common.h>
 #include <srt.h>
 
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#endif
-
 #include "logger.h"
 #include "opus_decoder.h"
 #include "periodic_timer.h"
 #include "protocol.h"
+#include "srt_client.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -51,46 +38,23 @@ constexpr int CLIENT_FRAME_SIZE = 240;  // 5ms at 48kHz (client sends this)
 constexpr int BYTES_PER_SAMPLE  = 2;    // int16
 constexpr int FRAME_BYTES       = FRAME_SIZE * CHANNELS * BYTES_PER_SAMPLE;
 
-// SRT configuration
-constexpr const char* SRT_HOST = "127.0.0.1";
-constexpr int         SRT_PORT = 9000;
-
 class Server {
 public:
     static constexpr auto   ALIVE_CHECK_INTERVAL = 5s;
     static constexpr auto   CLIENT_TIMEOUT       = 15s;
     static constexpr size_t RECV_BUF_SIZE        = 1024;
 
-    Server(asio::io_context& io_context, short port)
+    Server(asio::io_context& io_context, short port, const std::string& srt_host = "127.0.0.1",
+           int srt_port = 9000)
         : socket_(io_context, udp::endpoint(udp::v4(), port)),
           alive_check_timer_(io_context, ALIVE_CHECK_INTERVAL,
                              [this]() { alive_check_timer_callback(); }),
-          mix_timer_(io_context, 10ms, [this]() { mix_and_send_timer_callback(); }) {
-#ifdef _WIN32
-        // Initialize Winsock (required before any socket functions on Windows)
-        WSADATA wsaData;
-        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            Log::error("WSAStartup failed");
-            throw std::runtime_error("WSAStartup failed");
-        }
-#endif
-        // Initialize SRT
-        if (!init_srt()) {
-            Log::error("SRT initialization failed");
-            throw std::runtime_error("SRT initialization failed");
-        }
-        // Create and connect SRT socket
-        srt_sock_ = create_srt_socket();
-        if (srt_sock_ == SRT_INVALID_SOCK) {
-            cleanup_srt();
-            throw std::runtime_error("Failed to create SRT socket");
-        }
-        if (!connect_srt(srt_sock_)) {
+          mix_timer_(io_context, 10ms, [this]() { mix_and_send_timer_callback(); }),
+          srt_client_(io_context, srt_host, srt_port) {
+        // Try to connect SRT
+        if (!srt_client_.connect()) {
             Log::warn("Initial SRT connection failed. Will retry in background...");
-            // Start reconnection thread
-            reconnect_thread_ = std::thread([this]() { reconnect_with_backoff(); });
-        } else {
-            Log::info("Connected to SRT endpoint {}:{}", SRT_HOST, SRT_PORT);
+            srt_client_.start_reconnect();
         }
         do_receive();
         Log::info("SFU server ready: decoding, mixing, and broadcasting audio via SRT");
@@ -98,18 +62,7 @@ public:
     }
 
     ~Server() {
-        g_running_ = false;
         socket_.close();
-        if (reconnect_thread_.joinable()) {
-            reconnect_thread_.join();
-        }
-        if (srt_sock_ != SRT_INVALID_SOCK) {
-            srt_close(srt_sock_);
-        }
-        cleanup_srt();
-#ifdef _WIN32
-        WSACleanup();
-#endif
     }
 
     void do_receive() {
@@ -457,47 +410,29 @@ private:
         }
 
         // Always send a frame (even if silence) to maintain timing
-        if (srt_sock_ != SRT_INVALID_SOCK) {
-            // Check socket state - only send if connected
-            SRT_SOCKSTATUS status = srt_getsockstate(srt_sock_);
-            if (status != SRTS_CONNECTED) {
-                // Socket not connected - don't try to send
-                static int skip_count = 0;
-                if (++skip_count % 1000 == 0) {
-                    Log::debug("SRT socket not connected (status: {}), skipping send",
-                               static_cast<int>(status));
-                }
-                return;
+        if (!srt_client_.is_connected()) {
+            static int skip_count = 0;
+            if (++skip_count % 1000 == 0) {
+                Log::debug("SRT socket not connected, skipping send");
             }
+            return;
+        }
 
-            int result =
-                srt_send(srt_sock_, reinterpret_cast<const char*>(mixed_frame.data()), FRAME_BYTES);
-            if (result == SRT_ERROR) {
-                int err = srt_getlasterror(nullptr);
-                if (err == SRT_EASYNCSND || err == SRT_ECONGEST) {
-                    // Congestion - drop frame (this is expected with non-blocking send)
-                } else {
-                    // Connection broken - trigger reconnection
-                    Log::warn("SRT send error: {} (status: {}), will reconnect",
-                              srt_getlasterror_str(), static_cast<int>(status));
-                    srt_close(srt_sock_);
-                    srt_sock_ = SRT_INVALID_SOCK;
-                    if (!reconnect_thread_.joinable()) {
-                        reconnect_thread_ = std::thread([this]() { reconnect_with_backoff(); });
-                    }
-                }
-            } else if (result > 0) {
-                // Successfully sent - log occasionally for debugging
-                static int send_count = 0;
-                if (++send_count % 100 == 0 || send_count <= 10) {
-                    Log::info("Sent {} SRT frames ({} bytes each)", send_count, result);
-                }
-            } else {
-                // result == 0 shouldn't happen with non-blocking send, but log it
-                static int zero_count = 0;
-                if (++zero_count % 1000 == 0) {
-                    Log::debug("SRT send returned 0 (unexpected)");
-                }
+        int result = srt_client_.send(mixed_frame.data(), FRAME_BYTES);
+        if (result == SRT_ERROR) {
+            // Error already logged by SrtClient, and reconnection started if needed
+            // Congestion errors are expected with non-blocking send
+        } else if (result > 0) {
+            // Successfully sent - log occasionally for debugging
+            static int send_count = 0;
+            if (++send_count % 100 == 0 || send_count <= 10) {
+                Log::info("Sent {} SRT frames ({} bytes each)", send_count, result);
+            }
+        } else {
+            // result == 0 shouldn't happen with non-blocking send, but log it
+            static int zero_count = 0;
+            if (++zero_count % 1000 == 0) {
+                Log::debug("SRT send returned 0 (unexpected)");
             }
         }
     }
@@ -551,90 +486,6 @@ private:
         uint32_t                              client_id;  // Unique ID for this client
     };
 
-    // SRT functions
-    static bool init_srt() {
-        srt_startup();
-        return true;
-    }
-
-    static void cleanup_srt() {
-        srt_cleanup();
-    }
-
-    static SRTSOCKET create_srt_socket() {
-        SRTSOCKET sock = srt_create_socket();
-        if (sock == SRT_INVALID_SOCK) {
-            Log::error("Failed to create SRT socket: {}", srt_getlasterror_str());
-            return SRT_INVALID_SOCK;
-        }
-
-        // Set non-blocking send (SRTO_SNDSYN = 0)
-        int sndsyn = 0;
-        if (srt_setsockopt(sock, 0, SRTO_SNDSYN, &sndsyn, sizeof(sndsyn)) == SRT_ERROR) {
-            Log::error("Failed to set SRTO_SNDSYN: {}", srt_getlasterror_str());
-            srt_close(sock);
-            return SRT_INVALID_SOCK;
-        }
-
-        // Set latency (200ms as per broadcast_client)
-        int latency = 200;
-        if (srt_setsockopt(sock, 0, SRTO_LATENCY, &latency, sizeof(latency)) == SRT_ERROR) {
-            Log::error("Failed to set SRTO_LATENCY: {}", srt_getlasterror_str());
-            srt_close(sock);
-            return SRT_INVALID_SOCK;
-        }
-
-        return sock;
-    }
-
-    static bool connect_srt(SRTSOCKET sock) {
-        sockaddr_in sa;
-        std::memset(&sa, 0, sizeof(sa));
-        sa.sin_family = AF_INET;
-        sa.sin_port   = htons(SRT_PORT);
-
-        if (inet_pton(AF_INET, SRT_HOST, &sa.sin_addr) != 1) {
-            Log::error("Failed to parse address: {}", SRT_HOST);
-            return false;
-        }
-
-        if (srt_connect(sock, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SRT_ERROR) {
-            Log::error("Failed to connect: {}", srt_getlasterror_str());
-            return false;
-        }
-
-        return true;
-    }
-
-    void reconnect_with_backoff() {
-        int       backoff_ms     = 100;
-        const int max_backoff_ms = 5000;
-
-        while (g_running_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-
-            if (srt_sock_ != SRT_INVALID_SOCK) {
-                srt_close(srt_sock_);
-                srt_sock_ = SRT_INVALID_SOCK;
-            }
-
-            srt_sock_ = create_srt_socket();
-            if (srt_sock_ == SRT_INVALID_SOCK) {
-                backoff_ms = (backoff_ms * 2 < max_backoff_ms) ? (backoff_ms * 2) : max_backoff_ms;
-                continue;
-            }
-
-            if (connect_srt(srt_sock_)) {
-                Log::info("Reconnected to SRT endpoint {}:{}", SRT_HOST, SRT_PORT);
-                return;
-            }
-
-            srt_close(srt_sock_);
-            srt_sock_  = SRT_INVALID_SOCK;
-            backoff_ms = (backoff_ms * 2 < max_backoff_ms) ? (backoff_ms * 2) : max_backoff_ms;
-        }
-    }
-
     udp::socket socket_;
 
     std::unordered_map<udp::endpoint, ClientInfo, endpoint_hash> clients_;
@@ -646,10 +497,8 @@ private:
     PeriodicTimer alive_check_timer_;
     PeriodicTimer mix_timer_;
 
-    // SRT socket
-    SRTSOCKET         srt_sock_ = SRT_INVALID_SOCK;
-    std::thread       reconnect_thread_;
-    std::atomic<bool> g_running_{true};
+    // SRT client
+    SrtClient srt_client_;
 
     // Per-client decoders and PCM buffers
     std::mutex                                                           client_decoders_mutex_;
@@ -667,7 +516,8 @@ int main() {
         log.init(true, false, false, "", spdlog::level::debug);
 
         asio::io_context io_context;
-        Server           srv(io_context, SERVER_PORT);
+
+        Server srv(io_context, SERVER_PORT);
 
         log.info("SFU server listening on 127.0.0.1:{}", SERVER_PORT);
         log.info("Forwarding audio packets between clients");

@@ -163,17 +163,17 @@ public:
 
         // Store device info
         device_info_.input_device_name  = input_info->name;
-        device_info_.input_api           = (Pa_GetHostApiInfo(input_info->hostApi) != nullptr)
-                                               ? Pa_GetHostApiInfo(input_info->hostApi)->name
-                                               : "Unknown";
-        device_info_.input_channels      = input_channels;
-        device_info_.input_sample_rate   = input_info->defaultSampleRate;
-        device_info_.output_device_name  = output_info->name;
-        device_info_.output_api          = (Pa_GetHostApiInfo(output_info->hostApi) != nullptr)
-                                               ? Pa_GetHostApiInfo(output_info->hostApi)->name
-                                               : "Unknown";
-        device_info_.output_channels     = std::min(output_info->maxOutputChannels, 1);
-        device_info_.output_sample_rate  = output_info->defaultSampleRate;
+        device_info_.input_api          = (Pa_GetHostApiInfo(input_info->hostApi) != nullptr)
+                                              ? Pa_GetHostApiInfo(input_info->hostApi)->name
+                                              : "Unknown";
+        device_info_.input_channels     = input_channels;
+        device_info_.input_sample_rate  = input_info->defaultSampleRate;
+        device_info_.output_device_name = output_info->name;
+        device_info_.output_api         = (Pa_GetHostApiInfo(output_info->hostApi) != nullptr)
+                                              ? Pa_GetHostApiInfo(output_info->hostApi)->name
+                                              : "Unknown";
+        device_info_.output_channels    = std::min(output_info->maxOutputChannels, 1);
+        device_info_.output_sample_rate = output_info->defaultSampleRate;
 
         // Initialize Opus encoder for sending own audio BEFORE starting stream
         // This prevents data race where callback might access encoder during initialization
@@ -778,49 +778,49 @@ void DrawClientUI(Client& client) {
     }
 
     // Cache static device/config info (only updates if devices change, which is rare)
-    static Client::DeviceInfo cached_device_info;
-    static Client::EncoderInfo cached_encoder_info;
+    static Client::DeviceInfo       cached_device_info;
+    static Client::EncoderInfo      cached_encoder_info;
     static AudioStream::AudioConfig cached_audio_config;
     static AudioStream::LatencyInfo cached_latency_info;
-    static std::string cached_server_address;
-    static unsigned short cached_server_port = 0;
-    static unsigned short cached_local_port = 0;
-    static bool info_cached = false;
-    
+    static std::string              cached_server_address;
+    static unsigned short           cached_server_port = 0;
+    static unsigned short           cached_local_port  = 0;
+    static bool                     info_cached        = false;
+
     // Cache participant info and update every ~4 frames (60 FPS / 4 = ~15 updates/sec)
     static std::vector<Client::ParticipantInfo> cached_participants;
-    static size_t cached_participant_count = 0;
-    static int frame_counter = 0;
-    static constexpr int PARTICIPANT_UPDATE_INTERVAL = 4; // Update every 4 frames
-    
+    static size_t                               cached_participant_count = 0;
+    static int                                  frame_counter            = 0;
+    static constexpr int PARTICIPANT_UPDATE_INTERVAL = 4;  // Update every 4 frames
+
     // Update cached info periodically (only when needed)
-    if (!info_cached || frame_counter % 60 == 0) { // Check every second for device changes
-        cached_device_info = client.get_device_info();
-        cached_encoder_info = client.get_encoder_info();
-        cached_audio_config = client.get_audio_config();
-        cached_latency_info = client.get_latency_info();
+    if (!info_cached || frame_counter % 60 == 0) {  // Check every second for device changes
+        cached_device_info    = client.get_device_info();
+        cached_encoder_info   = client.get_encoder_info();
+        cached_audio_config   = client.get_audio_config();
+        cached_latency_info   = client.get_latency_info();
         cached_server_address = client.get_server_address();
-        cached_server_port = client.get_server_port();
-        cached_local_port = client.get_local_port();
-        info_cached = true;
+        cached_server_port    = client.get_server_port();
+        cached_local_port     = client.get_local_port();
+        info_cached           = true;
     }
-    
+
     // Update participant info more frequently (every few frames)
     if (frame_counter % PARTICIPANT_UPDATE_INTERVAL == 0) {
-        cached_participants = client.get_participant_info();
+        cached_participants      = client.get_participant_info();
         cached_participant_count = client.get_participant_count();
     }
     frame_counter++;
-    
+
     // Static strings to avoid allocations
     static const ImVec4 speaking_color(0.0F, 1.0F, 0.0F, 1.0F);
     static const ImVec4 not_speaking_color(0.5F, 0.5F, 0.5F, 1.0F);
-    static const char* active_text = "Active";
-    static const char* inactive_text = "Inactive";
-    static const char* ok_text = "OK";
-    static const char* muted_text = "[Muted] ";
-    static const char* buffering_text = "[Buffering] ";
-    static const char* underruns_prefix = "[Underruns: ";
+    static const char*  active_text      = "Active";
+    static const char*  inactive_text    = "Inactive";
+    static const char*  ok_text          = "OK";
+    static const char*  muted_text       = "[Muted] ";
+    static const char*  buffering_text   = "[Buffering] ";
+    static const char*  underruns_prefix = "[Underruns: ";
 
     if (ImGui::Begin("Client Info")) {
         // ImGui::Text("Hello from GLFW + OpenGL3!");
@@ -884,7 +884,8 @@ void DrawClientUI(Client& client) {
             ImGui::Text("  Sample rate: %.1f Hz", cached_latency_info.sample_rate);
             ImGui::TableNextColumn();
             ImGui::Text("Opus Encoder");
-            ImGui::Text("  %dch, %dHz", cached_encoder_info.channels, cached_encoder_info.sample_rate);
+            ImGui::Text("  %dch, %dHz", cached_encoder_info.channels,
+                        cached_encoder_info.sample_rate);
             ImGui::Text("  Target: %d bps", cached_encoder_info.bitrate);
             ImGui::Text("  Actual: %d bps", cached_encoder_info.actual_bitrate);
             ImGui::Text("  Complexity: %d", cached_encoder_info.complexity);
@@ -933,7 +934,7 @@ void DrawClientUI(Client& client) {
                 // Pre-allocate status string to avoid reallocations
                 static thread_local std::string status_buffer;
                 status_buffer.clear();
-                status_buffer.reserve(64); // Pre-allocate reasonable size
+                status_buffer.reserve(64);  // Pre-allocate reasonable size
 
                 for (const auto& p: cached_participants) {
                     ImGui::TableNextRow();
