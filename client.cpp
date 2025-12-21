@@ -777,78 +777,117 @@ void DrawClientUI(Client& client) {
         ImGui::ShowDemoWindow(&demo_open);
     }
 
-    // Your custom windows here
+    // Cache static device/config info (only updates if devices change, which is rare)
+    static Client::DeviceInfo cached_device_info;
+    static Client::EncoderInfo cached_encoder_info;
+    static AudioStream::AudioConfig cached_audio_config;
+    static AudioStream::LatencyInfo cached_latency_info;
+    static std::string cached_server_address;
+    static unsigned short cached_server_port = 0;
+    static unsigned short cached_local_port = 0;
+    static bool info_cached = false;
+    
+    // Cache participant info and update every ~4 frames (60 FPS / 4 = ~15 updates/sec)
+    static std::vector<Client::ParticipantInfo> cached_participants;
+    static size_t cached_participant_count = 0;
+    static int frame_counter = 0;
+    static constexpr int PARTICIPANT_UPDATE_INTERVAL = 4; // Update every 4 frames
+    
+    // Update cached info periodically (only when needed)
+    if (!info_cached || frame_counter % 60 == 0) { // Check every second for device changes
+        cached_device_info = client.get_device_info();
+        cached_encoder_info = client.get_encoder_info();
+        cached_audio_config = client.get_audio_config();
+        cached_latency_info = client.get_latency_info();
+        cached_server_address = client.get_server_address();
+        cached_server_port = client.get_server_port();
+        cached_local_port = client.get_local_port();
+        info_cached = true;
+    }
+    
+    // Update participant info more frequently (every few frames)
+    if (frame_counter % PARTICIPANT_UPDATE_INTERVAL == 0) {
+        cached_participants = client.get_participant_info();
+        cached_participant_count = client.get_participant_count();
+    }
+    frame_counter++;
+    
+    // Static strings to avoid allocations
+    static const ImVec4 speaking_color(0.0F, 1.0F, 0.0F, 1.0F);
+    static const ImVec4 not_speaking_color(0.5F, 0.5F, 0.5F, 1.0F);
+    static const char* active_text = "Active";
+    static const char* inactive_text = "Inactive";
+    static const char* ok_text = "OK";
+    static const char* muted_text = "[Muted] ";
+    static const char* buffering_text = "[Buffering] ";
+    static const char* underruns_prefix = "[Underruns: ";
 
     if (ImGui::Begin("Client Info")) {
-        ImGui::Text("Hello from GLFW + OpenGL3!");
-        ImGui::Separator();
+        // ImGui::Text("Hello from GLFW + OpenGL3!");
+        // ImGui::Separator();
 
-        // FPS and Frame Time side by side
-        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-        ImGui::SameLine(150.0F);
-        ImGui::Text("Frame Time: %.3f ms", 1000.0F / ImGui::GetIO().Framerate);
+        // // FPS and Frame Time side by side
+        // const float fps = ImGui::GetIO().Framerate;
+        // ImGui::Text("FPS: %.1f", fps);
+        // ImGui::SameLine(150.0F);
+        // ImGui::Text("Frame Time: %.3f ms", 1000.0F / fps);
 
         ImGui::Separator();
         ImGui::Text("Connection:");
         if (ImGui::BeginTable("Connection", 2, ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::Text("Server: %s:%u", client.get_server_address().c_str(),
-                        client.get_server_port());
+            ImGui::Text("Server: %s:%u", cached_server_address.c_str(), cached_server_port);
             ImGui::TableNextColumn();
-            ImGui::Text("Local Port: %u", client.get_local_port());
+            ImGui::Text("Local Port: %u", cached_local_port);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::Text("Participants: %zu", client.get_participant_count());
+            ImGui::Text("Participants: %zu", cached_participant_count);
             ImGui::TableNextColumn();
-            ImGui::Text("Audio Stream: %s",
-                        client.is_audio_stream_active() ? "Active" : "Inactive");
+            const bool audio_active = client.is_audio_stream_active();
+            ImGui::Text("Audio Stream: %s", audio_active ? active_text : inactive_text);
             ImGui::EndTable();
         }
 
         ImGui::Separator();
         ImGui::Text("Audio Devices:");
-        auto device_info = client.get_device_info();
         if (ImGui::BeginTable("AudioDevices", 2, ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::Text("Input: %s", device_info.input_device_name.c_str());
-            ImGui::Text("  API: %s", device_info.input_api.c_str());
-            ImGui::Text("  Channels: %d", device_info.input_channels);
-            ImGui::Text("  Sample Rate: %.0f Hz", device_info.input_sample_rate);
+            ImGui::Text("Input: %s", cached_device_info.input_device_name.c_str());
+            ImGui::Text("  API: %s", cached_device_info.input_api.c_str());
+            ImGui::Text("  Channels: %d", cached_device_info.input_channels);
+            ImGui::Text("  Sample Rate: %.0f Hz", cached_device_info.input_sample_rate);
             ImGui::TableNextColumn();
-            ImGui::Text("Output: %s", device_info.output_device_name.c_str());
-            ImGui::Text("  API: %s", device_info.output_api.c_str());
-            ImGui::Text("  Channels: %d", device_info.output_channels);
-            ImGui::Text("  Sample Rate: %.0f Hz", device_info.output_sample_rate);
+            ImGui::Text("Output: %s", cached_device_info.output_device_name.c_str());
+            ImGui::Text("  API: %s", cached_device_info.output_api.c_str());
+            ImGui::Text("  Channels: %d", cached_device_info.output_channels);
+            ImGui::Text("  Sample Rate: %.0f Hz", cached_device_info.output_sample_rate);
             ImGui::EndTable();
         }
 
         ImGui::Separator();
         ImGui::Text("Audio Config:");
-        auto audio_config = client.get_audio_config();
-        auto encoder_info = client.get_encoder_info();
-        auto latency_info = client.get_latency_info();
         if (ImGui::BeginTable("AudioConfig", 3, ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::Text("Stream Config");
-            ImGui::Text("  Frames/buffer: %d", audio_config.frames_per_buffer);
-            ImGui::Text("  Sample rate: %d Hz", encoder_info.sample_rate);
-            ImGui::Text("  Bitrate: %d bps", encoder_info.bitrate);
-            ImGui::Text("  Channels: %d in, %d out", device_info.input_channels,
-                        device_info.output_channels);
+            ImGui::Text("  Frames/buffer: %d", cached_audio_config.frames_per_buffer);
+            ImGui::Text("  Sample rate: %d Hz", cached_encoder_info.sample_rate);
+            ImGui::Text("  Bitrate: %d bps", cached_encoder_info.bitrate);
+            ImGui::Text("  Channels: %d in, %d out", cached_device_info.input_channels,
+                        cached_device_info.output_channels);
             ImGui::TableNextColumn();
             ImGui::Text("Latency");
-            ImGui::Text("  Input: %.3f ms", latency_info.input_latency_ms);
-            ImGui::Text("  Output: %.3f ms", latency_info.output_latency_ms);
-            ImGui::Text("  Sample rate: %.1f Hz", latency_info.sample_rate);
+            ImGui::Text("  Input: %.3f ms", cached_latency_info.input_latency_ms);
+            ImGui::Text("  Output: %.3f ms", cached_latency_info.output_latency_ms);
+            ImGui::Text("  Sample rate: %.1f Hz", cached_latency_info.sample_rate);
             ImGui::TableNextColumn();
             ImGui::Text("Opus Encoder");
-            ImGui::Text("  %dch, %dHz", encoder_info.channels, encoder_info.sample_rate);
-            ImGui::Text("  Target: %d bps", encoder_info.bitrate);
-            ImGui::Text("  Actual: %d bps", encoder_info.actual_bitrate);
-            ImGui::Text("  Complexity: %d", encoder_info.complexity);
+            ImGui::Text("  %dch, %dHz", cached_encoder_info.channels, cached_encoder_info.sample_rate);
+            ImGui::Text("  Target: %d bps", cached_encoder_info.bitrate);
+            ImGui::Text("  Actual: %d bps", cached_encoder_info.actual_bitrate);
+            ImGui::Text("  Complexity: %d", cached_encoder_info.complexity);
             ImGui::EndTable();
         }
 
@@ -857,7 +896,7 @@ void DrawClientUI(Client& client) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::Text("Network:");
-            double rtt = client.get_rtt_ms();
+            const double rtt = client.get_rtt_ms();
             if (rtt > 0.0) {
                 ImGui::Text("  RTT: %.3f ms", rtt);
             } else {
@@ -865,11 +904,11 @@ void DrawClientUI(Client& client) {
             }
             ImGui::TableNextColumn();
             ImGui::Text("You:");
-            float own_level = client.get_own_audio_level();
+            const float own_level = client.get_own_audio_level();
             ImGui::Text("  Audio Level: %.3f", own_level);
             if (own_level > 0.01F) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), " [Speaking]");
+                ImGui::TextColored(speaking_color, " [Speaking]");
             }
             ImGui::EndTable();
         }
@@ -877,8 +916,7 @@ void DrawClientUI(Client& client) {
         ImGui::Separator();
         ImGui::Text("Participants:");
 
-        auto participants = client.get_participant_info();
-        if (participants.empty()) {
+        if (cached_participants.empty()) {
             ImGui::Text("  No other participants");
         } else {
             if (ImGui::BeginTable(
@@ -892,23 +930,28 @@ void DrawClientUI(Client& client) {
                 ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableHeadersRow();
 
-                for (const auto& p: participants) {
+                // Pre-allocate status string to avoid reallocations
+                static thread_local std::string status_buffer;
+                status_buffer.clear();
+                status_buffer.reserve(64); // Pre-allocate reasonable size
+
+                for (const auto& p: cached_participants) {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
                     ImGui::Text("%u", p.id);
 
                     ImGui::TableNextColumn();
                     if (p.is_speaking) {
-                        ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), "Yes");
+                        ImGui::TextColored(speaking_color, "Yes");
                     } else {
-                        ImGui::TextColored(ImVec4(0.5F, 0.5F, 0.5F, 1.0F), "No");
+                        ImGui::TextColored(not_speaking_color, "No");
                     }
 
                     ImGui::TableNextColumn();
                     ImGui::Text("%.3f", p.audio_level);
                     // Visual level bar
                     ImGui::SameLine();
-                    float bar_width = ImGui::GetContentRegionAvail().x;
+                    const float bar_width = ImGui::GetContentRegionAvail().x;
                     ImGui::ProgressBar(p.audio_level, ImVec2(bar_width * 0.3F, 0.0F), "");
 
                     ImGui::TableNextColumn();
@@ -918,20 +961,24 @@ void DrawClientUI(Client& client) {
                     ImGui::Text("%zu", p.queue_size);
 
                     ImGui::TableNextColumn();
-                    std::string status;
+                    // Build status string efficiently
+                    status_buffer.clear();
                     if (p.is_muted) {
-                        status += "[Muted] ";
+                        status_buffer += muted_text;
                     }
                     if (!p.buffer_ready) {
-                        status += "[Buffering] ";
+                        status_buffer += buffering_text;
                     }
                     if (p.underrun_count > 0) {
-                        status += "[Underruns: " + std::to_string(p.underrun_count) + "] ";
+                        status_buffer += underruns_prefix;
+                        status_buffer += std::to_string(p.underrun_count);
+                        status_buffer += "] ";
                     }
-                    if (status.empty()) {
-                        status = "OK";
+                    if (status_buffer.empty()) {
+                        ImGui::TextUnformatted(ok_text);
+                    } else {
+                        ImGui::TextUnformatted(status_buffer.c_str());
                     }
-                    ImGui::Text("%s", status.c_str());
                 }
 
                 ImGui::EndTable();
@@ -948,7 +995,7 @@ int main() {
 
         asio::io_context io_context;
 
-        Client client_instance(io_context, "jam.welor.fun", 9999);
+        Client client_instance(io_context, "127.0.0.1", 9999);
 
         std::thread ui_thread([&io_context, &client_instance]() {
             // Enable VSync for efficient FPS limiting (hardware-accelerated)
