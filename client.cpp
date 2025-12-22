@@ -26,8 +26,8 @@
 #include <portaudio.h>
 #include <spdlog/common.h>
 
-#include "imguiapp.h"
 #include "audio_stream.h"
+#include "imguiapp.h"
 #include "logger.h"
 #include "opus_decoder.h"
 #include "opus_defines.h"
@@ -63,7 +63,7 @@ public:
             // Note: audio_config_ is now set even if validation fails, but the stream won't work
             // Remote audio decoding will fail gracefully with error messages
         }
-        audio_.print_all_devices();
+        AudioStream::print_all_devices();
         // start_audio_stream(38, 40, config);
         // Connect to server
         start_connection(server_address, server_port);
@@ -842,14 +842,14 @@ void DrawClientUI(Client& client) {
     static const char*  underruns_prefix = "[Underruns: ";
 
     if (ImGui::Begin("Client Info")) {
-        // ImGui::Text("Hello from GLFW + OpenGL3!");
-        // ImGui::Separator();
+        ImGui::Text("Hello from GLFW + OpenGL3!");
+        ImGui::Separator();
 
-        // // FPS and Frame Time side by side
-        // const float fps = ImGui::GetIO().Framerate;
-        // ImGui::Text("FPS: %.1f", fps);
-        // ImGui::SameLine(150.0F);
-        // ImGui::Text("Frame Time: %.3f ms", 1000.0F / fps);
+        // FPS and Frame Time side by side
+        const float fps = ImGui::GetIO().Framerate;
+        ImGui::Text("FPS: %.1f", fps);
+        ImGui::SameLine(150.0F);
+        ImGui::Text("Frame Time: %.3f ms", 1000.0F / fps);
 
         ImGui::Separator();
         ImGui::Text("Connection:");
@@ -1028,9 +1028,7 @@ int main() {
         Client client_instance(io_context, "127.0.0.1", 9999);
 
         // Run io_context in background thread (GLFW must be on main thread on macOS)
-        std::thread io_thread([&io_context]() {
-            io_context.run();
-        });
+        std::thread io_thread([&io_context]() { io_context.run(); });
 
         // Run UI on main thread (required for GLFW on macOS)
         {

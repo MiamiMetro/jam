@@ -118,29 +118,29 @@ void ImGuiApp::Run() {
 
     // Main loop
     while (glfwWindowShouldClose(m_Window) == 0) {
-        // FPS limiting (if vsync is off and target FPS is set)
-        if (!m_VSync && m_TargetFrameTime > 0.0) {
-            double currentTime = glfwGetTime();
-            double deltaTime   = currentTime - m_LastFrameTime;
+        double currentTime = glfwGetTime();
+        double deltaTime   = currentTime - m_LastFrameTime;
 
-            // Calculate how long to wait
-            double waitTime = m_TargetFrameTime - deltaTime;
-            if (waitTime > 0.0) {
-                // Use glfwWaitEventsTimeout for efficient waiting (yields CPU time)
-                // Wait for events or timeout, whichever comes first
-                glfwWaitEventsTimeout(waitTime);
-            } else {
-                // We're behind schedule, just poll events quickly
-                glfwPollEvents();
-            }
+        // Calculate wait time based on target frame time
+        double waitTime = m_TargetFrameTime - deltaTime;
 
-            m_LastFrameTime = glfwGetTime();
+        if (waitTime > 0.001) {  // Only wait if we have more than 1ms
+            // Use glfwWaitEventsTimeout to yield CPU time efficiently
+            // This blocks the thread until an event arrives or timeout expires
+            glfwWaitEventsTimeout(waitTime);
         } else {
-            // VSync is on, just poll events normally
+            // We're at or past target frame time, poll events and render
             glfwPollEvents();
         }
 
-        RenderFrame();
+        // Check if enough time has passed for next frame
+        currentTime = glfwGetTime();
+        deltaTime   = currentTime - m_LastFrameTime;
+
+        if (deltaTime >= m_TargetFrameTime) {
+            RenderFrame();
+            m_LastFrameTime = currentTime;
+        }
     }
 }
 

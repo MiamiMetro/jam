@@ -187,15 +187,16 @@ private:
                 Log::warn("Client sent PARTICIPANT_LEAVE (should only come from server)");
                 break;
             case CtrlHdr::Cmd::BROADCAST_ENABLE: {
-                Log::info("Client {}:{} requested broadcast enable", remote_endpoint_.address().to_string(),
-                          remote_endpoint_.port());
+                Log::info("Client {}:{} requested broadcast enable",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
                 if (!broadcast_enabled_.load()) {
                     broadcast_enabled_.store(true);
                     // Try to connect SRT if not already connected
                     if (!srt_client_.is_connected()) {
                         if (!srt_client_.connect()) {
                             srt_connection_attempts_ = 1;
-                            Log::warn("SRT connection failed (attempt 1/3). Will retry in background...");
+                            Log::warn(
+                                "SRT connection failed (attempt 1/3). Will retry in background...");
                             srt_client_.start_reconnect(2);  // 2 more attempts (total 3)
                         } else {
                             Log::info("Broadcast enabled: SRT connected");
@@ -209,8 +210,8 @@ private:
                 break;
             }
             case CtrlHdr::Cmd::BROADCAST_DISABLE: {
-                Log::info("Client {}:{} requested broadcast disable", remote_endpoint_.address().to_string(),
-                          remote_endpoint_.port());
+                Log::info("Client {}:{} requested broadcast disable",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
                 if (broadcast_enabled_.load()) {
                     broadcast_enabled_.store(false);
                     srt_client_.disconnect();
