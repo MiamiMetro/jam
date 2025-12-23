@@ -122,14 +122,22 @@ public:
 private:
     void handle_receive_error(std::error_code error_code) {
         Log::error("receive error: {}", error_code.message());
-        clients_.erase(remote_endpoint_);
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            clients_.erase(remote_endpoint_);
+        }
         Log::info("Client {}:{} removed due to receive error",
                   remote_endpoint_.address().to_string(), remote_endpoint_.port());
         do_receive();  // keep listening
     }
 
     void handle_ping_message(std::size_t bytes) {
-        if (bytes < sizeof(SyncHdr) || !clients_.contains(remote_endpoint_)) {
+        bool client_exists;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            client_exists = clients_.contains(remote_endpoint_);
+        }
+        if (bytes < sizeof(SyncHdr) || !client_exists) {
             do_receive();
             return;
         }
@@ -158,30 +166,40 @@ private:
         auto now = std::chrono::steady_clock::now();
 
         switch (chdr.type) {
-            case CtrlHdr::Cmd::JOIN:
+            case CtrlHdr::Cmd::JOIN: {
+                std::lock_guard<std::mutex> lock(clients_mutex_);
                 Log::info("Client JOIN: {}:{} (ID: {})", remote_endpoint_.address().to_string(),
                           remote_endpoint_.port(), next_client_id_);
                 clients_[remote_endpoint_].last_alive = now;
                 clients_[remote_endpoint_].client_id  = next_client_id_++;
                 break;
+            }
             case CtrlHdr::Cmd::LEAVE: {
-                Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
-                          remote_endpoint_.port());
-                uint32_t leaving_client_id = clients_[remote_endpoint_].client_id;
-                clients_.erase(remote_endpoint_);
+                uint32_t leaving_client_id;
+                bool     clients_empty;
+                {
+                    std::lock_guard<std::mutex> lock(clients_mutex_);
+                    Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
+                              remote_endpoint_.port());
+                    leaving_client_id = clients_[remote_endpoint_].client_id;
+                    clients_.erase(remote_endpoint_);
+                    clients_empty = clients_.empty();
+                }
                 // Broadcast participant leave to all other clients
                 broadcast_participant_leave(leaving_client_id);
                 // Check if no participants left and disable broadcast
-                if (clients_.empty() && broadcast_enabled_.load()) {
+                if (clients_empty && broadcast_enabled_.load()) {
                     Log::info("No participants left, disabling broadcast");
                     broadcast_enabled_.store(false);
                     srt_client_.disconnect();
                 }
                 break;
             }
-            case CtrlHdr::Cmd::ALIVE:
+            case CtrlHdr::Cmd::ALIVE: {
+                std::lock_guard<std::mutex> lock(clients_mutex_);
                 clients_[remote_endpoint_].last_alive = now;
                 break;
+            }
             case CtrlHdr::Cmd::PARTICIPANT_LEAVE:
                 // Clients shouldn't send this, only server broadcasts it
                 Log::warn("Client sent PARTICIPANT_LEAVE (should only come from server)");
@@ -240,33 +258,32 @@ private:
         }
 
         // Auto-register client if not known (handles case where server starts after clients)
-        if (!clients_.contains(remote_endpoint_)) {
-            auto now = std::chrono::steady_clock::now();
+        bool client_exists;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            client_exists = clients_.contains(remote_endpoint_);
+        }
+        if (!client_exists) {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            auto                        now = std::chrono::steady_clock::now();
             Log::info("Auto-registering client from audio packet: {}:{} (ID: {})",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port(),
                       next_client_id_);
-            clients_[remote_endpoint_].last_alive = now;
-            clients_[remote_endpoint_].client_id  = next_client_id_++;
+            auto& client      = clients_[remote_endpoint_];
+            client.last_alive = now;
+            client.client_id  = next_client_id_++;
             // Create decoder for new client
-            {
-                std::lock_guard<std::mutex> lock(client_decoders_mutex_);
-                auto&                       decoder = client_decoders_[remote_endpoint_];
-                if (!decoder.is_initialized()) {
-                    if (!decoder.create(SAMPLE_RATE, CHANNELS)) {
-                        Log::error("Failed to create decoder for client {}:{}",
-                                   remote_endpoint_.address().to_string(), remote_endpoint_.port());
-                        do_receive();
-                        return;
-                    }
-                    Log::info("Created decoder for client {}:{}",
-                              remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            if (!client.decoder.is_initialized()) {
+                if (!client.decoder.create(SAMPLE_RATE, CHANNELS)) {
+                    Log::error("Failed to create decoder for client {}:{}",
+                               remote_endpoint_.address().to_string(), remote_endpoint_.port());
+                    do_receive();
+                    return;
                 }
+                Log::info("Created decoder for client {}:{}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
             }
-            // Also initialize PCM buffer for this client
-            {
-                std::lock_guard<std::mutex> lock(client_buffers_mutex_);
-                client_pcm_buffers_[remote_endpoint_];  // Initialize empty buffer
-            }
+            // PCM buffer is already default-initialized (empty vector)
         }
 
         // Read encoded_bytes (after sender_id field)
@@ -299,7 +316,11 @@ private:
         }
 
         // Get sender's client ID
-        uint32_t sender_id = clients_[remote_endpoint_].client_id;
+        uint32_t sender_id;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            sender_id = clients_[remote_endpoint_].client_id;
+        }
 
         // Embed sender_id in the packet (client may not have sent it, or we override it)
         std::memcpy(recv_buf_.data() + sizeof(MsgHdr), &sender_id, sizeof(uint32_t));
@@ -337,46 +358,52 @@ private:
         const unsigned char* opus_data =
             reinterpret_cast<const unsigned char*>(recv_buf_.data() + MIN_AUDIO_PACKET_SIZE);
 
-        // Decode Opus to PCM float
-        std::vector<float> decoded_pcm;
+        // Decode Opus to PCM float (outside lock for performance)
+        OpusDecoderWrapper* decoder_ptr = nullptr;
         {
-            std::lock_guard<std::mutex> lock(client_decoders_mutex_);
-            auto                        it = client_decoders_.find(remote_endpoint_);
-            if (it == client_decoders_.end()) {
-                // Decoder not found - this shouldn't happen if registration worked
-                Log::error("Decoder not found in map for client {}:{} (ID: {}). Recreating...",
-                           remote_endpoint_.address().to_string(), remote_endpoint_.port(),
-                           sender_id);
-                // Try to create it now
-                auto& decoder = client_decoders_[remote_endpoint_];
-                if (!decoder.create(SAMPLE_RATE, CHANNELS)) {
-                    Log::error("Failed to create decoder on retry");
-                    do_receive();
-                    return;
-                }
-                it = client_decoders_.find(remote_endpoint_);
-            }
-
-            if (it != client_decoders_.end() && it->second.is_initialized()) {
-                if (!it->second.decode(opus_data, encoded_bytes, CLIENT_FRAME_SIZE, decoded_pcm)) {
-                    // Decode failed - use PLC (packet loss concealment)
-                    Log::debug("Opus decode failed for client {}, using PLC", sender_id);
-                    it->second.decode_plc(CLIENT_FRAME_SIZE, decoded_pcm);
-                }
-            } else {
-                // Decoder exists but not initialized
-                Log::error("Decoder exists but not initialized for client {}:{} (ID: {})",
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            auto                        it = clients_.find(remote_endpoint_);
+            if (it == clients_.end()) {
+                // Client not found - this shouldn't happen if registration worked
+                Log::error("Client not found in map for {}:{} (ID: {})",
                            remote_endpoint_.address().to_string(), remote_endpoint_.port(),
                            sender_id);
                 do_receive();
                 return;
             }
+
+            auto& decoder = it->second.decoder;
+            if (!decoder.is_initialized()) {
+                // Try to create it now
+                if (!decoder.create(SAMPLE_RATE, CHANNELS)) {
+                    Log::error("Failed to create decoder for client {}:{}",
+                               remote_endpoint_.address().to_string(), remote_endpoint_.port());
+                    do_receive();
+                    return;
+                }
+                Log::info("Created decoder for client {}:{}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            }
+            decoder_ptr = &decoder;
+        }
+
+        // Decode outside the lock (decoder is thread-safe for single client)
+        std::vector<float> decoded_pcm;
+        if (!decoder_ptr->decode(opus_data, encoded_bytes, CLIENT_FRAME_SIZE, decoded_pcm)) {
+            // Decode failed - use PLC (packet loss concealment)
+            Log::debug("Opus decode failed for client {}, using PLC", sender_id);
+            decoder_ptr->decode_plc(CLIENT_FRAME_SIZE, decoded_pcm);
         }
 
         // Buffer decoded PCM for mixing
         {
-            std::lock_guard<std::mutex> lock(client_buffers_mutex_);
-            auto&                       buffer = client_pcm_buffers_[remote_endpoint_];
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            auto                        it = clients_.find(remote_endpoint_);
+            if (it == clients_.end()) {
+                // Client disconnected during decode - drop the packet
+                return;
+            }
+            auto& buffer = it->second.pcm_buffer;
             // Convert float to int16 and append
             buffer.reserve(buffer.size() + decoded_pcm.size());
             for (float sample: decoded_pcm) {
@@ -395,32 +422,35 @@ private:
     }
 
     void alive_check_timer_callback() {
-        auto now = std::chrono::steady_clock::now();
-        for (auto it = clients_.begin(); it != clients_.end();) {
-            if (now - it->second.last_alive > CLIENT_TIMEOUT) {
-                Log::info("Client {}:{} timed out (ID: {})", it->first.address().to_string(),
-                          it->first.port(), it->second.client_id);
-                uint32_t timed_out_id = it->second.client_id;
-                // Clean up decoder and buffer
-                {
-                    std::lock_guard<std::mutex> lock_dec(client_decoders_mutex_);
-                    client_decoders_.erase(it->first);
+        auto     now           = std::chrono::steady_clock::now();
+        uint32_t timed_out_id  = 0;
+        bool     clients_empty = false;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            for (auto it = clients_.begin(); it != clients_.end();) {
+                if (now - it->second.last_alive > CLIENT_TIMEOUT) {
+                    Log::info("Client {}:{} timed out (ID: {})", it->first.address().to_string(),
+                              it->first.port(), it->second.client_id);
+                    timed_out_id = it->second.client_id;
+                    // Decoder and buffer are automatically cleaned up with erase
+                    it            = clients_.erase(it);
+                    clients_empty = clients_.empty();
+                    // Break after one timeout to release lock and broadcast
+                    break;
+                } else {
+                    ++it;
                 }
-                {
-                    std::lock_guard<std::mutex> lock_buf(client_buffers_mutex_);
-                    client_pcm_buffers_.erase(it->first);
-                }
-                it = clients_.erase(it);
-                // Broadcast participant leave to all other clients
-                broadcast_participant_leave(timed_out_id);
-                // Check if no participants left and disable broadcast
-                if (clients_.empty() && broadcast_enabled_.load()) {
-                    Log::info("No participants left, disabling broadcast");
-                    broadcast_enabled_.store(false);
-                    srt_client_.disconnect();
-                }
-            } else {
-                ++it;
+            }
+        }
+
+        if (timed_out_id > 0) {
+            // Broadcast participant leave to all other clients
+            broadcast_participant_leave(timed_out_id);
+            // Check if no participants left and disable broadcast
+            if (clients_empty && broadcast_enabled_.load()) {
+                Log::info("No participants left, disabling broadcast");
+                broadcast_enabled_.store(false);
+                srt_client_.disconnect();
             }
         }
     }
@@ -460,11 +490,13 @@ private:
             static_cast<size_t>(FRAME_SIZE) * static_cast<size_t>(CHANNELS);
         std::vector<int16_t> mixed_frame(FRAME_SAMPLES, 0);
 
+        // Copy client buffers out (hold lock briefly)
+        std::vector<std::pair<udp::endpoint, std::vector<int16_t>>> client_samples;
         {
-            std::lock_guard<std::mutex> lock(client_buffers_mutex_);
+            std::lock_guard<std::mutex> lock(clients_mutex_);
 
             // Check if we have any clients with data
-            if (client_pcm_buffers_.empty()) {
+            if (clients_.empty()) {
                 static int empty_count = 0;
                 if (++empty_count % 1000 == 0) {
                     Log::debug("Mix timer: no clients registered");
@@ -472,40 +504,49 @@ private:
                 return;  // No clients
             }
 
-            // Mix all client buffers - take up to FRAME_SAMPLES from each
-            int active_clients = 0;
-            for (auto& [endpoint, buffer]: client_pcm_buffers_) {
+            // Copy up to FRAME_SAMPLES from each client buffer
+            client_samples.reserve(clients_.size());
+            for (auto& [endpoint, client_info]: clients_) {
+                auto&  buffer         = client_info.pcm_buffer;
                 size_t samples_to_mix = std::min(buffer.size(), FRAME_SAMPLES);
                 if (samples_to_mix > 0) {
-                    // Mix this client's available samples
-                    for (size_t i = 0; i < samples_to_mix; ++i) {
-                        mixed_frame[i] = static_cast<int16_t>(static_cast<int32_t>(mixed_frame[i]) +
-                                                              static_cast<int32_t>(buffer[i]));
-                    }
-                    // Remove mixed samples from buffer
+                    // Copy samples out
+                    client_samples.emplace_back(
+                        endpoint, std::vector<int16_t>(
+                                      buffer.begin(),
+                                      buffer.begin() + static_cast<ptrdiff_t>(samples_to_mix)));
+                    // Remove from buffer immediately
                     buffer.erase(buffer.begin(),
                                  buffer.begin() + static_cast<ptrdiff_t>(samples_to_mix));
-                    active_clients++;
+                }
+            }
+        }
+
+        // Mix outside the lock
+        int active_clients = static_cast<int>(client_samples.size());
+        if (active_clients > 0) {
+            for (const auto& [endpoint, samples]: client_samples) {
+                for (size_t i = 0; i < samples.size(); ++i) {
+                    mixed_frame[i] = static_cast<int16_t>(static_cast<int32_t>(mixed_frame[i]) +
+                                                          static_cast<int32_t>(samples[i]));
                 }
             }
 
-            // Average the mixed samples to prevent clipping (only if we have active clients)
-            if (active_clients > 0) {
-                for (auto& sample: mixed_frame) {
-                    int32_t mixed = static_cast<int32_t>(sample) / active_clients;
-                    sample        = static_cast<int16_t>(std::max(-32768, std::min(32767, mixed)));
-                }
-                static int mix_count = 0;
-                if (++mix_count % 100 == 0 || mix_count <= 5) {
-                    Log::debug("Mixed {} clients, sending frame", active_clients);
-                }
-            } else {
-                // No active clients with data - send silence
-                // mixed_frame is already zero-initialized
-                static int silence_count = 0;
-                if (++silence_count % 1000 == 0) {
-                    Log::debug("Mix timer: no active clients with data, sending silence");
-                }
+            // Average the mixed samples to prevent clipping
+            for (auto& sample: mixed_frame) {
+                int32_t mixed = static_cast<int32_t>(sample) / active_clients;
+                sample        = static_cast<int16_t>(std::max(-32768, std::min(32767, mixed)));
+            }
+            static int mix_count = 0;
+            if (++mix_count % 100 == 0 || mix_count <= 5) {
+                Log::debug("Mixed {} clients, sending frame", active_clients);
+            }
+        } else {
+            // No active clients with data - send silence
+            // mixed_frame is already zero-initialized
+            static int silence_count = 0;
+            if (++silence_count % 1000 == 0) {
+                Log::debug("Mix timer: no active clients with data, sending silence");
             }
         }
 
@@ -540,7 +581,17 @@ private:
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
         std::memcpy(buf->data(), &chdr, sizeof(CtrlHdr));
 
-        for (const auto& [endpoint, client_info]: clients_) {
+        // Copy endpoints to avoid holding lock during async sends
+        std::vector<udp::endpoint> endpoints;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            endpoints.reserve(clients_.size());
+            for (const auto& [endpoint, client_info]: clients_) {
+                endpoints.push_back(endpoint);
+            }
+        }
+
+        for (const auto& endpoint: endpoints) {
             send(buf->data(), sizeof(CtrlHdr), endpoint, buf);
         }
     }
@@ -550,10 +601,21 @@ private:
         const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
         // Forward the audio packet to all clients except the sender
         // keep_alive ensures packet data remains valid during async sends
-        for (const auto& [endpoint, client_info]: clients_) {
-            if (endpoint != sender) {
-                send(packet_data, packet_size, endpoint, keep_alive);
+
+        // Copy endpoints to avoid holding lock during async sends
+        std::vector<udp::endpoint> endpoints;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            endpoints.reserve(clients_.size());
+            for (const auto& [endpoint, client_info]: clients_) {
+                if (endpoint != sender) {
+                    endpoints.push_back(endpoint);
+                }
             }
+        }
+
+        for (const auto& endpoint: endpoints) {
+            send(packet_data, packet_size, endpoint, keep_alive);
         }
     }
 
@@ -575,11 +637,14 @@ private:
 
     struct ClientInfo {
         std::chrono::steady_clock::time_point last_alive;
-        uint32_t                              client_id;  // Unique ID for this client
+        uint32_t                              client_id;   // Unique ID for this client
+        OpusDecoderWrapper                    decoder;     // Opus decoder for this client
+        std::vector<int16_t>                  pcm_buffer;  // PCM buffer for mixing
     };
 
     udp::socket socket_;
 
+    std::mutex                                                   clients_mutex_;
     std::unordered_map<udp::endpoint, ClientInfo, endpoint_hash> clients_;
     uint32_t next_client_id_ = 1;  // Start from 1, 0 is invalid
 
@@ -593,13 +658,6 @@ private:
     SrtClient         srt_client_;
     std::atomic<bool> broadcast_enabled_;
     std::atomic<int>  srt_connection_attempts_;
-
-    // Per-client decoders and PCM buffers
-    std::mutex                                                           client_decoders_mutex_;
-    std::unordered_map<udp::endpoint, OpusDecoderWrapper, endpoint_hash> client_decoders_;
-
-    std::mutex                                                             client_buffers_mutex_;
-    std::unordered_map<udp::endpoint, std::vector<int16_t>, endpoint_hash> client_pcm_buffers_;
 };
 
 int main() {
