@@ -137,32 +137,6 @@ public:
         }
     }
 
-    // Extract PCM samples from all clients for mixing (returns endpoint->samples pairs)
-    // Removes the extracted samples from client buffers
-    std::vector<std::pair<endpoint, std::vector<int16_t>>> extract_pcm_samples(
-        size_t max_samples_per_client) {
-        std::lock_guard<std::mutex>                            lock(mutex_);
-        std::vector<std::pair<endpoint, std::vector<int16_t>>> client_samples;
-        client_samples.reserve(clients_.size());
-
-        for (auto& [ep, client_info]: clients_) {
-            auto&  buffer             = client_info.pcm_buffer;
-            size_t samples_to_extract = std::min(buffer.size(), max_samples_per_client);
-            if (samples_to_extract > 0) {
-                // Copy samples out
-                client_samples.emplace_back(
-                    ep, std::vector<int16_t>(
-                            buffer.begin(),
-                            buffer.begin() + static_cast<ptrdiff_t>(samples_to_extract)));
-                // Remove from buffer immediately
-                buffer.erase(buffer.begin(),
-                             buffer.begin() + static_cast<ptrdiff_t>(samples_to_extract));
-            }
-        }
-
-        return client_samples;
-    }
-
 private:
     mutable std::mutex                                      mutex_;
     std::unordered_map<endpoint, ClientInfo, endpoint_hash> clients_;

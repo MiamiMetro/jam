@@ -22,9 +22,6 @@ CompileFlags:
     - -Ibuild/_deps/imgui-src
     - -Ibuild/_deps/imgui-src/backends
     - -Ibuild/_deps/glfw-src/include
-    - -Ibuild/_deps/srt-src/srtcore
-    - -Ibuild/_deps/srt-src/common
-    - -Ibuild/_deps/srt-build
   Remove:
     - -w
 
