@@ -29,7 +29,6 @@
 #include "audio_analysis.h"
 #include "audio_packet.h"
 #include "audio_stream.h"
-#include "broadcast_hls.h"
 #include "imguiapp.h"
 #include "logger.h"
 #include "message_validator.h"
@@ -115,24 +114,6 @@ public:
         socket_.cancel();
 
         Log::info("Disconnected (no longer sending/receiving)");
-    }
-
-    void enable_broadcast() {
-        Log::info("Requesting broadcast enable...");
-        CtrlHdr chdr{};
-        chdr.magic = CTRL_MAGIC;
-        chdr.type  = CtrlHdr::Cmd::BROADCAST_ENABLE;
-        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
-    }
-
-    void disable_broadcast() {
-        Log::info("Requesting broadcast disable...");
-        CtrlHdr chdr{};
-        chdr.magic = CTRL_MAGIC;
-        chdr.type  = CtrlHdr::Cmd::BROADCAST_DISABLE;
-        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
     }
 
     bool start_audio_stream(PaDeviceIndex input_device, PaDeviceIndex output_device,
@@ -270,23 +251,6 @@ public:
 
     AudioStream::AudioConfig get_audio_config() const {
         return audio_config_;
-    }
-
-    // HLS Broadcasting controls
-    bool start_hls_broadcast(const HLSBroadcaster::Config& config = HLSBroadcaster::Config{}) {
-        return hls_broadcaster_.start(config);
-    }
-
-    void stop_hls_broadcast() {
-        hls_broadcaster_.stop();
-    }
-
-    bool is_hls_broadcasting() const {
-        return hls_broadcaster_.is_running();
-    }
-
-    HLSBroadcaster::Config get_hls_config() const {
-        return hls_broadcaster_.get_config();
     }
 
     void on_receive(std::error_code error_code, std::size_t bytes) {
@@ -628,11 +592,6 @@ private:
             }
         }
 
-        // Send mixed audio to HLS broadcaster if active (always send to maintain stream timing)
-        if (client->hls_broadcaster_.is_running()) {
-            client->hls_broadcaster_.write_audio(output_buffer, frame_count);
-        }
-
         // Encode and send own audio (always send to maintain timing, even if silence)
         if (client->audio_encoder_.is_initialized() && client->audio_.is_stream_active()) {
             std::vector<unsigned char> encoded_data;
@@ -684,9 +643,6 @@ private:
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
 
     ParticipantManager participant_manager_;
-
-    // HLS Broadcaster (optional, header-only, decoupled)
-    HLSBroadcaster hls_broadcaster_;
 
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
@@ -781,54 +737,6 @@ void DrawClientUI(Client& client) {
             const bool audio_active = client.is_audio_stream_active();
             ImGui::Text("Audio Stream: %s", audio_active ? active_text : inactive_text);
             ImGui::EndTable();
-        }
-
-        ImGui::Separator();
-        ImGui::Text("Broadcast Control:");
-        if (ImGui::Button("Enable Broadcast")) {
-            client.enable_broadcast();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Disable Broadcast")) {
-            client.disable_broadcast();
-        }
-
-        ImGui::Separator();
-        ImGui::Text("HLS Streaming:");
-        const bool is_streaming = client.is_hls_broadcasting();
-        if (is_streaming) {
-            ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), "Status: LIVE");
-            auto hls_config = client.get_hls_config();
-            ImGui::Text("  Playlist: %s/%s.m3u8", hls_config.output_path.c_str(),
-                        hls_config.playlist_name.c_str());
-            ImGui::Text("  %dHz, %dch, %d bps", hls_config.sample_rate, hls_config.channels,
-                        hls_config.bitrate);
-            if (ImGui::Button("Stop HLS Stream")) {
-                client.stop_hls_broadcast();
-            }
-        } else {
-            ImGui::TextColored(ImVec4(0.5F, 0.5F, 0.5F, 1.0F), "Status: Offline");
-            if (ImGui::Button("Start HLS Stream")) {
-                HLSBroadcaster::Config hls_config;
-                hls_config.sample_rate = cached_encoder_info.sample_rate;
-                hls_config.channels    = 1;      // Mono for broadcast
-                hls_config.bitrate     = 96000;  // 96 kbps AAC (low-latency optimized)
-                // Use absolute path to project root (not binary location)
-                hls_config.output_path      = "C:/Users/Berkay/Downloads/udpstuff/hls";
-                hls_config.playlist_name    = "stream";
-                hls_config.segment_duration = 0.5f;  // 500ms segments for low latency
-                hls_config.playlist_size    = 6;
-                hls_config.verbose          = true;  // Enable to see FFmpeg errors
-                hls_config.low_latency      = true;  // Enable low-latency mode (fMP4)
-
-                if (client.start_hls_broadcast(hls_config)) {
-                    Log::info("HLS streaming started successfully");
-                } else {
-                    Log::error("Failed to start HLS streaming");
-                }
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("(needs FFmpeg)");
         }
 
         ImGui::Separator();
@@ -998,7 +906,6 @@ int main() {
         }
 
         // Clean up Client resources before exit
-        client_instance.stop_hls_broadcast();
         client_instance.stop_audio_stream();
         client_instance.stop_connection();
 

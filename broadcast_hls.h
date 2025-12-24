@@ -27,12 +27,12 @@ namespace fs = std::filesystem;
 class HLSBroadcaster {
 public:
     struct Config {
-        int         sample_rate   = 48000;
-        int         channels      = 1;
-        int         bitrate       = 96000;     // Audio bitrate in bps (96k default)
-        std::string output_path   = "hls";     // Output directory for HLS segments
+        int         sample_rate = 48000;
+        int         channels    = 1;
+        int         bitrate     = 80000;  // Audio bitrate in bps (80k default, optimized for mono)
+        std::string output_path = "hls";  // Output directory for HLS segments
         std::string playlist_name = "stream";  // Playlist filename (without .m3u8)
-        float segment_duration    = 0.5f;  // HLS segment duration in seconds (0.5 for low latency)
+        float segment_duration    = 0.5F;  // HLS segment duration in seconds (0.5 for low latency)
         int   playlist_size       = 6;     // Number of segments in playlist
         std::string ffmpeg_path   = "ffmpeg";  // Path to ffmpeg executable
         bool        verbose       = false;     // Show FFmpeg output
@@ -83,10 +83,12 @@ public:
         cmd += " -ac " + std::to_string(config_.channels);
         cmd += " -i pipe:0";
 
-        // Audio encoding: AAC
+        // Audio encoding: AAC with optimized CPU settings
         cmd += " -c:a aac";
+        cmd += " -profile:a aac_low";  // AAC-LC profile (lowest CPU, widely supported)
         cmd += " -b:a " + std::to_string(config_.bitrate);
         cmd += " -ar " + std::to_string(config_.sample_rate);
+        cmd += " -threads 1";  // Limit FFmpeg threads (prevents stealing cores from Jam server)
 
         // HLS options
         cmd += " -f hls";
@@ -109,7 +111,6 @@ public:
             cmd += " -hls_segment_filename \"" + config_.output_path + "/" + config_.playlist_name +
                    "_%03d.ts\"";
         }
-        "_%03d.ts\"";
 
         // Output playlist
         cmd += " -y \"" + config_.output_path + "/" + config_.playlist_name + ".m3u8\"";

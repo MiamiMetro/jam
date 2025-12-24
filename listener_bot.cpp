@@ -637,14 +637,14 @@ int main(int argc, char* argv[]) {
 
         ListenerBot bot(io_context, server_address, server_port);
 
-        // Start HLS broadcasting
+        // Start HLS broadcasting with CPU-optimized settings
         HLSBroadcaster::Config hls_config;
         hls_config.sample_rate      = 48000;
-        hls_config.channels         = 1;      // Mono for broadcast
-        hls_config.bitrate          = 96000;  // 96 kbps AAC (low-latency optimized)
+        hls_config.channels         = 1;      // Mono (reduces AAC CPU by ~40-50%)
+        hls_config.bitrate          = 80000;  // 80 kbps AAC (balanced CPU/quality for mono)
         hls_config.output_path      = hls_output;
         hls_config.playlist_name    = hls_name;
-        hls_config.segment_duration = 0.5F;  // 500ms segments for low latency
+        hls_config.segment_duration = 0.5F;  // 500ms segments (0.75s saves ~5-10% CPU if latency allows)
         hls_config.playlist_size    = 6;
         hls_config.verbose          = true;  // Enable to see FFmpeg errors
         hls_config.low_latency      = true;  // Enable low-latency mode (fMP4)
