@@ -453,43 +453,21 @@ private:
             }
         }
 
-        // Decode audio via participant manager
+        // Get opus data pointer
         const unsigned char* audio_data = reinterpret_cast<const unsigned char*>(
             recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
 
-        std::vector<float> decoded_data;
-        bool               decode_success = false;
-
+        // CRITICAL: Enqueue Opus packet, DON'T decode here
+        // Decoding happens in time-driven audio_callback
         participant_manager_.with_participant(sender_id, [&](ParticipantData& participant) {
-            if (encoded_bytes > 0) {
-                int frame_size = audio_config_.frames_per_buffer;
-                if (frame_size == 0) {
-                    Log::error(
-                        "Cannot decode audio from participant {}: invalid frame_size (audio "
-                        "config not initialized)",
-                        sender_id);
-                    return;
-                }
-                if (participant.decoder->decode(audio_data, encoded_bytes, frame_size,
-                                                decoded_data)) {
-                    decode_success = true;
-                } else {
-                    Log::warn("Failed to decode audio from participant {} (frame_size={})",
-                              sender_id, frame_size);
-                }
-            }
-        });
-
-        if (!decode_success || decoded_data.empty()) {
-            return;
-        }
-
-        // Queue decoded audio for this participant
-        participant_manager_.with_participant(sender_id, [&](ParticipantData& participant) {
-            size_t queue_size = participant.audio_queue.size_approx();
+            OpusPacket packet;
+            packet.data.assign(audio_data, audio_data + encoded_bytes);
+            packet.timestamp = std::chrono::steady_clock::now();
+            
+            size_t queue_size = participant.opus_queue.size_approx();
             if (queue_size < 16) {
-                participant.audio_queue.enqueue(std::move(decoded_data));
-                participant.last_packet_time = std::chrono::steady_clock::now();
+                participant.opus_queue.enqueue(std::move(packet));
+                participant.last_packet_time = packet.timestamp;
 
                 // Mark buffer as ready once we have enough packets
                 if (!participant.buffer_ready &&
@@ -500,10 +478,10 @@ private:
                 }
             } else {
                 // Buffer overflow - drop oldest packet
-                std::vector<float> discarded;
-                participant.audio_queue.try_dequeue(discarded);
-                participant.audio_queue.enqueue(std::move(decoded_data));
-                participant.last_packet_time = std::chrono::steady_clock::now();
+                OpusPacket discarded;
+                participant.opus_queue.try_dequeue(discarded);
+                participant.opus_queue.enqueue(std::move(packet));
+                participant.last_packet_time = packet.timestamp;
             }
         });
     }
@@ -526,17 +504,37 @@ private:
         std::memset(output_buffer, 0, bytes_to_copy);
 
         // Mix audio from all active participants (thread-safe iteration)
+        int active_count = 0;
         client->participant_manager_.for_each([&](uint32_t         participant_id,
                                                   ParticipantData& participant) {
             if (participant.is_muted || !participant.buffer_ready) {
                 return;
             }
 
-            std::vector<float> audio_frame;
+            OpusPacket opus_packet;
 
-            if (participant.audio_queue.try_dequeue(audio_frame)) {
+            if (participant.opus_queue.try_dequeue(opus_packet)) {
+                // Decode into preallocated buffer (zero allocations)
+                int decoded_samples = participant.decoder->decode_into(
+                    opus_packet.data.data(),
+                    static_cast<int>(opus_packet.data.size()),
+                    participant.pcm_buffer.data(),
+                    static_cast<int>(frame_count)
+                );
+
+                if (decoded_samples <= 0) {
+                    // Decode failed - use silence
+                    static int decode_fail_count = 0;
+                    if (++decode_fail_count % 100 == 0) {
+                        Log::warn("Decode failed for participant {} ({} times)", participant_id,
+                                  decode_fail_count);
+                    }
+                    return;
+                }
+
                 // Calculate audio level (RMS) for voice activity detection
-                float rms = audio_analysis::calculate_rms(audio_frame.data(), audio_frame.size());
+                float rms = audio_analysis::calculate_rms(participant.pcm_buffer.data(), 
+                                                          decoded_samples);
                 participant.current_level = rms;
 
                 // Voice Activity Detection (simple threshold-based)
@@ -550,28 +548,29 @@ private:
                     Log::debug("Participant {} stopped speaking", participant_id);
                 }
 
-                // Validate decoded data size
+                // Mix into output with participant's gain
                 size_t expected_samples = frame_count * out_channels;
-                if (audio_frame.size() == expected_samples) {
-                    // Mix into output with participant's gain
-                    audio_analysis::mix_with_gain(output_buffer, audio_frame.data(),
-                                                  audio_frame.size(), participant.gain);
-                } else if (audio_frame.size() == frame_count) {
+                if (static_cast<size_t>(decoded_samples) == expected_samples) {
+                    audio_analysis::mix_with_gain(output_buffer, participant.pcm_buffer.data(),
+                                                  decoded_samples, participant.gain);
+                    active_count++;
+                } else if (static_cast<size_t>(decoded_samples) == frame_count) {
                     // Mono input, stereo output - duplicate channel
-                    audio_analysis::mix_mono_to_stereo(output_buffer, audio_frame.data(),
+                    audio_analysis::mix_mono_to_stereo(output_buffer, participant.pcm_buffer.data(),
                                                        frame_count, out_channels, participant.gain);
+                    active_count++;
                 } else {
                     // Size mismatch - log warning occasionally
                     static int mismatch_count = 0;
                     if (++mismatch_count % 100 == 0) {
                         Log::warn(
                             "Audio size mismatch: participant {}, got {} samples, expected {}",
-                            participant_id, audio_frame.size(), expected_samples);
+                            participant_id, decoded_samples, expected_samples);
                     }
                 }
             } else {
                 // Underrun - failed to dequeue
-                size_t current_queue_size = participant.audio_queue.size_approx();
+                size_t current_queue_size = participant.opus_queue.size_approx();
                 if (current_queue_size == 0 && participant.buffer_ready) {
                     participant.buffer_ready = false;
                     Log::warn(
@@ -590,6 +589,20 @@ private:
                 }
             }
         });
+
+        // Apply normalization if multiple participants to prevent clipping
+        if (active_count > 1) {
+            constexpr float HEADROOM = 0.5f;  // VoIP can use more headroom than broadcast
+            float gain = HEADROOM / static_cast<float>(active_count);
+            
+            for (unsigned long i = 0; i < frame_count * out_channels; ++i) {
+                output_buffer[i] *= gain;
+                
+                // Soft clip (safety limiter)
+                if (output_buffer[i] > 1.0f) output_buffer[i] = 1.0f;
+                if (output_buffer[i] < -1.0f) output_buffer[i] = -1.0f;
+            }
+        }
 
         // Encode and send own audio (always send to maintain timing, even if silence)
         if (client->audio_encoder_.is_initialized() && client->audio_.is_stream_active()) {

@@ -84,6 +84,40 @@ public:
         return true;
     }
 
+    // Decode directly into caller-provided buffer (zero-allocation)
+    int decode_into(const unsigned char* input, int input_size, float* output, int frame_size) {
+        if (decoder_ == nullptr) {
+            Log::error("Opus decoder not initialized.");
+            return -1;
+        }
+
+        int decoded_samples_per_channel =
+            opus_decode_float(decoder_, input, input_size, output, frame_size, 0);
+
+        if (decoded_samples_per_channel < 0) {
+            Log::error("Opus decoding failed: {}", opus_strerror(decoded_samples_per_channel));
+            return -1;
+        }
+
+        return decoded_samples_per_channel * channels_;
+    }
+
+    // Decode directly into caller-provided buffer - Packet Loss Concealment
+    int decode_plc(float* output, int frame_size) {
+        if (decoder_ == nullptr) {
+            return -1;
+        }
+
+        int decoded_samples_per_channel =
+            opus_decode_float(decoder_, nullptr, 0, output, frame_size, 0);
+
+        if (decoded_samples_per_channel < 0) {
+            return -1;
+        }
+
+        return decoded_samples_per_channel * channels_;
+    }
+
     // Decode with Packet Loss Concealment (when packet is lost)
     bool decode_plc(int frame_size, std::vector<float>& output) {
         if (decoder_ == nullptr) {

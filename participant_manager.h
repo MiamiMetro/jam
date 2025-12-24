@@ -32,6 +32,7 @@ public:
             return false;
         }
 
+        new_participant.pcm_buffer.fill(0.0f);  // Initialize preallocated buffer
         new_participant.last_packet_time = std::chrono::steady_clock::now();
         participants_[id]                = std::move(new_participant);
 
@@ -81,7 +82,7 @@ public:
             info.audio_level    = data.current_level;
             info.gain           = data.gain;
             info.buffer_ready   = data.buffer_ready;
-            info.queue_size     = data.audio_queue.size_approx();
+            info.queue_size     = data.opus_queue.size_approx();
             info.underrun_count = data.underrun_count;
             result.push_back(info);
         }
@@ -127,9 +128,24 @@ public:
     // Iterate over all participants (thread-safe, for audio mixing)
     template <typename Func>
     void for_each(Func&& func) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& [id, data]: participants_) {
-            func(id, data);
+        // CRITICAL: Don't hold mutex during decode/mix
+        // 1. Lock and copy participant IDs
+        std::vector<uint32_t> ids;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ids.reserve(participants_.size());
+            for (const auto& [id, _] : participants_) {
+                ids.push_back(id);
+            }
+        }
+        
+        // 2. Process each participant without holding global lock
+        for (uint32_t id : ids) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = participants_.find(id);
+            if (it != participants_.end()) {
+                func(id, it->second);
+            }
         }
     }
 

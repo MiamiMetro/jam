@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <concurrentqueue.h>
 #include <cstdint>
@@ -7,11 +8,18 @@
 #include <vector>
 #include "opus_decoder.h"
 
+// Opus packet with metadata (for time-driven decode)
+struct OpusPacket {
+    std::vector<uint8_t>                  data;
+    std::chrono::steady_clock::time_point timestamp;
+};
+
 // Per-participant audio data and state
 struct ParticipantData {
-    // Audio processing
-    moodycamel::ConcurrentQueue<std::vector<float>> audio_queue;
-    std::unique_ptr<OpusDecoderWrapper>             decoder;
+    // Audio processing - store OPUS packets, decode in audio callback
+    moodycamel::ConcurrentQueue<OpusPacket>     opus_queue;
+    std::unique_ptr<OpusDecoderWrapper>         decoder;
+    std::array<float, 960>                      pcm_buffer;  // Preallocated decode buffer
 
     // Participant state
     bool                                  is_muted = false;

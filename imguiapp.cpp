@@ -77,7 +77,7 @@ ImGuiApp::ImGuiApp(int width, int height, const char* title, bool vsync, int tar
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     // Disable viewports for better performance (re-enable if you need multi-window support)
-    // io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
     ImGui::StyleColorsDark();
 
