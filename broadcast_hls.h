@@ -100,16 +100,23 @@ public:
 
         cmd += " -hls_list_size " + std::to_string(config_.playlist_size);
 
+        // Use epoch-based sequence numbering for restart-safe monotonic segments
+        cmd += " -hls_start_number_source epoch";
+
         // Low-latency HLS: use fMP4 segments with more flags
         if (config_.low_latency) {
             cmd += " -hls_segment_type fmp4";
-            cmd += " -hls_flags independent_segments+append_list+program_date_time+delete_segments";
+            // Remove append_list - it causes issues when FFmpeg restarts
+            cmd += " -hls_flags independent_segments+program_date_time+delete_segments";
+            // Use %d for monotonic sequence numbers (epoch-based via hls_start_number_source)
             cmd += " -hls_segment_filename \"" + config_.output_path + "/" + config_.playlist_name +
-                   "_%03d.m4s\"";
+                   "_%d.m4s\"";
         } else {
-            cmd += " -hls_flags delete_segments+append_list";
+            // Remove append_list - it causes issues when FFmpeg restarts
+            cmd += " -hls_flags delete_segments";
+            // Use %d for monotonic sequence numbers (epoch-based via hls_start_number_source)
             cmd += " -hls_segment_filename \"" + config_.output_path + "/" + config_.playlist_name +
-                   "_%03d.ts\"";
+                   "_%d.ts\"";
         }
 
         // Output playlist
