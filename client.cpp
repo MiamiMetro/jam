@@ -479,12 +479,19 @@ private:
         // Decoding happens in time-driven audio_callback
         participant_manager_.with_participant(sender_id, [&](ParticipantData& participant) {
             OpusPacket packet;
-            packet.data.assign(audio_data, audio_data + encoded_bytes);
-            packet.timestamp = std::chrono::steady_clock::now();
+            // Use memcpy for zero-allocation copy (fixed buffer)
+            if (encoded_bytes <= AUDIO_BUF_SIZE) {
+                std::memcpy(packet.data.data(), audio_data, encoded_bytes);
+                packet.size      = encoded_bytes;
+                packet.timestamp = std::chrono::steady_clock::now();
+            } else {
+                Log::error("Packet too large: {} bytes (max {})", encoded_bytes, AUDIO_BUF_SIZE);
+                return;
+            }
 
             size_t queue_size = participant.opus_queue.size_approx();
             if (queue_size < 16) {
-                participant.opus_queue.enqueue(std::move(packet));
+                participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 participant.last_packet_time = packet.timestamp;
 
                 // Mark buffer as ready once we have enough packets
@@ -498,7 +505,7 @@ private:
                 // Buffer overflow - drop oldest packet
                 OpusPacket discarded;
                 participant.opus_queue.try_dequeue(discarded);
-                participant.opus_queue.enqueue(std::move(packet));
+                participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 participant.last_packet_time = packet.timestamp;
             }
         });
@@ -534,7 +541,7 @@ private:
             if (participant.opus_queue.try_dequeue(opus_packet)) {
                 // Decode into preallocated buffer (zero allocations)
                 int decoded_samples = participant.decoder->decode_into(
-                    opus_packet.data.data(), static_cast<int>(opus_packet.data.size()),
+                    opus_packet.get_data(), static_cast<int>(opus_packet.get_size()),
                     participant.pcm_buffer.data(), static_cast<int>(frame_count));
 
                 if (decoded_samples <= 0) {

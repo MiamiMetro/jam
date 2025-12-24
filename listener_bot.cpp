@@ -81,12 +81,19 @@ public:
     void stop_connection() {
         Log::info("Disconnecting from server...");
 
-        // Send LEAVE message
+        // Send LEAVE message synchronously (to ensure it's sent before shutdown)
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type  = CtrlHdr::Cmd::LEAVE;
         std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+
+        // Use blocking send for shutdown to ensure packet is sent
+        std::error_code ec;
+        socket_.send_to(asio::buffer(ctrl_tx_buf_.data(), sizeof(CtrlHdr)), server_endpoint_, 0,
+                        ec);
+        if (ec) {
+            Log::warn("Failed to send LEAVE: {}", ec.message());
+        }
 
         // Cancel pending async operations
         socket_.cancel();
@@ -107,7 +114,7 @@ public:
         return hls_broadcaster_.is_running();
     }
 
-    // Start the mix thread (time-driven, not device-driven)
+    // Start the mix thread and writer thread (time-driven, not device-driven)
     void start_mixing() {
         if (mix_thread_.joinable()) {
             Log::warn("Mix thread already running");
@@ -118,7 +125,8 @@ public:
                   audio_config_.sample_rate, audio_config_.frames_per_buffer,
                   (audio_config_.frames_per_buffer * 1000.0) / audio_config_.sample_rate);
 
-        mix_thread_ = std::thread([this]() { mix_thread_loop(); });
+        mix_thread_    = std::thread([this]() { mix_thread_loop(); });
+        writer_thread_ = std::thread([this]() { writer_thread_loop(); });
     }
 
     // Stop the bot (stops mixing, broadcasting, connection)
@@ -135,10 +143,15 @@ public:
             mix_thread_.join();
         }
 
+        // Stop writer thread (will drain remaining PCM frames)
+        if (writer_thread_.joinable()) {
+            writer_thread_.join();
+        }
+
         // Stop HLS broadcasting
         stop_hls_broadcast();
 
-        // Stop connection
+        // Stop connection (synchronous LEAVE send)
         stop_connection();
     }
 
@@ -146,6 +159,14 @@ public:
         if (error_code) {
             do_receive();  // keep listening
             return;
+        }
+
+        // Optional: verify packet is from server (can be disabled for flexibility)
+        if (remote_endpoint_ != server_endpoint_) {
+            Log::warn("Received packet from unexpected endpoint: {}:{}, expected {}:{}",
+                      remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                      server_endpoint_.address().to_string(), server_endpoint_.port());
+            // Continue processing anyway (some setups may use different ports)
         }
 
         if (bytes < sizeof(MsgHdr)) {
@@ -180,7 +201,7 @@ public:
     }
 
     void do_receive() {
-        socket_.async_receive_from(asio::buffer(recv_buf_), server_endpoint_,
+        socket_.async_receive_from(asio::buffer(recv_buf_), remote_endpoint_,
                                    [this](std::error_code error_code, std::size_t bytes) {
                                        on_receive(error_code, bytes);
                                    });
@@ -222,19 +243,35 @@ private:
             // Mix one frame
             mix_one_frame(mixed_buffer.data(), frame_count, channels);
 
-            // Write to HLS if broadcasting
-            if (hls_broadcaster_.is_running()) {
-                hls_broadcaster_.write_audio(mixed_buffer.data(), frame_count);
+            // Push to PCM queue (decoupled from FFmpeg write)
+            // Use fixed-size array to avoid allocations
+            std::array<float, 240> pcm_frame;
+            std::memcpy(pcm_frame.data(), mixed_buffer.data(),
+                        frame_count * channels * sizeof(float));
+
+            // Non-blocking enqueue (drop if queue is full to prevent blocking)
+            if (!pcm_queue_.enqueue(pcm_frame)) {
+                static int drop_count = 0;
+                if (++drop_count % 200 == 0) {
+                    Log::warn("PCM queue full, dropping frames ({} drops)", drop_count);
+                }
             }
 
             // Calculate next tick time (real-time discipline)
             next_tick += frame_duration;
 
+            // Resync if we're too far behind (prevents drift accumulation)
+            auto now = std::chrono::steady_clock::now();
+            if (now > next_tick + 5 * frame_duration) {
+                Log::warn("Mix thread too far behind, resyncing timing");
+                next_tick = now;
+            }
+
             // Sleep until next tick (don't drift)
             std::this_thread::sleep_until(next_tick);
 
             // Log if we're falling behind (warn if mix takes too long)
-            auto elapsed = std::chrono::steady_clock::now() - start;
+            auto elapsed = now - start;
             if (elapsed > frame_duration) {
                 static int behind_count = 0;
                 if (++behind_count % 200 == 0) {  // Log every 200 frames (1 second)
@@ -251,6 +288,29 @@ private:
         }
 
         Log::info("Mix thread stopped");
+    }
+
+    // Writer thread loop: pops PCM frames and writes to FFmpeg (decoupled from mixing)
+    void writer_thread_loop() {
+        const size_t frame_count = audio_config_.frames_per_buffer;
+        Log::info("Writer thread started");
+
+        while (running_.load() || pcm_queue_.size_approx() > 0) {
+            std::array<float, 240> pcm_frame;
+
+            // Try to dequeue a PCM frame (with timeout to allow shutdown check)
+            if (pcm_queue_.try_dequeue(pcm_frame)) {
+                // Write to HLS if broadcasting (this can block, but it's OK in separate thread)
+                if (hls_broadcaster_.is_running()) {
+                    hls_broadcaster_.write_audio(pcm_frame.data(), frame_count);
+                }
+            } else {
+                // No data available, sleep briefly to avoid spinning
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        Log::info("Writer thread stopped");
     }
 
     // Mix one frame of audio (extracted from audio_callback logic)
@@ -270,7 +330,7 @@ private:
             if (participant.opus_queue.try_dequeue(opus_packet)) {
                 // Decode into preallocated buffer (zero allocations)
                 int decoded_samples = participant.decoder->decode_into(
-                    opus_packet.data.data(), static_cast<int>(opus_packet.data.size()),
+                    opus_packet.get_data(), static_cast<int>(opus_packet.get_size()),
                     participant.pcm_buffer.data(), static_cast<int>(frame_count));
 
                 if (decoded_samples <= 0) {
@@ -356,12 +416,8 @@ private:
                 output[i] *= gain;
 
                 // Soft clip (safety limiter)
-                if (output[i] > 1.0F) {
-                    output[i] = 1.0F;
-                }
-                if (output[i] < -1.0F) {
-                    output[i] = -1.0F;
-                }
+                output[i] = std::min(output[i], 1.0F);
+                output[i] = std::max(output[i], -1.0F);
             }
         }
     }
@@ -483,12 +539,19 @@ private:
         // Decoding happens in time-driven mix thread
         participant_manager_.with_participant(sender_id, [&](ParticipantData& participant) {
             OpusPacket packet;
-            packet.data.assign(audio_data, audio_data + encoded_bytes);
-            packet.timestamp = std::chrono::steady_clock::now();
+            // Use memcpy for zero-allocation copy (fixed buffer)
+            if (encoded_bytes <= AUDIO_BUF_SIZE) {
+                std::memcpy(packet.data.data(), audio_data, encoded_bytes);
+                packet.size      = encoded_bytes;  // implicit conversion
+                packet.timestamp = std::chrono::steady_clock::now();
+            } else {
+                Log::error("Packet too large: {} bytes (max {})", encoded_bytes, AUDIO_BUF_SIZE);
+                return;
+            }
 
             size_t queue_size = participant.opus_queue.size_approx();
             if (queue_size < 16) {
-                participant.opus_queue.enqueue(std::move(packet));
+                participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 participant.last_packet_time = packet.timestamp;
 
                 // Mark buffer as ready once we have enough packets
@@ -502,7 +565,7 @@ private:
                 // Buffer overflow - drop oldest packet
                 OpusPacket discarded;
                 participant.opus_queue.try_dequeue(discarded);
-                participant.opus_queue.enqueue(std::move(packet));
+                participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 participant.last_packet_time = packet.timestamp;
             }
         });
@@ -516,6 +579,7 @@ private:
     asio::io_context& io_context_;
     udp::socket       socket_;
     udp::endpoint     server_endpoint_;
+    udp::endpoint     remote_endpoint_;  // Actual sender endpoint (for receive)
 
     std::array<char, 1024>         recv_buf_;
     std::array<unsigned char, 128> sync_tx_buf_;
@@ -528,8 +592,12 @@ private:
     // HLS Broadcaster
     HLSBroadcaster hls_broadcaster_;
 
+    // PCM queue (decouples mix thread from FFmpeg writes)
+    moodycamel::ConcurrentQueue<std::array<float, 240>> pcm_queue_;
+
     // Mix thread (replaces PortAudio callback)
     std::thread       mix_thread_;
+    std::thread       writer_thread_;  // FFmpeg writer thread
     std::atomic<bool> running_;
 
     PeriodicTimer ping_timer_;
@@ -564,6 +632,9 @@ int main(int argc, char* argv[]) {
 
         asio::io_context io_context;
 
+        // Work guard to prevent io_context from exiting when there's no work
+        auto work = asio::make_work_guard(io_context);
+
         ListenerBot bot(io_context, server_address, server_port);
 
         // Start HLS broadcasting
@@ -587,12 +658,24 @@ int main(int argc, char* argv[]) {
         // Start mix thread (time-driven, replaces PortAudio)
         bot.start_mixing();
 
-        // Run network I/O
-        Log::info("ListenerBot running... (press Ctrl+C to stop)");
-        io_context.run();
+        // Run network I/O in separate thread
+        std::thread net_thread([&]() {
+            Log::info("Network I/O thread started");
+            io_context.run();
+            Log::info("Network I/O thread stopped");
+        });
 
-        // Cleanup
-        bot.stop();
+        // Wait for network thread (blocks until io_context stops)
+        // To stop: send SIGINT/Ctrl+C, which should trigger cleanup
+        Log::info("ListenerBot running... (press Ctrl+C to stop)");
+
+        // For now, wait on network thread (in real deployment, use signal handling)
+        net_thread.join();
+
+        // Cleanup: allow io_context to exit and stop bot
+        work.reset();       // Release work guard (io_context may have already stopped)
+        io_context.stop();  // Ensure it's stopped
+        bot.stop();         // Stop threads gracefully
 
         Log::info("ListenerBot stopped");
     } catch (std::exception& e) {

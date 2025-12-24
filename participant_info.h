@@ -7,19 +7,30 @@
 #include <memory>
 #include <vector>
 #include "opus_decoder.h"
+#include "protocol.h"  // For AUDIO_BUF_SIZE
 
 // Opus packet with metadata (for time-driven decode)
+// Uses fixed buffer to avoid allocations in hot path
 struct OpusPacket {
-    std::vector<uint8_t>                  data;
+    uint16_t                              size = 0;  // Actual data size (<= AUDIO_BUF_SIZE)
+    std::array<uint8_t, AUDIO_BUF_SIZE>   data;      // Fixed buffer (no allocations)
     std::chrono::steady_clock::time_point timestamp;
+
+    // Helper to get data pointer and size (compatible with old vector API)
+    const uint8_t* get_data() const {
+        return data.data();
+    }
+    size_t get_size() const {
+        return size;
+    }
 };
 
 // Per-participant audio data and state
 struct ParticipantData {
     // Audio processing - store OPUS packets, decode in audio callback
-    moodycamel::ConcurrentQueue<OpusPacket>     opus_queue;
-    std::unique_ptr<OpusDecoderWrapper>         decoder;
-    std::array<float, 960>                      pcm_buffer;  // Preallocated decode buffer
+    moodycamel::ConcurrentQueue<OpusPacket> opus_queue;
+    std::unique_ptr<OpusDecoderWrapper>     decoder;
+    std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
 
     // Participant state
     bool                                  is_muted = false;
