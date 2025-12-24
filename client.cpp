@@ -978,8 +978,7 @@ int main() {
 
         // Run UI on main thread (required for GLFW on macOS)
         {
-            // Enable VSync for efficient FPS limiting (hardware-accelerated)
-            ImGuiApp app(900, 500, "Jam", true, 60);
+            ImGuiApp app(900, 500, "Jam", false, 60);
 
             // Clean lambda - just delegates to separate function
             app.SetDrawCallback([&client_instance]() { DrawClientUI(client_instance); });
