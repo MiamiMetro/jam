@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -14,6 +15,7 @@
 
 #include <asio.hpp>
 #include <asio/buffer.hpp>
+#include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
 #include <concurrentqueue.h>
@@ -25,6 +27,7 @@
 #include "message_validator.h"
 #include "opus_decoder.h"
 #include "packet_builder.h"
+#include "participant_info.h"
 #include "participant_manager.h"
 #include "periodic_timer.h"
 #include "protocol.h"
@@ -40,10 +43,10 @@ public:
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
           audio_config_{48000, 240},  // 48kHz, 240 frames = 5ms
+          running_(true),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
-          cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }),
-          running_(true) {
+          cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
         Log::info("ListenerBot local port: {}", socket_.local_endpoint().port());
 
         // Connect to server
@@ -639,15 +642,16 @@ int main(int argc, char* argv[]) {
 
         // Start HLS broadcasting with CPU-optimized settings
         HLSBroadcaster::Config hls_config;
-        hls_config.sample_rate      = 48000;
-        hls_config.channels         = 1;      // Mono (reduces AAC CPU by ~40-50%)
-        hls_config.bitrate          = 80000;  // 80 kbps AAC (balanced CPU/quality for mono)
-        hls_config.output_path      = hls_output;
-        hls_config.playlist_name    = hls_name;
-        hls_config.segment_duration = 0.5F;  // 500ms segments (0.75s saves ~5-10% CPU if latency allows)
-        hls_config.playlist_size    = 6;
-        hls_config.verbose          = true;  // Enable to see FFmpeg errors
-        hls_config.low_latency      = true;  // Enable low-latency mode (fMP4)
+        hls_config.sample_rate   = 48000;
+        hls_config.channels      = 1;      // Mono (reduces AAC CPU by ~40-50%)
+        hls_config.bitrate       = 80000;  // 80 kbps AAC (balanced CPU/quality for mono)
+        hls_config.output_path   = hls_output;
+        hls_config.playlist_name = hls_name;
+        hls_config.segment_duration =
+            0.5F;  // 500ms segments (0.75s saves ~5-10% CPU if latency allows)
+        hls_config.playlist_size = 6;
+        hls_config.verbose       = true;  // Enable to see FFmpeg errors
+        hls_config.low_latency   = true;  // Enable low-latency mode (fMP4)
 
         if (bot.start_hls_broadcast(hls_config)) {
             Log::info("HLS broadcasting started: {}/{}.m3u8", hls_output, hls_name);

@@ -1,6 +1,4 @@
-#include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -8,26 +6,22 @@
 #include <exception>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <string_view>
 #include <system_error>
-#include <unordered_map>
 #include <vector>
 
 #include <asio.hpp>
 #include <asio/buffer.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
+#include <spdlog/common.h>
 
-#include "logger.h"
-#include "periodic_timer.h"
-#include "protocol.h"
-
-#include "client_info.h"
 #include "client_manager.h"
+#include "logger.h"
 #include "message_validator.h"
 #include "packet_builder.h"
+#include "periodic_timer.h"
+#include "protocol.h"
 #include "server_config.h"
 
 using asio::ip::udp;
@@ -230,7 +224,6 @@ private:
         }
     }
 
-private:
     udp::socket socket_;
 
     ClientManager client_manager_;

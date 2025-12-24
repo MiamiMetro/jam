@@ -10,8 +10,9 @@ namespace audio_analysis {
 
 // Calculate RMS (Root Mean Square) audio level
 inline float calculate_rms(const float* samples, size_t count) {
-    if (count == 0)
+    if (count == 0) {
         return 0.0F;
+    }
 
     float sum_squares = 0.0F;
     for (size_t i = 0; i < count; ++i) {

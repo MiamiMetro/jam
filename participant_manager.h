@@ -19,7 +19,7 @@ public:
     bool register_participant(uint32_t id, int sample_rate, int channels) {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        if (participants_.find(id) != participants_.end()) {
+        if (participants_.contains(id)) {
             return true;  // Already registered
         }
 
@@ -32,7 +32,7 @@ public:
             return false;
         }
 
-        new_participant.pcm_buffer.fill(0.0f);  // Initialize preallocated buffer
+        new_participant.pcm_buffer.fill(0.0F);  // Initialize preallocated buffer
         new_participant.last_packet_time = std::chrono::steady_clock::now();
         participants_[id]                = std::move(new_participant);
 
@@ -53,7 +53,7 @@ public:
     // Check if participant exists
     bool exists(uint32_t id) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return participants_.find(id) != participants_.end();
+        return participants_.contains(id);
     }
 
     // Access participant with lambda (thread-safe)
@@ -134,15 +134,15 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ids.reserve(participants_.size());
-            for (const auto& [id, _] : participants_) {
+            for (const auto& [id, _]: participants_) {
                 ids.push_back(id);
             }
         }
-        
+
         // 2. Process each participant without holding global lock
-        for (uint32_t id : ids) {
+        for (uint32_t id: ids) {
             std::lock_guard<std::mutex> lock(mutex_);
-            auto it = participants_.find(id);
+            auto                        it = participants_.find(id);
             if (it != participants_.end()) {
                 func(id, it->second);
             }

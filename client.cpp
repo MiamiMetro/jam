@@ -2,18 +2,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <asio.hpp>
@@ -36,6 +32,7 @@
 #include "opus_defines.h"
 #include "opus_encoder.h"
 #include "packet_builder.h"
+#include "participant_info.h"
 #include "participant_manager.h"
 #include "periodic_timer.h"
 #include "protocol.h"
@@ -379,11 +376,12 @@ private:
         auto current_time =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
         auto rtt = (current_time - hdr.t1_client_send) - (hdr.t3_server_send - hdr.t2_server_recv);
-        auto offset =
-            ((hdr.t2_server_recv - hdr.t1_client_send) + (hdr.t3_server_send - current_time)) / 2;
+        // auto offset =
+        //     ((hdr.t2_server_recv - hdr.t1_client_send) + (hdr.t3_server_send - current_time)) /
+        //     2;
 
-        double rtt_ms    = static_cast<double>(rtt) / 1e6;
-        double offset_ms = static_cast<double>(offset) / 1e6;
+        double rtt_ms = static_cast<double>(rtt) / 1e6;
+        // double offset_ms = static_cast<double>(offset) / 1e6;
 
         // Store RTT for GUI display (thread-safe atomic update)
         rtt_ms_.store(rtt_ms, std::memory_order_relaxed);
@@ -578,17 +576,15 @@ private:
 
         // Apply normalization if multiple participants to prevent clipping
         if (active_count > 1) {
-            constexpr float HEADROOM = 0.5f;  // VoIP can use more headroom than broadcast
+            constexpr float HEADROOM = 0.5F;  // VoIP can use more headroom than broadcast
             float           gain     = HEADROOM / static_cast<float>(active_count);
 
             for (unsigned long i = 0; i < frame_count * out_channels; ++i) {
                 output_buffer[i] *= gain;
 
                 // Soft clip (safety limiter)
-                if (output_buffer[i] > 1.0f)
-                    output_buffer[i] = 1.0f;
-                if (output_buffer[i] < -1.0f)
-                    output_buffer[i] = -1.0f;
+                output_buffer[i] = std::min(output_buffer[i], 1.0F);
+                output_buffer[i] = std::max(output_buffer[i], -1.0F);
             }
         }
 

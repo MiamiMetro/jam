@@ -35,8 +35,6 @@ struct CtrlHdr : MsgHdr {
         LEAVE             = 2,
         ALIVE             = 3,
         PARTICIPANT_LEAVE = 4,  // Server broadcasts when participant leaves
-        BROADCAST_ENABLE  = 5,  // Client requests to enable broadcast
-        BROADCAST_DISABLE = 6,  // Client requests to disable broadcast
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };

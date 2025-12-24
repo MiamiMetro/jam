@@ -219,7 +219,7 @@ public:
         DWORD bytes_written = 0;
         BOOL  success =
             WriteFile(stdin_write_, data, static_cast<DWORD>(byte_count), &bytes_written, nullptr);
-        if (!success || bytes_written != byte_count) {
+        if ((success == 0) || bytes_written != byte_count) {
             static int error_count = 0;
             if (++error_count % 100 == 0) {
                 Log::error("Failed to write to FFmpeg stdin (error count: {})", error_count);
@@ -262,7 +262,7 @@ private:
 
         // Create pipe for stdin
         HANDLE stdin_read = nullptr;
-        if (!CreatePipe(&stdin_read, &stdin_write_, &sa, 0)) {
+        if (CreatePipe(&stdin_read, &stdin_write_, &sa, 0) == 0) {
             Log::error("Failed to create stdin pipe");
             return false;
         }
@@ -283,8 +283,8 @@ private:
 
         // Create process (don't use CREATE_NO_WINDOW if verbose to see output)
         DWORD creation_flags = config_.verbose ? 0 : CREATE_NO_WINDOW;
-        if (!CreateProcessA(nullptr, const_cast<char*>(cmd.c_str()), nullptr, nullptr, TRUE,
-                            creation_flags, nullptr, nullptr, &si, &pi)) {
+        if (CreateProcessA(nullptr, const_cast<char*>(cmd.c_str()), nullptr, nullptr, TRUE,
+                           creation_flags, nullptr, nullptr, &si, &pi) == 0) {
             Log::error("Failed to start FFmpeg process (error code: {})", GetLastError());
             CloseHandle(stdin_read);
             CloseHandle(stdin_write_);

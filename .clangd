@@ -39,6 +39,7 @@ Diagnostics:
       - readability-identifier-length
       - readability-magic-numbers
       - bugprone-easily-swappable-parameters
+      - readability-function-cognitive-complexity
 
 Index:
   Background: Build

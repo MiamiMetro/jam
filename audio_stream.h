@@ -51,7 +51,7 @@ public:
         Pa_Terminate();
     }
 
-    static const void print_all_devices() {
+    static void print_all_devices() {
         int device_count = Pa_GetDeviceCount();
         if (device_count < 0) {
             Log::error("Pa_GetDeviceCount returned error: {}", Pa_GetErrorText(device_count));
