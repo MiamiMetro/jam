@@ -29,6 +29,7 @@
 #include "audio_analysis.h"
 #include "audio_packet.h"
 #include "audio_stream.h"
+#include "broadcast_hls.h"
 #include "imguiapp.h"
 #include "logger.h"
 #include "message_validator.h"
@@ -271,6 +272,23 @@ public:
         return audio_config_;
     }
 
+    // HLS Broadcasting controls
+    bool start_hls_broadcast(const HLSBroadcaster::Config& config = HLSBroadcaster::Config{}) {
+        return hls_broadcaster_.start(config);
+    }
+
+    void stop_hls_broadcast() {
+        hls_broadcaster_.stop();
+    }
+
+    bool is_hls_broadcasting() const {
+        return hls_broadcaster_.is_running();
+    }
+
+    HLSBroadcaster::Config get_hls_config() const {
+        return hls_broadcaster_.get_config();
+    }
+
     void on_receive(std::error_code error_code, std::size_t bytes) {
         if (error_code) {
             // std::cerr << "receive error: " << error_code.message() << "\n";
@@ -463,7 +481,7 @@ private:
             OpusPacket packet;
             packet.data.assign(audio_data, audio_data + encoded_bytes);
             packet.timestamp = std::chrono::steady_clock::now();
-            
+
             size_t queue_size = participant.opus_queue.size_approx();
             if (queue_size < 16) {
                 participant.opus_queue.enqueue(std::move(packet));
@@ -516,11 +534,8 @@ private:
             if (participant.opus_queue.try_dequeue(opus_packet)) {
                 // Decode into preallocated buffer (zero allocations)
                 int decoded_samples = participant.decoder->decode_into(
-                    opus_packet.data.data(),
-                    static_cast<int>(opus_packet.data.size()),
-                    participant.pcm_buffer.data(),
-                    static_cast<int>(frame_count)
-                );
+                    opus_packet.data.data(), static_cast<int>(opus_packet.data.size()),
+                    participant.pcm_buffer.data(), static_cast<int>(frame_count));
 
                 if (decoded_samples <= 0) {
                     // Decode failed - use silence
@@ -533,8 +548,8 @@ private:
                 }
 
                 // Calculate audio level (RMS) for voice activity detection
-                float rms = audio_analysis::calculate_rms(participant.pcm_buffer.data(), 
-                                                          decoded_samples);
+                float rms =
+                    audio_analysis::calculate_rms(participant.pcm_buffer.data(), decoded_samples);
                 participant.current_level = rms;
 
                 // Voice Activity Detection (simple threshold-based)
@@ -593,15 +608,22 @@ private:
         // Apply normalization if multiple participants to prevent clipping
         if (active_count > 1) {
             constexpr float HEADROOM = 0.5f;  // VoIP can use more headroom than broadcast
-            float gain = HEADROOM / static_cast<float>(active_count);
-            
+            float           gain     = HEADROOM / static_cast<float>(active_count);
+
             for (unsigned long i = 0; i < frame_count * out_channels; ++i) {
                 output_buffer[i] *= gain;
-                
+
                 // Soft clip (safety limiter)
-                if (output_buffer[i] > 1.0f) output_buffer[i] = 1.0f;
-                if (output_buffer[i] < -1.0f) output_buffer[i] = -1.0f;
+                if (output_buffer[i] > 1.0f)
+                    output_buffer[i] = 1.0f;
+                if (output_buffer[i] < -1.0f)
+                    output_buffer[i] = -1.0f;
             }
+        }
+
+        // Send mixed audio to HLS broadcaster if active (always send to maintain stream timing)
+        if (client->hls_broadcaster_.is_running()) {
+            client->hls_broadcaster_.write_audio(output_buffer, frame_count);
         }
 
         // Encode and send own audio (always send to maintain timing, even if silence)
@@ -655,6 +677,9 @@ private:
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
 
     ParticipantManager participant_manager_;
+
+    // HLS Broadcaster (optional, header-only, decoupled)
+    HLSBroadcaster hls_broadcaster_;
 
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
@@ -759,6 +784,44 @@ void DrawClientUI(Client& client) {
         ImGui::SameLine();
         if (ImGui::Button("Disable Broadcast")) {
             client.disable_broadcast();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("HLS Streaming:");
+        const bool is_streaming = client.is_hls_broadcasting();
+        if (is_streaming) {
+            ImGui::TextColored(ImVec4(0.0F, 1.0F, 0.0F, 1.0F), "Status: LIVE");
+            auto hls_config = client.get_hls_config();
+            ImGui::Text("  Playlist: %s/%s.m3u8", hls_config.output_path.c_str(),
+                        hls_config.playlist_name.c_str());
+            ImGui::Text("  %dHz, %dch, %d bps", hls_config.sample_rate, hls_config.channels,
+                        hls_config.bitrate);
+            if (ImGui::Button("Stop HLS Stream")) {
+                client.stop_hls_broadcast();
+            }
+        } else {
+            ImGui::TextColored(ImVec4(0.5F, 0.5F, 0.5F, 1.0F), "Status: Offline");
+            if (ImGui::Button("Start HLS Stream")) {
+                HLSBroadcaster::Config hls_config;
+                hls_config.sample_rate = cached_encoder_info.sample_rate;
+                hls_config.channels    = 1;      // Mono for broadcast
+                hls_config.bitrate     = 96000;  // 96 kbps AAC (low-latency optimized)
+                // Use absolute path to project root (not binary location)
+                hls_config.output_path      = "C:/Users/Berkay/Downloads/udpstuff/hls";
+                hls_config.playlist_name    = "stream";
+                hls_config.segment_duration = 0.5f;  // 500ms segments for low latency
+                hls_config.playlist_size    = 6;
+                hls_config.verbose          = true;  // Enable to see FFmpeg errors
+                hls_config.low_latency      = true;  // Enable low-latency mode (fMP4)
+
+                if (client.start_hls_broadcast(hls_config)) {
+                    Log::info("HLS streaming started successfully");
+                } else {
+                    Log::error("Failed to start HLS streaming");
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(needs FFmpeg)");
         }
 
         ImGui::Separator();
@@ -929,6 +992,7 @@ int main() {
         }
 
         // Clean up Client resources before exit
+        client_instance.stop_hls_broadcast();
         client_instance.stop_audio_stream();
         client_instance.stop_connection();
 
