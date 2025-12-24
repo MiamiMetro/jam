@@ -45,29 +45,35 @@ public:
     Client(asio::io_context& io_context, const std::string& server_address, short server_port)
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
+          selected_input_device_(paNoDevice),
+          selected_output_device_(paNoDevice),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
           cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
         Log::info("Client local port: {}", socket_.local_endpoint().port());
 
-        // Start audio stream with configuration
-        AudioStream::AudioConfig config;
-        config.sample_rate       = 48000;
-        config.bitrate           = 64000;
-        config.complexity        = 2;
-        config.frames_per_buffer = 240;
-        config.input_gain        = 1.0F;
-        config.output_gain       = 1.0F;
+        // Initialize audio config with defaults (but don't start stream yet)
+        audio_config_.sample_rate       = 48000;
+        audio_config_.bitrate           = 64000;
+        audio_config_.complexity        = 2;
+        audio_config_.frames_per_buffer = 240;
+        audio_config_.input_gain        = 1.0F;
+        audio_config_.output_gain       = 1.0F;
 
-        // Check audio stream initialization - fail gracefully if it fails
-        if (!start_audio_stream(17, 15, config)) {
-            Log::error("Failed to initialize audio stream - client will not function correctly");
-            // Note: audio_config_ is now set even if validation fails, but the stream won't work
-            // Remote audio decoding will fail gracefully with error messages
+        // Set default devices
+        selected_input_device_  = AudioStream::get_default_input_device();
+        selected_output_device_ = AudioStream::get_default_output_device();
+
+        // Initialize device info with default devices
+        if (selected_input_device_ != paNoDevice) {
+            set_input_device(selected_input_device_);
         }
+        if (selected_output_device_ != paNoDevice) {
+            set_output_device(selected_output_device_);
+        }
+
         AudioStream::print_all_devices();
-        // start_audio_stream(38, 40, config);
-        // Connect to server
+        // Connect to server (audio stream will be started manually via UI)
         start_connection(server_address, server_port);
     }
 
@@ -250,6 +256,77 @@ public:
         return audio_config_;
     }
 
+    // Device selection methods (removed - use AudioStream static methods directly)
+
+    PaDeviceIndex get_selected_input_device() const {
+        return selected_input_device_;
+    }
+
+    PaDeviceIndex get_selected_output_device() const {
+        return selected_output_device_;
+    }
+
+    bool set_input_device(PaDeviceIndex device_index) {
+        if (!AudioStream::is_device_valid(device_index)) {
+            Log::error("Invalid input device index: {}", device_index);
+            return false;
+        }
+        selected_input_device_ = device_index;
+
+        // Update device info for UI display
+        const auto* input_info = AudioStream::get_device_info(device_index);
+        if (input_info != nullptr) {
+            device_info_.input_device_name = input_info->name;
+            device_info_.input_api         = (Pa_GetHostApiInfo(input_info->hostApi) != nullptr)
+                                                 ? Pa_GetHostApiInfo(input_info->hostApi)->name
+                                                 : "Unknown";
+            device_info_.input_channels    = std::min(input_info->maxInputChannels, 1);
+            device_info_.input_sample_rate = input_info->defaultSampleRate;
+        }
+        return true;
+    }
+
+    bool set_output_device(PaDeviceIndex device_index) {
+        if (!AudioStream::is_device_valid(device_index)) {
+            Log::error("Invalid output device index: {}", device_index);
+            return false;
+        }
+        selected_output_device_ = device_index;
+
+        // Update device info for UI display
+        const auto* output_info = AudioStream::get_device_info(device_index);
+        if (output_info != nullptr) {
+            device_info_.output_device_name = output_info->name;
+            device_info_.output_api         = (Pa_GetHostApiInfo(output_info->hostApi) != nullptr)
+                                                  ? Pa_GetHostApiInfo(output_info->hostApi)->name
+                                                  : "Unknown";
+            device_info_.output_channels    = std::min(output_info->maxOutputChannels, 1);
+            device_info_.output_sample_rate = output_info->defaultSampleRate;
+        }
+        return true;
+    }
+
+    // Hot-swap audio devices (stops current stream and starts new one)
+    bool swap_audio_devices(PaDeviceIndex input_device, PaDeviceIndex output_device) {
+        bool was_active = audio_.is_stream_active();
+
+        // Stop current stream if active
+        if (was_active) {
+            stop_audio_stream();
+        }
+
+        // Update selected devices
+        selected_input_device_  = input_device;
+        selected_output_device_ = output_device;
+
+        // Start new stream if it was active before
+        if (was_active) {
+            return start_audio_stream(input_device, output_device, audio_config_);
+        }
+
+        return true;
+    }
+
     void on_receive(std::error_code error_code, std::size_t bytes) {
         if (error_code) {
             // std::cerr << "receive error: " << error_code.message() << "\n";
@@ -427,8 +504,14 @@ private:
                 return;
             }
 
+            // Get channel count - use 1 (mono) as default if stream isn't active
+            int channel_count = audio_.get_input_channel_count();
+            if (channel_count == 0) {
+                channel_count = 1;  // Default to mono for VoIP
+            }
+
             if (!participant_manager_.register_participant(sender_id, audio_config_.sample_rate,
-                                                           audio_.get_input_channel_count())) {
+                                                           channel_count)) {
                 return;
             }
         }
@@ -650,6 +733,10 @@ private:
     DeviceInfo  device_info_;
     EncoderInfo encoder_info_;
 
+    // Selected devices (for UI)
+    PaDeviceIndex selected_input_device_;
+    PaDeviceIndex selected_output_device_;
+
     PeriodicTimer ping_timer_;
     PeriodicTimer alive_timer_;
     PeriodicTimer cleanup_timer_;
@@ -737,6 +824,222 @@ void DrawClientUI(Client& client) {
 
         ImGui::Separator();
         ImGui::Text("Audio Devices:");
+
+        // Pending device selections (shared between collapsible and start button)
+        static PaDeviceIndex pending_input_device  = paNoDevice;
+        static PaDeviceIndex pending_output_device = paNoDevice;
+
+        // Device selection UI
+        if (ImGui::CollapsingHeader("Device Selection")) {
+            // Get device lists (cache them, refresh periodically)
+            static std::vector<AudioStream::DeviceInfo> input_devices;
+            static std::vector<AudioStream::DeviceInfo> output_devices;
+            static std::vector<AudioStream::ApiInfo>    apis;
+
+            static int           device_refresh_counter  = 0;
+            static constexpr int DEVICE_REFRESH_INTERVAL = 60;  // Refresh every second at 60 FPS
+            static int           selected_api_idx        = -1;  // -1 means "All APIs"
+
+            if (device_refresh_counter % DEVICE_REFRESH_INTERVAL == 0) {
+                input_devices  = AudioStream::get_input_devices();
+                output_devices = AudioStream::get_output_devices();
+                apis           = AudioStream::get_apis();
+            }
+            device_refresh_counter++;
+
+            // Initialize pending devices with current selections
+            if (pending_input_device == paNoDevice) {
+                pending_input_device = client.get_selected_input_device();
+            }
+            if (pending_output_device == paNoDevice) {
+                pending_output_device = client.get_selected_output_device();
+            }
+
+            // Single API filter (applies to both input and output)
+            ImGui::Text("API Filter:");
+            std::string api_preview =
+                (selected_api_idx >= 0 && selected_api_idx < static_cast<int>(apis.size()))
+                    ? apis[selected_api_idx].name
+                    : "All APIs";
+            if (ImGui::BeginCombo("##API", api_preview.c_str())) {
+                if (ImGui::Selectable("All APIs", selected_api_idx == -1)) {
+                    selected_api_idx = -1;
+                }
+                for (size_t i = 0; i < apis.size(); ++i) {
+                    bool is_selected = (selected_api_idx == static_cast<int>(i));
+                    if (ImGui::Selectable(apis[i].name.c_str(), is_selected)) {
+                        selected_api_idx = static_cast<int>(i);
+                    }
+                    if (is_selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::Spacing();
+
+            // Input device selection (filtered by API if selected)
+            ImGui::Text("Input Device:");
+            std::vector<size_t> filtered_input_indices;
+            for (size_t i = 0; i < input_devices.size(); ++i) {
+                if (selected_api_idx < 0 ||
+                    (selected_api_idx < static_cast<int>(apis.size()) &&
+                     input_devices[i].api_name == apis[selected_api_idx].name)) {
+                    filtered_input_indices.push_back(i);
+                }
+            }
+
+            std::string input_preview = "Select Input Device";
+            if (pending_input_device != paNoDevice) {
+                for (size_t i = 0; i < input_devices.size(); ++i) {
+                    if (input_devices[i].index == pending_input_device) {
+                        input_preview =
+                            input_devices[i].name + " (" + input_devices[i].api_name + ")";
+                        break;
+                    }
+                }
+            }
+
+            if (ImGui::BeginCombo("##InputDevice", input_preview.c_str())) {
+                for (size_t filtered_idx: filtered_input_indices) {
+                    size_t      i           = filtered_idx;
+                    bool        is_selected = (input_devices[i].index == pending_input_device);
+                    std::string label =
+                        input_devices[i].name + " (" + input_devices[i].api_name + ")";
+                    if (ImGui::Selectable(label.c_str(), is_selected)) {
+                        pending_input_device = input_devices[i].index;
+                    }
+                    if (is_selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::Spacing();
+
+            // Output device selection (filtered by API if selected)
+            ImGui::Text("Output Device:");
+            std::vector<size_t> filtered_output_indices;
+            for (size_t i = 0; i < output_devices.size(); ++i) {
+                if (selected_api_idx < 0 ||
+                    (selected_api_idx < static_cast<int>(apis.size()) &&
+                     output_devices[i].api_name == apis[selected_api_idx].name)) {
+                    filtered_output_indices.push_back(i);
+                }
+            }
+
+            std::string output_preview = "Select Output Device";
+            if (pending_output_device != paNoDevice) {
+                for (size_t i = 0; i < output_devices.size(); ++i) {
+                    if (output_devices[i].index == pending_output_device) {
+                        output_preview =
+                            output_devices[i].name + " (" + output_devices[i].api_name + ")";
+                        break;
+                    }
+                }
+            }
+
+            if (ImGui::BeginCombo("##OutputDevice", output_preview.c_str())) {
+                for (size_t filtered_idx: filtered_output_indices) {
+                    size_t      i           = filtered_idx;
+                    bool        is_selected = (output_devices[i].index == pending_output_device);
+                    std::string label =
+                        output_devices[i].name + " (" + output_devices[i].api_name + ")";
+                    if (ImGui::Selectable(label.c_str(), is_selected)) {
+                        pending_output_device = output_devices[i].index;
+                    }
+                    if (is_selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::Spacing();
+
+            // Set Defaults button
+            if (ImGui::Button("Set Defaults")) {
+                PaDeviceIndex default_input  = AudioStream::get_default_input_device();
+                PaDeviceIndex default_output = AudioStream::get_default_output_device();
+
+                if (default_input != paNoDevice) {
+                    pending_input_device = default_input;
+                }
+                if (default_output != paNoDevice) {
+                    pending_output_device = default_output;
+                }
+            }
+
+            ImGui::SameLine();
+
+            // Apply button
+            bool can_apply =
+                (pending_input_device != paNoDevice && pending_output_device != paNoDevice);
+            if (!can_apply) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Apply Devices")) {
+                bool was_active = client.is_audio_stream_active();
+
+                // Stop current stream if active
+                if (was_active) {
+                    client.stop_audio_stream();
+                }
+
+                // Apply device changes
+                client.set_input_device(pending_input_device);
+                client.set_output_device(pending_output_device);
+
+                // Restart stream if it was active
+                if (was_active) {
+                    AudioStream::AudioConfig config = client.get_audio_config();
+                    if (!client.start_audio_stream(pending_input_device, pending_output_device,
+                                                   config)) {
+                        Log::error("Failed to restart audio stream with new devices");
+                    }
+                }
+            }
+            if (!can_apply) {
+                ImGui::EndDisabled();
+            }
+        }
+
+        // Start/Stop audio stream button (outside collapsible)
+        ImGui::Spacing();
+        bool is_active = client.is_audio_stream_active();
+        if (!is_active) {
+            if (ImGui::Button("Start Audio Stream")) {
+                // Initialize pending devices if not set
+                if (pending_input_device == paNoDevice) {
+                    pending_input_device = client.get_selected_input_device();
+                }
+                if (pending_output_device == paNoDevice) {
+                    pending_output_device = client.get_selected_output_device();
+                }
+
+                if (pending_input_device != paNoDevice && pending_output_device != paNoDevice) {
+                    // Apply devices first
+                    client.set_input_device(pending_input_device);
+                    client.set_output_device(pending_output_device);
+
+                    AudioStream::AudioConfig config = client.get_audio_config();
+                    if (!client.start_audio_stream(pending_input_device, pending_output_device,
+                                                   config)) {
+                        Log::error("Failed to start audio stream");
+                    }
+                } else {
+                    Log::error("Please select both input and output devices");
+                }
+            }
+        } else {
+            if (ImGui::Button("Stop Audio Stream")) {
+                client.stop_audio_stream();
+            }
+        }
+
+        // Display current device info
         if (ImGui::BeginTable("AudioDevices", 2, ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();

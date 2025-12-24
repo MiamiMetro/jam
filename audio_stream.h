@@ -89,6 +89,99 @@ public:
                Pa_GetDeviceInfo(device_index) != nullptr;
     }
 
+    struct DeviceInfo {
+        int         index;
+        std::string name;
+        std::string api_name;
+        int         max_input_channels;
+        int         max_output_channels;
+        double      default_sample_rate;
+    };
+
+    struct ApiInfo {
+        int           index;
+        std::string   name;
+        PaDeviceIndex default_input_device;
+        PaDeviceIndex default_output_device;
+    };
+
+    static std::vector<DeviceInfo> get_input_devices() {
+        std::vector<DeviceInfo> devices;
+        int                     device_count = Pa_GetDeviceCount();
+        if (device_count < 0) {
+            return devices;
+        }
+
+        for (int i = 0; i < device_count; ++i) {
+            const PaDeviceInfo* device_info = Pa_GetDeviceInfo(i);
+            if (device_info != nullptr && device_info->maxInputChannels > 0) {
+                DeviceInfo info;
+                info.index                    = i;
+                info.name                     = device_info->name;
+                info.max_input_channels       = device_info->maxInputChannels;
+                info.max_output_channels      = device_info->maxOutputChannels;
+                info.default_sample_rate      = device_info->defaultSampleRate;
+                const PaHostApiInfo* api_info = Pa_GetHostApiInfo(device_info->hostApi);
+                info.api_name                 = (api_info != nullptr) ? api_info->name : "Unknown";
+                devices.push_back(info);
+            }
+        }
+        return devices;
+    }
+
+    static std::vector<DeviceInfo> get_output_devices() {
+        std::vector<DeviceInfo> devices;
+        int                     device_count = Pa_GetDeviceCount();
+        if (device_count < 0) {
+            return devices;
+        }
+
+        for (int i = 0; i < device_count; ++i) {
+            const PaDeviceInfo* device_info = Pa_GetDeviceInfo(i);
+            if (device_info != nullptr && device_info->maxOutputChannels > 0) {
+                DeviceInfo info;
+                info.index                    = i;
+                info.name                     = device_info->name;
+                info.max_input_channels       = device_info->maxInputChannels;
+                info.max_output_channels      = device_info->maxOutputChannels;
+                info.default_sample_rate      = device_info->defaultSampleRate;
+                const PaHostApiInfo* api_info = Pa_GetHostApiInfo(device_info->hostApi);
+                info.api_name                 = (api_info != nullptr) ? api_info->name : "Unknown";
+                devices.push_back(info);
+            }
+        }
+        return devices;
+    }
+
+    static std::vector<ApiInfo> get_apis() {
+        std::vector<ApiInfo> apis;
+        int                  api_count = Pa_GetHostApiCount();
+        if (api_count < 0) {
+            return apis;
+        }
+
+        for (int i = 0; i < api_count; ++i) {
+            const PaHostApiInfo* api_info = Pa_GetHostApiInfo(i);
+            if (api_info != nullptr) {
+                ApiInfo info;
+                info.index                 = i;
+                info.name                  = api_info->name;
+                info.default_input_device  = api_info->defaultInputDevice;
+                info.default_output_device = api_info->defaultOutputDevice;
+                apis.push_back(info);
+            }
+        }
+        return apis;
+    }
+
+    static PaDeviceIndex get_default_input_device() {
+        return Pa_GetDefaultInputDevice();
+    }
+
+    static PaDeviceIndex get_default_output_device() {
+        return Pa_GetDefaultOutputDevice();
+    }
+
     static void print_device_info(const PaDeviceInfo* input_info, const PaDeviceInfo* output_info) {
         Log::info("Input Device: {} | API: {} | Max Input Channels: {} | Default Sample Rate: {}",
                   input_info->name,
