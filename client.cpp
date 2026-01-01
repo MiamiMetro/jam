@@ -217,6 +217,15 @@ public:
         return own_audio_level_.load();
     }
 
+    // Microphone mute control
+    void set_mic_muted(bool muted) {
+        mic_muted_.store(muted, std::memory_order_release);
+    }
+
+    bool get_mic_muted() const {
+        return mic_muted_.load(std::memory_order_acquire);
+    }
+
     // Device and encoder info structure
     struct DeviceInfo {
         std::string input_device_name;
@@ -775,9 +784,9 @@ private:
                 }
                 // Note: If wav_frames_read < frame_count, remaining frames stay as 0.0F (silence)
                 
-                // Mix microphone input if available
-                if (input_buffer != nullptr) {
-                    // Mix mic with WAV (average mixing)
+                // Mix microphone input if available and not muted
+                if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
+                    // Mix mic with WAV (average mixing to prevent clipping)
                     for (unsigned long i = 0; i < frame_count; ++i) {
                         mixed_input[i] = (mixed_input[i] + input_buffer[i]) * 0.5F;
                     }
@@ -785,7 +794,13 @@ private:
                     float rms = audio_analysis::calculate_rms(mixed_input.data(), static_cast<int>(frame_count));
                     client->own_audio_level_.store(rms);
                 } else {
-                    // No mic, just WAV (remaining frames are already zero from initialization)
+                    // No mic or mic muted - apply same scaling to WAV for consistent volume
+                    // When mixing with mic we use 0.5F, so apply 0.5F here too to keep WAV volume consistent
+                    constexpr float MIX_SCALE = 0.5F;
+                    for (unsigned long i = 0; i < frame_count; ++i) {
+                        mixed_input[i] *= MIX_SCALE;
+                    }
+                    // Calculate RMS for own audio level (from WAV signal)
                     float rms = audio_analysis::calculate_rms(mixed_input.data(), static_cast<int>(frame_count));
                     client->own_audio_level_.store(rms);
                 }
@@ -796,7 +811,7 @@ private:
             } else {
                 // No WAV active - use original behavior (mic only or silence)
                 // This branch preserves exact backward compatibility when WAV is not in use
-                if (input_buffer != nullptr) {
+                if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
                     // Calculate RMS for own audio level
                     float rms = audio_analysis::calculate_rms(input_buffer, frame_count);
                     client->own_audio_level_.store(rms);
@@ -813,7 +828,7 @@ private:
                             input_buffer, static_cast<int>(frame_count), encoded_data);
                     }
                 } else {
-                    // No input device - encode silence to maintain timing
+                    // Mic muted or no input device - encode silence to maintain timing
                     std::vector<float> silence_frame(frame_count, 0.0F);
                     encode_success = client->audio_encoder_.encode(
                         silence_frame.data(), static_cast<int>(frame_count), encoded_data);
@@ -848,6 +863,9 @@ private:
     // WAV playback volume/gain (thread-safe with atomic)
     std::atomic<float> wav_gain_{1.0F};  // Default to 100% volume
     std::atomic<bool>  wav_muted_local_{false};  // Mute locally (still sends over network)
+
+    // Microphone mute (thread-safe with atomic)
+    std::atomic<bool> mic_muted_{false};  // Mute mic (doesn't send to server)
 
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
@@ -1317,6 +1335,17 @@ void DrawClientUI(Client& client) {
                 ImGui::TextColored(speaking_color, " [Speaking]");
             }
             ImGui::EndTable();
+        }
+        
+        // Microphone mute button
+        ImGui::Spacing();
+        bool mic_muted = client.get_mic_muted();
+        if (ImGui::Checkbox("Mute Microphone", &mic_muted)) {
+            client.set_mic_muted(mic_muted);
+        }
+        if (mic_muted) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0F, 0.0F, 0.0F, 1.0F), "[MICROPHONE MUTED]");
         }
 
         ImGui::Separator();
