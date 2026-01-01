@@ -36,6 +36,7 @@
 #include "participant_manager.h"
 #include "periodic_timer.h"
 #include "protocol.h"
+#include "wav_file_playback.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -254,6 +255,63 @@ public:
 
     AudioStream::AudioConfig get_audio_config() const {
         return audio_config_;
+    }
+
+    // WAV file playback methods
+    bool load_wav_file(const std::string& path) {
+        return wav_playback_.load_file(path);
+    }
+
+    void wav_play() {
+        wav_playback_.play();
+    }
+
+    void wav_pause() {
+        wav_playback_.pause();
+    }
+
+    void wav_seek(int64_t frame_position) {
+        wav_playback_.seek(frame_position);
+    }
+
+    struct WavState {
+        bool    is_loaded;
+        bool    is_playing;
+        int64_t position;
+        int64_t total_frames;
+        int     sample_rate;
+        int     channels;
+        float   gain;
+        bool    muted_local;  // Muted locally (still sends over network)
+    };
+
+    void set_wav_gain(float gain) {
+        wav_gain_.store(std::max(0.0F, std::min(2.0F, gain)), std::memory_order_release);
+    }
+
+    float get_wav_gain() const {
+        return wav_gain_.load(std::memory_order_acquire);
+    }
+
+    void set_wav_muted_local(bool muted) {
+        wav_muted_local_.store(muted, std::memory_order_release);
+    }
+
+    bool get_wav_muted_local() const {
+        return wav_muted_local_.load(std::memory_order_acquire);
+    }
+
+    WavState get_wav_state() const {
+        WavState state{};
+        state.is_loaded    = wav_playback_.is_loaded();
+        state.is_playing   = wav_playback_.is_playing();
+        state.position     = wav_playback_.get_position();
+        state.total_frames = wav_playback_.get_total_frames();
+        state.sample_rate  = wav_playback_.get_sample_rate();
+        state.channels     = wav_playback_.get_channels();
+        state.gain         = wav_gain_.load(std::memory_order_acquire);
+        state.muted_local  = wav_muted_local_.load(std::memory_order_acquire);
+        return state;
     }
 
     // Device selection methods (removed - use AudioStream static methods directly)
@@ -657,7 +715,35 @@ private:
             }
         });
 
-        // Apply normalization if multiple participants to prevent clipping
+        // Mix WAV file audio for local output (if loaded and playing)
+        // WAV and mic are completely independent - WAV can work without mic, mic can work without WAV
+        std::array<float, 240> wav_buffer{};  // Maximum frame_count is 240
+        int                    wav_frames_read = 0;
+        bool                   wav_active      = false;
+
+        if (client->wav_playback_.is_loaded() && client->wav_playback_.is_playing()) {
+            wav_frames_read = client->wav_playback_.read(wav_buffer.data(), static_cast<int>(frame_count),
+                                                          client->audio_config_.sample_rate);
+            if (wav_frames_read > 0) {
+                wav_active = true;  // Only set active if we actually read frames (handles EOF case)
+                
+                // Mix WAV into local output buffer only if not muted locally
+                if (!client->wav_muted_local_.load(std::memory_order_acquire)) {
+                    float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
+                    if (out_channels == 1) {
+                        audio_analysis::mix_with_gain(output_buffer, wav_buffer.data(), wav_frames_read, wav_gain);
+                    } else {
+                        // Stereo output - duplicate mono WAV to both channels
+                        audio_analysis::mix_mono_to_stereo(output_buffer, wav_buffer.data(), wav_frames_read,
+                                                            out_channels, wav_gain);
+                    }
+                    active_count++;
+                }
+                // Note: WAV is still sent over network even if muted locally (handled in encoding section)
+            }
+        }
+
+        // Apply normalization if multiple sources to prevent clipping
         if (active_count > 1) {
             constexpr float HEADROOM = 0.5F;  // VoIP can use more headroom than broadcast
             float           gain     = HEADROOM / static_cast<float>(active_count);
@@ -672,31 +758,66 @@ private:
         }
 
         // Encode and send own audio (always send to maintain timing, even if silence)
+        // Mix WAV with microphone input before encoding
         if (client->audio_encoder_.is_initialized() && client->audio_.is_stream_active()) {
             std::vector<unsigned char> encoded_data;
             bool                       encode_success = false;
 
-            if (input_buffer != nullptr) {
-                // Calculate RMS for own audio level
-                float rms = audio_analysis::calculate_rms(input_buffer, frame_count);
-                client->own_audio_level_.store(rms);
+            // Prepare mixed input buffer (WAV + mic)
+            std::array<float, 240> mixed_input{};  // Maximum frame_count is 240
 
-                // Check if input is silence
-                if (audio_analysis::is_silence(input_buffer, frame_count)) {
-                    // Encode silence to maintain packet timing
+            if (wav_active && wav_frames_read > 0) {
+                // Copy WAV data first and apply gain
+                // mixed_input is already zero-initialized, so any remaining frames are silence
+                float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
+                for (int i = 0; i < wav_frames_read; ++i) {
+                    mixed_input[i] = wav_buffer[i] * wav_gain;
+                }
+                // Note: If wav_frames_read < frame_count, remaining frames stay as 0.0F (silence)
+                
+                // Mix microphone input if available
+                if (input_buffer != nullptr) {
+                    // Mix mic with WAV (average mixing)
+                    for (unsigned long i = 0; i < frame_count; ++i) {
+                        mixed_input[i] = (mixed_input[i] + input_buffer[i]) * 0.5F;
+                    }
+                    // Calculate RMS for own audio level (from mixed signal)
+                    float rms = audio_analysis::calculate_rms(mixed_input.data(), static_cast<int>(frame_count));
+                    client->own_audio_level_.store(rms);
+                } else {
+                    // No mic, just WAV (remaining frames are already zero from initialization)
+                    float rms = audio_analysis::calculate_rms(mixed_input.data(), static_cast<int>(frame_count));
+                    client->own_audio_level_.store(rms);
+                }
+                
+                // Encode mixed audio (WAV + optional mic, or just WAV)
+                encode_success = client->audio_encoder_.encode(mixed_input.data(), static_cast<int>(frame_count),
+                                                               encoded_data);
+            } else {
+                // No WAV active - use original behavior (mic only or silence)
+                // This branch preserves exact backward compatibility when WAV is not in use
+                if (input_buffer != nullptr) {
+                    // Calculate RMS for own audio level
+                    float rms = audio_analysis::calculate_rms(input_buffer, frame_count);
+                    client->own_audio_level_.store(rms);
+
+                    // Check if input is silence
+                    if (audio_analysis::is_silence(input_buffer, frame_count)) {
+                        // Encode silence to maintain packet timing
+                        std::vector<float> silence_frame(frame_count, 0.0F);
+                        encode_success = client->audio_encoder_.encode(
+                            silence_frame.data(), static_cast<int>(frame_count), encoded_data);
+                    } else {
+                        // Encode actual audio
+                        encode_success = client->audio_encoder_.encode(
+                            input_buffer, static_cast<int>(frame_count), encoded_data);
+                    }
+                } else {
+                    // No input device - encode silence to maintain timing
                     std::vector<float> silence_frame(frame_count, 0.0F);
                     encode_success = client->audio_encoder_.encode(
                         silence_frame.data(), static_cast<int>(frame_count), encoded_data);
-                } else {
-                    // Encode actual audio
-                    encode_success = client->audio_encoder_.encode(
-                        input_buffer, static_cast<int>(frame_count), encoded_data);
                 }
-            } else {
-                // No input device - encode silence to maintain timing
-                std::vector<float> silence_frame(frame_count, 0.0F);
-                encode_success = client->audio_encoder_.encode(
-                    silence_frame.data(), static_cast<int>(frame_count), encoded_data);
             }
 
             // Send packet if encoding succeeded
@@ -722,6 +843,11 @@ private:
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
 
     ParticipantManager participant_manager_;
+    WavFilePlayback    wav_playback_;
+
+    // WAV playback volume/gain (thread-safe with atomic)
+    std::atomic<float> wav_gain_{1.0F};  // Default to 100% volume
+    std::atomic<bool>  wav_muted_local_{false};  // Mute locally (still sends over network)
 
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
@@ -1081,6 +1207,96 @@ void DrawClientUI(Client& client) {
             ImGui::EndTable();
         }
 
+        ImGui::Separator();
+        ImGui::Text("WAV File Playback:");
+        
+        // Cache WAV state (update every frame for responsive UI)
+        static Client::WavState cached_wav_state;
+        cached_wav_state = client.get_wav_state();
+        
+        // File path input
+        static char wav_file_path[512] = "";
+        ImGui::InputText("File Path", wav_file_path, sizeof(wav_file_path));
+        ImGui::SameLine();
+        if (ImGui::Button("Load")) {
+            if (strlen(wav_file_path) > 0) {
+                if (client.load_wav_file(wav_file_path)) {
+                    Log::info("WAV file loaded: {}", wav_file_path);
+                } else {
+                    Log::error("Failed to load WAV file: {}", wav_file_path);
+                }
+            }
+        }
+        
+        if (cached_wav_state.is_loaded) {
+            // Playback controls
+            if (cached_wav_state.is_playing) {
+                if (ImGui::Button("Pause")) {
+                    client.wav_pause();
+                }
+            } else {
+                if (ImGui::Button("Play")) {
+                    client.wav_play();
+                }
+            }
+            
+            ImGui::SameLine();
+            
+            // Progress bar and seek
+            float progress = 0.0F;
+            if (cached_wav_state.total_frames > 0) {
+                progress = static_cast<float>(cached_wav_state.position) /
+                          static_cast<float>(cached_wav_state.total_frames);
+            }
+            
+            // Display current position / total
+            char progress_text[64];
+            std::snprintf(progress_text, sizeof(progress_text), "%lld / %lld frames",
+                         static_cast<long long>(cached_wav_state.position),
+                         static_cast<long long>(cached_wav_state.total_frames));
+            ImGui::Text("%s", progress_text);
+            
+            // Seek slider (only when paused - boundary discipline)
+            if (!cached_wav_state.is_playing) {
+                float seek_pos_float = static_cast<float>(cached_wav_state.position);
+                float max_pos_float  = static_cast<float>(cached_wav_state.total_frames);
+                if (ImGui::SliderFloat("Seek", &seek_pos_float, 0.0F, max_pos_float, "%.0f")) {
+                    int64_t seek_position = static_cast<int64_t>(seek_pos_float);
+                    client.wav_seek(seek_position);
+                }
+            } else {
+                // Show progress bar when playing (non-interactive)
+                ImGui::ProgressBar(progress, ImVec2(-1, 0), "");
+            }
+            
+            // Volume/Gain control
+            float wav_gain = cached_wav_state.gain;
+            if (ImGui::SliderFloat("Volume", &wav_gain, 0.0F, 2.0F, "%.2f")) {
+                client.set_wav_gain(wav_gain);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset")) {
+                client.set_wav_gain(1.0F);
+            }
+            
+            // Mute locally button (still sends over network)
+            bool muted_local = cached_wav_state.muted_local;
+            if (ImGui::Checkbox("Mute Locally", &muted_local)) {
+                client.set_wav_muted_local(muted_local);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(?)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Mutes WAV file in your headphones/speakers, but still sends it to others over the network");
+            }
+            
+            // File info
+            ImGui::Text("Sample Rate: %d Hz | Channels: %d", cached_wav_state.sample_rate,
+                       cached_wav_state.channels);
+        } else {
+            ImGui::Text("No WAV file loaded");
+        }
+        
         ImGui::Separator();
         if (ImGui::BeginTable("NetworkYou", 2, ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextRow();
