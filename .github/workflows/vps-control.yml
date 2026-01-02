@@ -12,13 +12,9 @@ on:
         default: "rebuild"
         type: choice
         options:
-          - rebuild     # Incremental build + restart
-          - build       # Just build (no restart)
-          - start       # Start service
-          - stop        # Stop service
-          - restart     # Restart service (no build)
-          - clean_build # Delete build + full rebuild
-          - logs        # Show logs
+          - build
+          - rebuild
+          - clean_build
 
 jobs:
   deploy:
@@ -28,29 +24,30 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # --- Incremental file sync (preserves build directory) ---
       - name: Sync source files to VPS
         uses: burnett01/rsync-deployments@5.2
         with:
-          switches: -avz --delete --exclude 'build/' --exclude '.git/' --exclude '.github/' --exclude '.gitignore'
+          switches: -avz --delete \
+            --exclude 'build/' \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.gitignore'
           path: ./
-          remote_path: /root/jam
+          remote_path: /home/ops/jam
           remote_host: ${{ secrets.VPS_HOST }}
-          remote_user: ${{ secrets.VPS_USER }}
+          remote_user: ops
           remote_key: ${{ secrets.VPS_KEY }}
 
-      # --- Execute command on VPS ---
-      - name: Execute action on VPS
+      - name: Build / Deploy on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
+          username: ops
           key: ${{ secrets.VPS_KEY }}
           script: |
             set -e
-            cd /root/jam
+            cd /home/ops/jam
 
-            # Determine action
             if [ "${{ github.event_name }}" = "push" ]; then
               ACTION="rebuild"
             else
@@ -58,58 +55,42 @@ jobs:
             fi
 
             case "$ACTION" in
-              stop)
-                systemctl stop jam_server.service || true
-                ;;
-
-              start)
-                systemctl start jam_server.service
-                systemctl status jam_server.service --no-pager || true
-                ;;
-
-              restart)
-                systemctl restart jam_server.service
-                systemctl status jam_server.service --no-pager || true
-                ;;
-
               build)
                 mkdir -p build
                 cd build
                 if [ ! -f CMakeCache.txt ]; then
-                  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                  cmake .. \
+                    -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_FETCHCONTENT_BASE_DIR=/home/ops/.cmake_deps
                 fi
                 cmake --build . --target server --parallel $(nproc)
                 ;;
 
               rebuild)
-                systemctl stop jam_server.service || true
+                sudo systemctl stop jam_server.service || true
                 mkdir -p build
                 cd build
                 if [ ! -f CMakeCache.txt ]; then
-                  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                  cmake .. \
+                    -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_FETCHCONTENT_BASE_DIR=/home/ops/.cmake_deps
                 fi
                 cmake --build . --target server --parallel $(nproc)
                 cd ..
-                systemctl start jam_server.service
-                systemctl status jam_server.service --no-pager || true
+                sudo systemctl start jam_server.service
                 ;;
 
               clean_build)
-                systemctl stop jam_server.service || true
+                sudo systemctl stop jam_server.service || true
                 rm -rf build
                 mkdir -p build
                 cd build
-                cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_FETCHCONTENT_BASE_DIR=/root/.cmake_deps
+                cmake .. \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_FETCHCONTENT_BASE_DIR=/home/ops/.cmake_deps
                 cmake --build . --target server --parallel $(nproc)
                 cd ..
-                systemctl start jam_server.service
-                systemctl status jam_server.service --no-pager || true
-                ;;
-
-              logs)
-                systemctl status jam_server.service --no-pager || true
-                echo "---"
-                journalctl -u jam_server.service -n 50 --no-pager || true
+                sudo systemctl start jam_server.service
                 ;;
 
               *)
@@ -117,9 +98,3 @@ jobs:
                 exit 1
                 ;;
             esac
-
-            # Show recent logs after build/restart actions
-            if [ "$ACTION" = "rebuild" ] || [ "$ACTION" = "clean_build" ] || [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
-              echo "---"
-              journalctl -u jam_server.service -n 10 --no-pager || true
-            fi
