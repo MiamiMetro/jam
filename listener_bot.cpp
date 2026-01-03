@@ -388,24 +388,74 @@ private:
                             participant_id, decoded_samples, expected_samples);
                     }
                 }
-            } else {
-                // Underrun - failed to dequeue
+
+                // Adaptive jitter buffer: track queue size history and adjust minimum
                 size_t current_queue_size = participant.opus_queue.size_approx();
+                participant.queue_size_history[participant.history_index] = current_queue_size;
+                participant.history_index =
+                    (participant.history_index + 1) % participant.queue_size_history.size();
+
+                // Calculate average queue size over history window
+                size_t total = 0;
+                for (size_t qs: participant.queue_size_history) {
+                    total += qs;
+                }
+                size_t avg_queue_size = total / participant.queue_size_history.size();
+
+                // Adaptive adjustment
+                constexpr size_t MAX_JITTER_BUFFER_PACKETS = 5;
+                if (avg_queue_size < 2 &&
+                    participant.jitter_buffer_min_packets < MAX_JITTER_BUFFER_PACKETS) {
+                    participant.jitter_buffer_min_packets++;
+                    Log::debug("Participant {} jitter buffer increased to {} (avg queue: {})",
+                               participant_id, participant.jitter_buffer_min_packets,
+                               avg_queue_size);
+                } else if (avg_queue_size > 4 &&
+                           participant.jitter_buffer_min_packets > MIN_JITTER_BUFFER_PACKETS) {
+                    participant.jitter_buffer_min_packets--;
+                    Log::debug("Participant {} jitter buffer decreased to {} (avg queue: {})",
+                               participant_id, participant.jitter_buffer_min_packets,
+                               avg_queue_size);
+                }
+            } else {
+                // Underrun - use PLC instead of silence for smoother audio
+                size_t current_queue_size = participant.opus_queue.size_approx();
+
+                // Use Opus PLC to generate concealment audio
+                int plc_samples = participant.decoder->decode_plc(participant.pcm_buffer.data(),
+                                                                  static_cast<int>(frame_count));
+
+                if (plc_samples > 0) {
+                    // Mix PLC output (same as normal decode path)
+                    size_t expected_samples = frame_count * out_channels;
+                    if (static_cast<size_t>(plc_samples) == expected_samples) {
+                        audio_analysis::mix_with_gain(output, participant.pcm_buffer.data(),
+                                                      plc_samples, participant.gain);
+                    } else if (static_cast<size_t>(plc_samples) == frame_count) {
+                        if (out_channels == 1) {
+                            audio_analysis::mix_with_gain(output, participant.pcm_buffer.data(),
+                                                          frame_count, participant.gain);
+                        } else {
+                            audio_analysis::mix_mono_to_stereo(
+                                output, participant.pcm_buffer.data(), frame_count, out_channels,
+                                participant.gain);
+                        }
+                    }
+                    participant.plc_count++;
+                }
+
+                // Handle rebuffering state (reduced logging - PLC handles gaps silently)
                 if (current_queue_size == 0 && participant.buffer_ready) {
                     participant.buffer_ready = false;
-                    Log::warn(
-                        "Jitter buffer underrun for participant {}! Rebuffering... (queue: {} "
-                        "packets)",
-                        participant_id, current_queue_size);
-                } else if (participant.buffer_ready) {
-                    // Log underrun with queue size info
-                    if (++participant.underrun_count % 20 == 0) {
-                        Log::warn(
-                            "Jitter buffer underrun for participant {} (queue: {} packets, min: "
-                            "{})",
-                            participant_id, current_queue_size,
-                            participant.jitter_buffer_min_packets);
+                    participant.underrun_count++;
+                    // Only log first rebuffer or every 10th to reduce noise
+                    if (participant.underrun_count == 1 || participant.underrun_count % 10 == 0) {
+                        Log::info("Participant {} rebuffering (underruns: {}, PLC: {})",
+                                  participant_id, participant.underrun_count,
+                                  participant.plc_count);
                     }
+                } else if (participant.buffer_ready) {
+                    participant.underrun_count++;
                 }
             }
         });
@@ -553,7 +603,19 @@ private:
             }
 
             size_t queue_size = participant.opus_queue.size_approx();
-            if (queue_size < 16) {
+
+            // Adaptive queue management: drop old packets if queue is too large
+            // This keeps latency bounded to TARGET_OPUS_QUEUE_SIZE + 2 packets
+            while (queue_size > TARGET_OPUS_QUEUE_SIZE + 2) {
+                OpusPacket discarded;
+                if (participant.opus_queue.try_dequeue(discarded)) {
+                    queue_size--;
+                } else {
+                    break;
+                }
+            }
+
+            if (queue_size < MAX_OPUS_QUEUE_SIZE) {
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 participant.last_packet_time = packet.timestamp;
 
@@ -565,7 +627,7 @@ private:
                               queue_size);
                 }
             } else {
-                // Buffer overflow - drop oldest packet
+                // Buffer overflow - drop oldest packet (safety limit)
                 OpusPacket discarded;
                 participant.opus_queue.try_dequeue(discarded);
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable

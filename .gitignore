@@ -3,6 +3,7 @@ out
 cmake-build-*/
 .vscode
 .vscode-test
+.cursor
 .idea
 node_modules
 .cache

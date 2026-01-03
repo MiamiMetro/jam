@@ -84,6 +84,7 @@ public:
             info.buffer_ready   = data.buffer_ready;
             info.queue_size     = data.opus_queue.size_approx();
             info.underrun_count = data.underrun_count;
+            info.plc_count      = data.plc_count;
             result.push_back(info);
         }
 

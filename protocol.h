@@ -12,6 +12,11 @@ constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
 // Buffer sizes
 constexpr size_t AUDIO_BUF_SIZE = 512;
 
+// Jitter buffer configuration (CLIENT/LISTENER ONLY - server just relays packets)
+constexpr size_t MAX_OPUS_QUEUE_SIZE       = 10;  // Maximum packets in queue (safety limit)
+constexpr size_t TARGET_OPUS_QUEUE_SIZE    = 3;   // Target queue size for adaptive management
+constexpr size_t MIN_JITTER_BUFFER_PACKETS = 3;   // Minimum packets before playback starts
+
 // Type aliases
 template <size_t N>
 using Bytes = std::array<char, N>;
