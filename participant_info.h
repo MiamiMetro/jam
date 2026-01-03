@@ -36,16 +36,11 @@ struct ParticipantData {
     bool                                  is_muted = false;
     float                                 gain     = 1.0F;
     std::chrono::steady_clock::time_point last_packet_time;
-    size_t                                jitter_buffer_min_packets = MIN_JITTER_BUFFER_PACKETS;
+    size_t                                jitter_buffer_min_packets = 2;
     bool                                  buffer_ready              = false;
     int                                   underrun_count            = 0;
     float                                 current_level             = 0.0F;  // RMS audio level
     bool                                  is_speaking = false;  // Voice activity detection
-
-    // Adaptive jitter buffer tracking
-    std::array<size_t, 8> queue_size_history = {};  // Rolling history for adaptive buffer
-    size_t                history_index      = 0;   // Current index in history
-    size_t                plc_count          = 0;   // PLC invocations (for diagnostics)
 };
 
 // Lightweight view for UI (snapshot of ParticipantData)
@@ -58,5 +53,4 @@ struct ParticipantInfo {
     bool     buffer_ready;
     size_t   queue_size;
     int      underrun_count;
-    size_t   plc_count;  // PLC invocations for diagnostics
 };

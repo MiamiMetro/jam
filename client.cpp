@@ -57,7 +57,7 @@ public:
         audio_config_.sample_rate       = 48000;
         audio_config_.bitrate           = 64000;
         audio_config_.complexity        = 2;
-        audio_config_.frames_per_buffer = 240;  // 5ms (optimal for stability)
+        audio_config_.frames_per_buffer = 240;
         audio_config_.input_gain        = 1.0F;
         audio_config_.output_gain       = 1.0F;
 
@@ -602,19 +602,7 @@ private:
             }
 
             size_t queue_size = participant.opus_queue.size_approx();
-
-            // Adaptive queue management: drop old packets if queue is too large
-            // This keeps latency bounded to TARGET_OPUS_QUEUE_SIZE + 2 packets
-            while (queue_size > TARGET_OPUS_QUEUE_SIZE + 2) {
-                OpusPacket discarded;
-                if (participant.opus_queue.try_dequeue(discarded)) {
-                    queue_size--;
-                } else {
-                    break;
-                }
-            }
-
-            if (queue_size < MAX_OPUS_QUEUE_SIZE) {
+            if (queue_size < 16) {
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 participant.last_packet_time = packet.timestamp;
 
@@ -626,7 +614,7 @@ private:
                               queue_size);
                 }
             } else {
-                // Buffer overflow - drop oldest packet (safety limit)
+                // Buffer overflow - drop oldest packet
                 OpusPacket discarded;
                 participant.opus_queue.try_dequeue(discarded);
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
@@ -714,105 +702,53 @@ private:
                             participant_id, decoded_samples, expected_samples);
                     }
                 }
-
-                // Adaptive jitter buffer: track queue size history and adjust minimum
-                size_t current_queue_size = participant.opus_queue.size_approx();
-                participant.queue_size_history[participant.history_index] = current_queue_size;
-                participant.history_index =
-                    (participant.history_index + 1) % participant.queue_size_history.size();
-
-                // Calculate average queue size over history window
-                size_t total = 0;
-                for (size_t qs: participant.queue_size_history) {
-                    total += qs;
-                }
-                size_t avg_queue_size = total / participant.queue_size_history.size();
-
-                // Adaptive adjustment: increase buffer if queue is often low (jittery network)
-                // Decrease buffer if queue is consistently high (stable network, reduce latency)
-                constexpr size_t MAX_JITTER_BUFFER_PACKETS = 5;  // Upper limit for adaptation
-                if (avg_queue_size < 2 &&
-                    participant.jitter_buffer_min_packets < MAX_JITTER_BUFFER_PACKETS) {
-                    participant.jitter_buffer_min_packets++;
-                    Log::debug("Participant {} jitter buffer increased to {} (avg queue: {})",
-                               participant_id, participant.jitter_buffer_min_packets,
-                               avg_queue_size);
-                } else if (avg_queue_size > 4 &&
-                           participant.jitter_buffer_min_packets > MIN_JITTER_BUFFER_PACKETS) {
-                    participant.jitter_buffer_min_packets--;
-                    Log::debug("Participant {} jitter buffer decreased to {} (avg queue: {})",
-                               participant_id, participant.jitter_buffer_min_packets,
-                               avg_queue_size);
-                }
             } else {
-                // Underrun - use PLC instead of silence for smoother audio
+                // Underrun - failed to dequeue
                 size_t current_queue_size = participant.opus_queue.size_approx();
-
-                // Use Opus PLC to generate concealment audio
-                int plc_samples = participant.decoder->decode_plc(participant.pcm_buffer.data(),
-                                                                  static_cast<int>(frame_count));
-
-                if (plc_samples > 0) {
-                    // Mix PLC output (same as normal decode path)
-                    size_t expected_samples = frame_count * out_channels;
-                    if (static_cast<size_t>(plc_samples) == expected_samples) {
-                        audio_analysis::mix_with_gain(output_buffer, participant.pcm_buffer.data(),
-                                                      plc_samples, participant.gain);
-                    } else if (static_cast<size_t>(plc_samples) == frame_count) {
-                        // Mono PLC, stereo output - duplicate channel
-                        audio_analysis::mix_mono_to_stereo(
-                            output_buffer, participant.pcm_buffer.data(), frame_count, out_channels,
-                            participant.gain);
-                    }
-                    participant.plc_count++;
-                }
-
-                // Handle rebuffering state (reduced logging - PLC handles gaps silently)
                 if (current_queue_size == 0 && participant.buffer_ready) {
                     participant.buffer_ready = false;
-                    participant.underrun_count++;
-                    // Only log first rebuffer or every 10th to reduce noise
-                    if (participant.underrun_count == 1 || participant.underrun_count % 10 == 0) {
-                        Log::info("Participant {} rebuffering (underruns: {}, PLC: {})",
-                                  participant_id, participant.underrun_count,
-                                  participant.plc_count);
-                    }
+                    Log::warn(
+                        "Jitter buffer underrun for participant {}! Rebuffering... (queue: {} "
+                        "packets)",
+                        participant_id, current_queue_size);
                 } else if (participant.buffer_ready) {
-                    participant.underrun_count++;
+                    // Log underrun with queue size info (use per-participant counter)
+                    if (++participant.underrun_count % 20 == 0) {
+                        Log::warn(
+                            "Jitter buffer underrun for participant {} (queue: {} packets, min: "
+                            "{})",
+                            participant_id, current_queue_size,
+                            participant.jitter_buffer_min_packets);
+                    }
                 }
             }
         });
 
         // Mix WAV file audio for local output (if loaded and playing)
-        // WAV and mic are completely independent - WAV can work without mic, mic can work without
-        // WAV
-        std::array<float, 480>
-             wav_buffer{};  // Buffer for WAV audio (sized for max possible frame_count)
-        int  wav_frames_read = 0;
-        bool wav_active      = false;
+        // WAV and mic are completely independent - WAV can work without mic, mic can work without WAV
+        std::array<float, 240> wav_buffer{};  // Maximum frame_count is 240
+        int                    wav_frames_read = 0;
+        bool                   wav_active      = false;
 
         if (client->wav_playback_.is_loaded() && client->wav_playback_.is_playing()) {
-            wav_frames_read =
-                client->wav_playback_.read(wav_buffer.data(), static_cast<int>(frame_count),
-                                           client->audio_config_.sample_rate);
+            wav_frames_read = client->wav_playback_.read(wav_buffer.data(), static_cast<int>(frame_count),
+                                                          client->audio_config_.sample_rate);
             if (wav_frames_read > 0) {
                 wav_active = true;  // Only set active if we actually read frames (handles EOF case)
-
+                
                 // Mix WAV into local output buffer only if not muted locally
                 if (!client->wav_muted_local_.load(std::memory_order_acquire)) {
                     float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
                     if (out_channels == 1) {
-                        audio_analysis::mix_with_gain(output_buffer, wav_buffer.data(),
-                                                      wav_frames_read, wav_gain);
+                        audio_analysis::mix_with_gain(output_buffer, wav_buffer.data(), wav_frames_read, wav_gain);
                     } else {
                         // Stereo output - duplicate mono WAV to both channels
-                        audio_analysis::mix_mono_to_stereo(output_buffer, wav_buffer.data(),
-                                                           wav_frames_read, out_channels, wav_gain);
+                        audio_analysis::mix_mono_to_stereo(output_buffer, wav_buffer.data(), wav_frames_read,
+                                                            out_channels, wav_gain);
                     }
                     active_count++;
                 }
-                // Note: WAV is still sent over network even if muted locally (handled in encoding
-                // section)
+                // Note: WAV is still sent over network even if muted locally (handled in encoding section)
             }
         }
 
@@ -837,8 +773,7 @@ private:
             bool                       encode_success = false;
 
             // Prepare mixed input buffer (WAV + mic)
-            std::array<float, 480>
-                mixed_input{};  // Buffer for mixed audio (sized for max possible frame_count)
+            std::array<float, 240> mixed_input{};  // Maximum frame_count is 240
 
             if (wav_active && wav_frames_read > 0) {
                 // Copy WAV data first and apply gain
@@ -848,40 +783,35 @@ private:
                     mixed_input[i] = wav_buffer[i] * wav_gain;
                 }
                 // Note: If wav_frames_read < frame_count, remaining frames stay as 0.0F (silence)
-
+                
                 // Mix microphone input if available and not muted
-                if (input_buffer != nullptr &&
-                    !client->mic_muted_.load(std::memory_order_acquire)) {
+                if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
                     // Mix mic with WAV (average mixing to prevent clipping)
                     for (unsigned long i = 0; i < frame_count; ++i) {
                         mixed_input[i] = (mixed_input[i] + input_buffer[i]) * 0.5F;
                     }
                     // Calculate RMS for own audio level (from mixed signal)
-                    float rms = audio_analysis::calculate_rms(mixed_input.data(),
-                                                              static_cast<int>(frame_count));
+                    float rms = audio_analysis::calculate_rms(mixed_input.data(), static_cast<int>(frame_count));
                     client->own_audio_level_.store(rms);
                 } else {
                     // No mic or mic muted - apply same scaling to WAV for consistent volume
-                    // When mixing with mic we use 0.5F, so apply 0.5F here too to keep WAV volume
-                    // consistent
+                    // When mixing with mic we use 0.5F, so apply 0.5F here too to keep WAV volume consistent
                     constexpr float MIX_SCALE = 0.5F;
                     for (unsigned long i = 0; i < frame_count; ++i) {
                         mixed_input[i] *= MIX_SCALE;
                     }
                     // Calculate RMS for own audio level (from WAV signal)
-                    float rms = audio_analysis::calculate_rms(mixed_input.data(),
-                                                              static_cast<int>(frame_count));
+                    float rms = audio_analysis::calculate_rms(mixed_input.data(), static_cast<int>(frame_count));
                     client->own_audio_level_.store(rms);
                 }
-
+                
                 // Encode mixed audio (WAV + optional mic, or just WAV)
-                encode_success = client->audio_encoder_.encode(
-                    mixed_input.data(), static_cast<int>(frame_count), encoded_data);
+                encode_success = client->audio_encoder_.encode(mixed_input.data(), static_cast<int>(frame_count),
+                                                               encoded_data);
             } else {
                 // No WAV active - use original behavior (mic only or silence)
                 // This branch preserves exact backward compatibility when WAV is not in use
-                if (input_buffer != nullptr &&
-                    !client->mic_muted_.load(std::memory_order_acquire)) {
+                if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
                     // Calculate RMS for own audio level
                     float rms = audio_analysis::calculate_rms(input_buffer, frame_count);
                     client->own_audio_level_.store(rms);
@@ -931,7 +861,7 @@ private:
     WavFilePlayback    wav_playback_;
 
     // WAV playback volume/gain (thread-safe with atomic)
-    std::atomic<float> wav_gain_{1.0F};          // Default to 100% volume
+    std::atomic<float> wav_gain_{1.0F};  // Default to 100% volume
     std::atomic<bool>  wav_muted_local_{false};  // Mute locally (still sends over network)
 
     // Microphone mute (thread-safe with atomic)
@@ -1008,7 +938,6 @@ void DrawClientUI(Client& client) {
     static const char*  muted_text       = "[Muted] ";
     static const char*  buffering_text   = "[Buffering] ";
     static const char*  underruns_prefix = "[Underruns: ";
-    static const char*  plc_prefix       = "[PLC: ";
 
     if (ImGui::Begin("Client Info")) {
         ImGui::Text("Hello from GLFW + OpenGL3!");
@@ -1298,11 +1227,11 @@ void DrawClientUI(Client& client) {
 
         ImGui::Separator();
         ImGui::Text("WAV File Playback:");
-
+        
         // Cache WAV state (update every frame for responsive UI)
         static Client::WavState cached_wav_state;
         cached_wav_state = client.get_wav_state();
-
+        
         // File path input
         static char wav_file_path[512] = "";
         ImGui::InputText("File Path", wav_file_path, sizeof(wav_file_path));
@@ -1316,7 +1245,7 @@ void DrawClientUI(Client& client) {
                 }
             }
         }
-
+        
         if (cached_wav_state.is_loaded) {
             // Playback controls
             if (cached_wav_state.is_playing) {
@@ -1328,23 +1257,23 @@ void DrawClientUI(Client& client) {
                     client.wav_play();
                 }
             }
-
+            
             ImGui::SameLine();
-
+            
             // Progress bar and seek
             float progress = 0.0F;
             if (cached_wav_state.total_frames > 0) {
                 progress = static_cast<float>(cached_wav_state.position) /
-                           static_cast<float>(cached_wav_state.total_frames);
+                          static_cast<float>(cached_wav_state.total_frames);
             }
-
+            
             // Display current position / total
             char progress_text[64];
             std::snprintf(progress_text, sizeof(progress_text), "%lld / %lld frames",
-                          static_cast<long long>(cached_wav_state.position),
-                          static_cast<long long>(cached_wav_state.total_frames));
+                         static_cast<long long>(cached_wav_state.position),
+                         static_cast<long long>(cached_wav_state.total_frames));
             ImGui::Text("%s", progress_text);
-
+            
             // Seek slider (only when paused - boundary discipline)
             if (!cached_wav_state.is_playing) {
                 float seek_pos_float = static_cast<float>(cached_wav_state.position);
@@ -1357,7 +1286,7 @@ void DrawClientUI(Client& client) {
                 // Show progress bar when playing (non-interactive)
                 ImGui::ProgressBar(progress, ImVec2(-1, 0), "");
             }
-
+            
             // Volume/Gain control
             float wav_gain = cached_wav_state.gain;
             if (ImGui::SliderFloat("Volume", &wav_gain, 0.0F, 2.0F, "%.2f")) {
@@ -1367,7 +1296,7 @@ void DrawClientUI(Client& client) {
             if (ImGui::Button("Reset")) {
                 client.set_wav_gain(1.0F);
             }
-
+            
             // Mute locally button (still sends over network)
             bool muted_local = cached_wav_state.muted_local;
             if (ImGui::Checkbox("Mute Locally", &muted_local)) {
@@ -1376,18 +1305,16 @@ void DrawClientUI(Client& client) {
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Mutes WAV file in your headphones/speakers, but still sends it to others over "
-                    "the network");
+                ImGui::SetTooltip("Mutes WAV file in your headphones/speakers, but still sends it to others over the network");
             }
-
+            
             // File info
             ImGui::Text("Sample Rate: %d Hz | Channels: %d", cached_wav_state.sample_rate,
-                        cached_wav_state.channels);
+                       cached_wav_state.channels);
         } else {
             ImGui::Text("No WAV file loaded");
         }
-
+        
         ImGui::Separator();
         if (ImGui::BeginTable("NetworkYou", 2, ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextRow();
@@ -1409,7 +1336,7 @@ void DrawClientUI(Client& client) {
             }
             ImGui::EndTable();
         }
-
+        
         // Microphone mute button
         ImGui::Spacing();
         bool mic_muted = client.get_mic_muted();
@@ -1480,11 +1407,6 @@ void DrawClientUI(Client& client) {
                     if (p.underrun_count > 0) {
                         status_buffer += underruns_prefix;
                         status_buffer += std::to_string(p.underrun_count);
-                        status_buffer += "] ";
-                    }
-                    if (p.plc_count > 0) {
-                        status_buffer += plc_prefix;
-                        status_buffer += std::to_string(p.plc_count);
                         status_buffer += "] ";
                     }
                     if (status_buffer.empty()) {
