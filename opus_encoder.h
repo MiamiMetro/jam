@@ -61,10 +61,11 @@ public:
         channels_    = channels;
         sample_rate_ = sample_rate;
 
-        // Set encoder options for low-latency music streaming
+        // Set encoder options for ultra-low-latency music streaming
         opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(complexity));
         opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(bitrate));
         opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
+        opus_encoder_ctl(encoder_, OPUS_SET_APPLICATION(OPUS_APPLICATION_RESTRICTED_LOWDELAY));
         opus_encoder_ctl(encoder_, OPUS_SET_VBR(1));  // Variable bitrate for better quality
         opus_encoder_ctl(encoder_, OPUS_SET_VBR_CONSTRAINT(0));  // Unconstrained VBR for music
         opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(1));      // Forward error correction for UDP

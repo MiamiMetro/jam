@@ -13,6 +13,17 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX  // Prevent Windows from defining min/max macros
+#endif
+#include <winsock2.h>  // Must come before windows.h
+#include <windows.h>   // For SetThreadPriority
+#endif
+
 #include <asio.hpp>
 #include <asio/buffer.hpp>
 #include <asio/io_context.hpp>
@@ -53,6 +64,15 @@ public:
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
           cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
         Log::info("Client local port: {}", socket_.local_endpoint().port());
+
+        // Optimize UDP socket buffers for low-latency audio streaming
+        try {
+            socket_.set_option(asio::socket_base::receive_buffer_size(65536));
+            socket_.set_option(asio::socket_base::send_buffer_size(65536));
+            Log::info("UDP socket buffers optimized for low latency");
+        } catch (const std::exception& e) {
+            Log::warn("Failed to set socket buffer sizes: {}", e.what());
+        }
 
         // Initialize audio config with defaults (but don't start stream yet)
         audio_config_.sample_rate       = 48000;
@@ -270,6 +290,14 @@ public:
 
     double get_rtt_ms() const {
         return rtt_ms_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t get_total_bytes_rx() const {
+        return total_bytes_rx_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t get_total_bytes_tx() const {
+        return total_bytes_tx_.load(std::memory_order_relaxed);
     }
 
     AudioStream::AudioConfig get_audio_config() const {
@@ -496,6 +524,9 @@ public:
     // Send with optional shared_ptr to keep data alive during async operation
     void send(void* data, std::size_t len,
               const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
+        // Add to total bytes sent
+        total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
+        
         socket_.async_send_to(asio::buffer(data, len), server_endpoint_,
                               [keep_alive](std::error_code error_code, std::size_t) {
                                   if (error_code) {
@@ -527,6 +558,9 @@ private:
     }
 
     void handle_ctrl_message(std::size_t bytes) {
+        // Add to total bytes received
+        total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
+
         if (bytes < sizeof(CtrlHdr)) {
             return;
         }
@@ -566,7 +600,10 @@ private:
         }
     }
 
-    void handle_ping_message(std::size_t /*bytes*/) {
+    void handle_ping_message(std::size_t bytes) {
+        // Add to total bytes received
+        total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
+
         SyncHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(SyncHdr));
 
@@ -637,6 +674,9 @@ private:
             }
         }
 
+        // Add to total bytes received
+        total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
+
         // Get opus data pointer
         const unsigned char* audio_data = reinterpret_cast<const unsigned char*>(
             recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
@@ -695,6 +735,15 @@ private:
         const auto* input_buffer  = static_cast<const float*>(input);
         auto*       output_buffer = static_cast<float*>(output);
         auto*       client        = static_cast<Client*>(user_data);
+
+#ifdef _WIN32
+        // Boost thread priority on Windows for minimal audio latency
+        static bool priority_set = false;
+        if (!priority_set) {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            priority_set = true;
+        }
+#endif
 
         if (output_buffer == nullptr) {
             return paContinue;
@@ -1007,6 +1056,10 @@ private:
 
     // RTT tracking (thread-safe with atomic)
     std::atomic<double> rtt_ms_{0.0};
+
+    // Total bytes sent/received (cumulative counters)
+    std::atomic<uint64_t> total_bytes_rx_{0};
+    std::atomic<uint64_t> total_bytes_tx_{0};
 
     // Device and encoder info storage
     DeviceInfo  device_info_;
@@ -1526,6 +1579,41 @@ void draw_client_ui(Client& client) {
 
             // Participants count
             ImGui::Text("Users: %zu", cached_participants.size());
+
+            ImGui::Separator();
+
+            // Total bytes sent/received (throttled updates to reduce CPU usage)
+            static std::string cached_rx_str = "0 B";
+            static std::string cached_tx_str = "0 B";
+            static auto last_update = std::chrono::steady_clock::now();
+            
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count() >= 1000) {
+                uint64_t total_rx = client.get_total_bytes_rx();
+                uint64_t total_tx = client.get_total_bytes_tx();
+                
+                // Format as KB or MB
+                auto format_bytes = [](uint64_t bytes) -> std::string {
+                    if (bytes < 1024) {
+                        return std::to_string(bytes) + " B";
+                    } else if (bytes < 1024 * 1024) {
+                        return std::to_string(bytes / 1024) + " KB";
+                    } else {
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "%.2f MB", bytes / (1024.0 * 1024.0));
+                        return std::string(buf);
+                    }
+                };
+                
+                cached_rx_str = format_bytes(total_rx);
+                cached_tx_str = format_bytes(total_tx);
+                last_update = now;
+            }
+            
+            ImGui::Text("RX: %s", cached_rx_str.c_str());
+            ImGui::SameLine();
+            ImGui::Text("TX: %s", cached_tx_str.c_str());
+            JamGui::ShowTooltipOnHover("Total bytes received / transmitted");
 
             ImGui::Separator();
 

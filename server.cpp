@@ -34,6 +34,15 @@ public:
         : socket_(io_context, udp::endpoint(udp::v4(), port)),
           alive_check_timer_(io_context, server_config::ALIVE_CHECK_INTERVAL,
                              [this]() { alive_check_timer_callback(); }) {
+        // Optimize UDP socket buffers for high-throughput packet forwarding
+        try {
+            socket_.set_option(asio::socket_base::receive_buffer_size(131072));  // 128KB
+            socket_.set_option(asio::socket_base::send_buffer_size(131072));     // 128KB
+            Log::info("UDP socket buffers optimized for packet forwarding");
+        } catch (const std::exception& e) {
+            Log::warn("Failed to set socket buffer sizes: {}", e.what());
+        }
+
         Log::info("SFU server ready: forwarding audio between clients");
         do_receive();
     }
