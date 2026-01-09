@@ -10,6 +10,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <asio.hpp>
@@ -392,6 +393,50 @@ public:
         }
 
         return true;
+    }
+
+    // =========================================================================
+    // Participant control methods (mute, gain, pan)
+    // =========================================================================
+
+    // Set participant mute state
+    void set_participant_muted(uint32_t id, bool muted) {
+        participant_manager_.with_participant(id,
+                                              [muted](ParticipantData& p) { p.is_muted = muted; });
+    }
+
+    // Get participant mute state
+    bool get_participant_muted(uint32_t id) {
+        bool muted = false;
+        participant_manager_.with_participant(id,
+                                              [&muted](ParticipantData& p) { muted = p.is_muted; });
+        return muted;
+    }
+
+    // Set participant gain (0.0 - 2.0, 1.0 = unity)
+    void set_participant_gain(uint32_t id, float gain) {
+        participant_manager_.with_participant(
+            id, [gain](ParticipantData& p) { p.gain = std::clamp(gain, 0.0F, 2.0F); });
+    }
+
+    // Get participant gain
+    float get_participant_gain(uint32_t id) {
+        float gain = 1.0F;
+        participant_manager_.with_participant(id, [&gain](ParticipantData& p) { gain = p.gain; });
+        return gain;
+    }
+
+    // Set participant pan (0.0 = full left, 0.5 = center, 1.0 = full right)
+    void set_participant_pan(uint32_t id, float pan) {
+        participant_manager_.with_participant(
+            id, [pan](ParticipantData& p) { p.pan = std::clamp(pan, 0.0F, 1.0F); });
+    }
+
+    // Get participant pan
+    float get_participant_pan(uint32_t id) {
+        float pan = 0.5F;
+        participant_manager_.with_participant(id, [&pan](ParticipantData& p) { pan = p.pan; });
+        return pan;
     }
 
     void on_receive(std::error_code error_code, std::size_t bytes) {
@@ -956,7 +1001,564 @@ private:
     PeriodicTimer cleanup_timer_;
 };
 
+// =============================================================================
+// Zynlab-Style Jam Client UI
+// =============================================================================
+
+// Layout constants
+static constexpr float TRACK_WIDTH = 140.0F;  // Wider strips
+// FADER_HEIGHT removed - now dynamically calculated based on window size
+static constexpr float METER_WIDTH  = 20.0F;
+static constexpr float KNOB_SIZE    = 50.0F;
+static constexpr float MASTER_WIDTH = 160.0F;  // Wider master
+
+// Draw the master (your own audio) channel strip with WAV controls
+static void draw_master_strip(Client& client, float available_height) {
+    ImGuiStyle& style       = ImGui::GetStyle();
+    float       strip_width = MASTER_WIDTH;
+    float       line_height = ImGui::GetTextLineHeightWithSpacing();
+
+    // Dynamic fader height - scale with available space, min 200, max based on window
+    float fader_height = std::max(200.0F, available_height - 350.0F);
+
+    // Padding constant
+    constexpr float PADDING = 8.0F;
+
+    ImGui::BeginChild("MasterStrip", ImVec2(strip_width, 0), ImGuiChildFlags_None);
+    {
+        float width = ImGui::GetContentRegionAvail().x - PADDING;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+
+        // Title
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2F, 0.4F, 0.6F, 1.0F));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25F, 0.5F, 0.7F, 1.0F));
+        ImGui::Button("YOU", ImVec2(width, 0));
+        ImGui::PopStyleColor(2);
+
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+
+        // Mute button - explicit MUTE/UNMUTE text
+        bool mic_muted = client.get_mic_muted();
+        ImGui::PushStyleColor(ImGuiCol_Button, mic_muted ? ImVec4(0.8F, 0.2F, 0.2F, 1.0F)
+                                                         : ImVec4(0.2F, 0.5F, 0.3F, 1.0F));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, mic_muted ? ImVec4(0.9F, 0.3F, 0.3F, 1.0F)
+                                                                : ImVec4(0.3F, 0.6F, 0.4F, 1.0F));
+        if (ImGui::Button(mic_muted ? "UNMUTE" : "MUTE", ImVec2(width, 0))) {
+            client.set_mic_muted(!mic_muted);
+        }
+        JamGui::ShowTooltipOnHover("Click to toggle microphone mute");
+        ImGui::PopStyleColor(2);
+
+        ImGui::Spacing();
+
+        // Level meter and fader section
+        float own_level = client.get_own_audio_level();
+        int   meter_val = static_cast<int>(own_level * fader_height);
+
+        // Center the meter + fader
+        float total_control_width = METER_WIDTH + style.ItemSpacing.x + METER_WIDTH;
+        float offset              = (strip_width - total_control_width) / 2.0F;
+
+        ImGui::SetCursorPosX(offset);
+        JamGui::UvMeter("##MasterMeter", ImVec2(METER_WIDTH, fader_height), &meter_val, 0,
+                        static_cast<int>(fader_height));
+        ImGui::SameLine();
+
+        // Master volume fader
+        static int master_vol = 100;
+        JamGui::Fader("##MasterFader", ImVec2(METER_WIDTH, fader_height), &master_vol, 0, 127, "%d",
+                      100.0F / 127.0F);
+
+        ImGui::Spacing();
+
+        // Label
+        JamGui::TextCentered(ImVec2(strip_width, line_height), "master");
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // ========== LATENCY INFO (with padding) ==========
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        AudioStream::LatencyInfo latency = client.get_latency_info();
+        ImGui::Text("Latency:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("In: %.1fms", latency.input_latency_ms);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Out: %.1fms", latency.output_latency_ms);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // ========== WAV SECTION (with padding) ==========
+        Client::WavState wav_state = client.get_wav_state();
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("WAV File:");
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+        static char wav_file_path[512] = "";
+        ImGui::PushItemWidth(width);
+        ImGui::InputText("##WavPath", wav_file_path, sizeof(wav_file_path));
+        ImGui::PopItemWidth();
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+        if (ImGui::Button("Load", ImVec2(width, 0))) {
+            if (strlen(wav_file_path) > 0) {
+                client.load_wav_file(wav_file_path);
+            }
+        }
+
+        if (wav_state.is_loaded) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+            // Play/Pause button
+            if (wav_state.is_playing) {
+                if (ImGui::Button("Pause", ImVec2(width, 0))) {
+                    client.wav_pause();
+                }
+            } else {
+                if (ImGui::Button("Play", ImVec2(width, 0))) {
+                    client.wav_play();
+                }
+            }
+
+            // Progress/Seek
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+            float seek_pos = static_cast<float>(wav_state.position);
+            float max_pos  = static_cast<float>(wav_state.total_frames);
+            ImGui::PushItemWidth(width);
+            if (wav_state.is_playing) {
+                float progress = (max_pos > 0) ? seek_pos / max_pos : 0.0F;
+                ImGui::ProgressBar(progress, ImVec2(width, 0), "");
+            } else {
+                if (ImGui::SliderFloat("##Seek", &seek_pos, 0.0F, max_pos, "%.0f")) {
+                    client.wav_seek(static_cast<int64_t>(seek_pos));
+                }
+            }
+            ImGui::PopItemWidth();
+
+            // Volume
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Volume:");
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+            float wav_gain = wav_state.gain;
+            ImGui::PushItemWidth(width);
+            if (ImGui::SliderFloat("##WavVol", &wav_gain, 0.0F, 2.0F, "%.2f")) {
+                client.set_wav_gain(wav_gain);
+            }
+            ImGui::PopItemWidth();
+
+            // Mute local
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+            bool muted_local = wav_state.muted_local;
+            if (ImGui::Checkbox("Mute Local##wav", &muted_local)) {
+                client.set_wav_muted_local(muted_local);
+            }
+            JamGui::ShowTooltipOnHover("Mute locally but still send to others");
+        }
+    }
+    ImGui::EndChild();
+}
+
+// Draw a participant channel strip
+static void draw_participant_strip(Client& client, const ParticipantInfo& p, int index,
+                                   float available_height) {
+    ImGuiStyle& style       = ImGui::GetStyle();
+    float       strip_width = TRACK_WIDTH;
+    float       line_height = ImGui::GetTextLineHeightWithSpacing();
+
+    // Dynamic fader height - scale with available space
+    // Reserve more space for: title, mute btn, pan knob, label, separator, stats section (expanded)
+    float fader_height = std::max(200.0F, available_height - 330.0F);
+
+    // Padding constant
+    constexpr float PADDING = 8.0F;
+
+    // Get track color based on index
+    ImVec4 track_color         = JamGui::GetTrackColor(index, 0.6F, 0.6F);
+    ImVec4 track_color_hovered = JamGui::GetTrackColor(index, 0.7F, 0.7F);
+    ImVec4 track_color_active  = JamGui::GetTrackColor(index, 0.8F, 0.8F);
+
+    // Background tint for highlighted/selected
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 0.02F));
+
+    ImGui::PushID(static_cast<int>(p.id));
+    ImGui::BeginChild("ParticipantStrip", ImVec2(strip_width, 0), ImGuiChildFlags_None);
+    {
+        float width = ImGui::GetContentRegionAvail().x - PADDING;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+
+        // Push track-specific colors for title
+        ImGui::PushStyleColor(ImGuiCol_Button, track_color);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, track_color_hovered);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, track_color_active);
+
+        // Participant name button (title)
+        char name_buf[32];
+        std::snprintf(name_buf, sizeof(name_buf), "User #%u", p.id);
+        ImGui::Button(name_buf, ImVec2(width, 0));
+        ImGui::PopStyleColor(3);
+
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+
+        // Mute button - explicit MUTE/UNMUTE text
+        bool muted = p.is_muted;
+        ImGui::PushStyleColor(ImGuiCol_Button, muted ? ImVec4(0.8F, 0.2F, 0.2F, 1.0F)
+                                                     : ImVec4(0.2F, 0.5F, 0.3F, 1.0F));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, muted ? ImVec4(0.9F, 0.3F, 0.3F, 1.0F)
+                                                            : ImVec4(0.3F, 0.6F, 0.4F, 1.0F));
+        char mute_label[32];
+        std::snprintf(mute_label, sizeof(mute_label), muted ? "UNMUTE##%u" : "MUTE##%u", p.id);
+        if (ImGui::Button(mute_label, ImVec2(width, 0))) {
+            client.set_participant_muted(p.id, !muted);
+        }
+        JamGui::ShowTooltipOnHover(muted ? "Click to unmute" : "Click to mute");
+        ImGui::PopStyleColor(2);
+
+        ImGui::Spacing();
+
+        // Pan knob at TOP - use local cache to prevent jitter during drag
+        static std::unordered_map<uint32_t, float> pan_cache;
+        if (!pan_cache.contains(p.id)) {
+            pan_cache[p.id] = p.pan * 127.0F;
+        }
+        bool  knob_active = false;
+        float pan_val     = pan_cache[p.id];
+
+        float knob_offset = (strip_width - KNOB_SIZE) / 2.0F;
+        ImGui::SetCursorPosX(knob_offset);
+        if (JamGui::Knob("pan", &pan_val, 0.0F, 127.0F, ImVec2(KNOB_SIZE, KNOB_SIZE), "Pan")) {
+            pan_cache[p.id] = pan_val;
+            client.set_participant_pan(p.id, pan_val / 127.0F);
+            knob_active = true;
+        }
+        // Update cache from server when not dragging
+        if (!knob_active && !ImGui::IsItemActive()) {
+            pan_cache[p.id] = p.pan * 127.0F;
+        }
+
+        ImGui::Spacing();
+
+        // Level meter and volume fader
+        int meter_val = static_cast<int>(p.audio_level * fader_height);
+
+        // Center the meter + fader
+        float total_control_width = METER_WIDTH + style.ItemSpacing.x + METER_WIDTH;
+        float offset              = (strip_width - total_control_width) / 2.0F;
+
+        ImGui::SetCursorPosX(offset);
+        JamGui::UvMeter("##meter", ImVec2(METER_WIDTH, fader_height), &meter_val, 0,
+                        static_cast<int>(fader_height));
+        ImGui::SameLine();
+
+        // Volume fader - use local cache to prevent jitter
+        static std::unordered_map<uint32_t, int> vol_cache;
+        if (!vol_cache.contains(p.id) || !ImGui::IsItemActive()) {
+            vol_cache[p.id] = static_cast<int>(p.gain * 64.0F);
+        }
+        int vol = vol_cache[p.id];
+        vol     = std::clamp(vol, 0, 127);
+        if (JamGui::Fader("##vol", ImVec2(METER_WIDTH, fader_height), &vol, 0, 127, "%d",
+                          100.0F / 127.0F)) {
+            vol_cache[p.id] = vol;
+            client.set_participant_gain(p.id, static_cast<float>(vol) / 64.0F);
+        }
+
+        ImGui::Spacing();
+
+        // Participant label (lowercase to avoid ID conflict with title button)
+        char label_buf[32];
+        std::snprintf(label_buf, sizeof(label_buf), "user %u", p.id);
+        JamGui::TextCentered(ImVec2(strip_width, line_height), label_buf);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Connection stats section at bottom (open by default, with padding)
+        char stats_label[32];
+        std::snprintf(stats_label, sizeof(stats_label), "Stats##%u", p.id);
+        if (ImGui::CollapsingHeader(stats_label, ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Queue: %zu", p.queue_size);
+            if (p.underrun_count > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Underruns: %d",
+                                   p.underrun_count);
+            }
+            if (p.plc_count > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("PLC: %zu", p.plc_count);
+            }
+            if (!p.buffer_ready) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.8F, 0.2F, 1.0F), "Buffering...");
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::PopID();
+
+    ImGui::PopStyleColor();  // ChildBg
+}
+
+// Draw bottom device selector bar (horizontal)
+static void draw_bottom_bar(Client& client) {
+    static std::vector<AudioStream::DeviceInfo> input_devices;
+    static std::vector<AudioStream::DeviceInfo> output_devices;
+    static std::vector<AudioStream::ApiInfo>    available_apis;
+    static int                                  selected_api        = -1;
+    static int                                  refresh_counter     = 0;
+    static PaDeviceIndex                        pending_input       = paNoDevice;
+    static PaDeviceIndex                        pending_output      = paNoDevice;
+    static bool                                 devices_initialized = false;
+
+    if (!devices_initialized) {
+        pending_input       = client.get_selected_input_device();
+        pending_output      = client.get_selected_output_device();
+        devices_initialized = true;
+    }
+
+    if (refresh_counter++ % 60 == 0) {
+        input_devices  = AudioStream::get_input_devices();
+        output_devices = AudioStream::get_output_devices();
+        available_apis = AudioStream::get_apis();
+    }
+
+    // API selector
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("API:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(100);
+    const char* api_preview = (selected_api < 0) ? "All" : nullptr;
+    for (const auto& api: available_apis) {
+        if (api.index == selected_api) {
+            api_preview = api.name.c_str();
+            break;
+        }
+    }
+    if (api_preview == nullptr)
+        api_preview = "All";
+    if (ImGui::BeginCombo("##ApiSelect", api_preview)) {
+        if (ImGui::Selectable("All APIs", selected_api < 0)) {
+            selected_api = -1;
+        }
+        for (const auto& api: available_apis) {
+            char api_label[128];
+            std::snprintf(api_label, sizeof(api_label), "%s##api_%d", api.name.c_str(), api.index);
+            if (ImGui::Selectable(api_label, api.index == selected_api)) {
+                selected_api = api.index;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Input:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(250);
+    std::string input_preview = "Select...";
+    for (const auto& dev: input_devices) {
+        if (dev.index == pending_input) {
+            input_preview = dev.name;
+            break;
+        }
+    }
+    if (ImGui::BeginCombo("##InputDev", input_preview.c_str())) {
+        for (const auto& dev: input_devices) {
+            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name)
+                continue;
+            char dev_label[256];
+            std::snprintf(dev_label, sizeof(dev_label), "%s (%s)##dev_%d", dev.name.c_str(),
+                          dev.api_name.c_str(), dev.index);
+            if (ImGui::Selectable(dev_label, dev.index == pending_input)) {
+                pending_input = dev.index;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Output:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(250);
+    std::string output_preview = "Select...";
+    for (const auto& dev: output_devices) {
+        if (dev.index == pending_output) {
+            output_preview = dev.name;
+            break;
+        }
+    }
+    if (ImGui::BeginCombo("##OutputDev", output_preview.c_str())) {
+        for (const auto& dev: output_devices) {
+            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name)
+                continue;
+            char dev_label[256];
+            std::snprintf(dev_label, sizeof(dev_label), "%s (%s)##dev_%d", dev.name.c_str(),
+                          dev.api_name.c_str(), dev.index);
+            if (ImGui::Selectable(dev_label, dev.index == pending_output)) {
+                pending_output = dev.index;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::SameLine();
+
+    // Check if devices changed
+    PaDeviceIndex active_input  = client.get_selected_input_device();
+    PaDeviceIndex active_output = client.get_selected_output_device();
+    bool devices_changed = (pending_input != active_input) || (pending_output != active_output);
+
+    if (devices_changed) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8F, 0.6F, 0.2F, 1.0F));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9F, 0.7F, 0.3F, 1.0F));
+        if (ImGui::Button("APPLY")) {
+            client.set_input_device(pending_input);
+            client.set_output_device(pending_output);
+            if (client.is_audio_stream_active()) {
+                client.swap_audio_devices(pending_input, pending_output);
+            }
+        }
+        ImGui::PopStyleColor(2);
+    } else {
+        bool is_active = client.is_audio_stream_active();
+        if (is_active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7F, 0.2F, 0.2F, 1.0F));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8F, 0.3F, 0.3F, 1.0F));
+            if (ImGui::Button("STOP")) {
+                client.stop_audio_stream();
+            }
+            ImGui::PopStyleColor(2);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2F, 0.6F, 0.3F, 1.0F));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3F, 0.7F, 0.4F, 1.0F));
+            if (ImGui::Button("START")) {
+                if (pending_input != paNoDevice && pending_output != paNoDevice) {
+                    client.set_input_device(pending_input);
+                    client.set_output_device(pending_output);
+                    AudioStream::AudioConfig config = client.get_audio_config();
+                    client.start_audio_stream(pending_input, pending_output, config);
+                }
+            }
+            ImGui::PopStyleColor(2);
+        }
+    }
+
+    // Show error message if any
+    const std::string& last_error = AudioStream::get_last_error();
+    if (!last_error.empty()) {
+        ImGui::TextColored(ImVec4(1.0F, 0.3F, 0.3F, 1.0F), "Error: %s", last_error.c_str());
+    }
+}
+
 void draw_client_ui(Client& client) {
+    // Apply zynlab theme on first frame
+    static bool theme_applied = false;
+    if (!theme_applied) {
+        JamGui::ApplyZynlabTheme();
+        theme_applied = true;
+    }
+
+    // Cache participant info
+    static std::vector<ParticipantInfo> cached_participants;
+    static int                          frame_counter = 0;
+    if (frame_counter++ % 4 == 0) {
+        cached_participants = client.get_participant_info();
+    }
+
+    // Main mixer window
+    ImGui::SetNextWindowSize(ImVec2(900, 600), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Jam Client", nullptr, ImGuiWindowFlags_MenuBar)) {
+        // Menu bar with connection info
+        if (ImGui::BeginMenuBar()) {
+            // Connection status
+            std::string server_info =
+                client.get_server_address() + ":" + std::to_string(client.get_server_port());
+            ImGui::Text("Server: %s", server_info.c_str());
+
+            ImGui::Separator();
+
+            // RTT
+            double rtt = client.get_rtt_ms();
+            if (rtt > 0) {
+                ImGui::Text("RTT: %.1f ms", rtt);
+            } else {
+                ImGui::Text("RTT: --");
+            }
+
+            ImGui::Separator();
+
+            // Participants count
+            ImGui::Text("Users: %zu", cached_participants.size());
+
+            ImGui::Separator();
+
+            // Audio status
+            bool is_active = client.is_audio_stream_active();
+            if (is_active) {
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f), "CONNECTED");
+            } else {
+                ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.2f, 1.0f), "DISCONNECTED");
+            }
+
+            ImGui::Separator();
+
+            // FPS
+            ImGui::Text("%.0f FPS", ImGui::GetIO().Framerate);
+
+            ImGui::EndMenuBar();
+        }
+
+        // Get available height for channel strips
+        float available_height =
+            ImGui::GetContentRegionAvail().y - 60;  // Reserve space for device bar + error
+
+        // Horizontal scrolling mixer area
+        ImGui::BeginChild("Mixer", ImVec2(0, available_height), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        {
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5, 10));
+
+            // Draw master strip
+            draw_master_strip(client, available_height);
+            ImGui::SameLine();
+
+            // Space between master and participants
+            // ImGui::Dummy(ImVec2(1, 0));
+            // ImGui::SameLine();
+
+            // Draw participant strips
+            int index = 0;
+            for (const auto& p: cached_participants) {
+                draw_participant_strip(client, p, index++, available_height);
+                ImGui::SameLine();
+            }
+
+            // Empty space at the end for scrolling
+            ImGui::Dummy(ImVec2(20, 0));
+
+            ImGui::PopStyleVar();
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+
+        // WAV playback controls at bottom
+        draw_bottom_bar(client);
+    }
+    ImGui::End();
+}
+
+// Keep the old UI as a fallback option (can be removed later)
+void draw_client_ui_old(Client& client) {
     // Closed by default for better performance
     static bool demo_open = false;
     if (demo_open) {
@@ -1009,7 +1611,7 @@ void draw_client_ui(Client& client) {
     static const char*  underruns_prefix = "[Underruns: ";
     static const char*  plc_prefix       = "[PLC: ";
 
-    if (ImGui::Begin("Client Info")) {
+    if (ImGui::Begin("Client Info (Old)")) {
         ImGui::Text("Jam Client v0.0.1");
         ImGui::Separator();
 
@@ -1509,12 +2111,26 @@ int main() {
 
         Client client_instance(io_context, "127.0.0.1", 9999);
 
+        // Auto-start audio stream with default devices
+        {
+            PaDeviceIndex input_dev  = client_instance.get_selected_input_device();
+            PaDeviceIndex output_dev = client_instance.get_selected_output_device();
+            if (input_dev != paNoDevice && output_dev != paNoDevice) {
+                AudioStream::AudioConfig config = client_instance.get_audio_config();
+                if (client_instance.start_audio_stream(input_dev, output_dev, config)) {
+                    Log::info("Auto-started audio stream with default devices");
+                } else {
+                    Log::warn("Failed to auto-start audio stream");
+                }
+            }
+        }
+
         // Run io_context in background thread (GLFW must be on main thread on macOS)
         std::thread io_thread([&io_context]() { io_context.run(); });
 
         // Run UI on main thread (required for GLFW on macOS)
         {
-            Gui app(900, 500, "Jam", false, 60);
+            Gui app(800, 550, "Jam", false, 60);
 
             // Clean lambda - just delegates to separate function
             app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });

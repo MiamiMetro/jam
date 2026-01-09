@@ -81,6 +81,7 @@ public:
             info.is_muted       = data.is_muted;
             info.audio_level    = data.current_level;
             info.gain           = data.gain;
+            info.pan            = data.pan;
             info.buffer_ready   = data.buffer_ready;
             info.queue_size     = data.opus_queue.size_approx();
             info.underrun_count = data.underrun_count;

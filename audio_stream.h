@@ -14,6 +14,12 @@
 
 class AudioStream {
 public:
+    // Static error storage for UI display
+    static inline std::string last_error_;
+
+    static const std::string& get_last_error() { return last_error_; }
+    static void               clear_last_error() { last_error_.clear(); }
+
     struct AudioConfig {
         static constexpr int   DEFAULT_SAMPLE_RATE       = 48000;
         static constexpr int   DEFAULT_BITRATE           = 64000;
@@ -202,6 +208,7 @@ public:
                             PaStreamCallback* callback = nullptr, void* user_data = nullptr) {
         // Validate devices
         if (!is_device_valid(input_device) || !is_device_valid(output_device)) {
+            last_error_ = "Invalid input or output device";
             Log::error("Invalid input or output device.");
             return false;
         }
@@ -230,17 +237,21 @@ public:
             Pa_OpenStream(&stream_, &input_parameters, &output_parameters, config.sample_rate,
                           config.frames_per_buffer, paNoFlag, callback, user_data);
         if (err != paNoError) {
+            last_error_ = std::string("Open failed: ") + Pa_GetErrorText(err);
             Log::error("Pa_OpenStream failed: {}", Pa_GetErrorText(err));
             stream_ = nullptr;
             return false;
         }
         err = Pa_StartStream(stream_);
         if (err != paNoError) {
+            last_error_ = std::string("Start failed: ") + Pa_GetErrorText(err);
             Log::error("Pa_StartStream failed: {}", Pa_GetErrorText(err));
             Pa_CloseStream(stream_);
             stream_ = nullptr;
             return false;
         }
+        // Clear error on success
+        last_error_.clear();
         stream_active_.store(true, std::memory_order_relaxed);
 
         Log::info("{} input channel(s), {} output channel(s) at {} Hz", input_channel_count_,

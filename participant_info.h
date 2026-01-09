@@ -35,6 +35,7 @@ struct ParticipantData {
     // Participant state
     bool                                  is_muted = false;
     float                                 gain     = 1.0F;
+    float                                 pan      = 0.5F;  // 0.0 = full left, 0.5 = center, 1.0 = full right
     std::chrono::steady_clock::time_point last_packet_time;
     size_t                                jitter_buffer_min_packets = MIN_JITTER_BUFFER_PACKETS;
     bool                                  buffer_ready              = false;
@@ -55,6 +56,7 @@ struct ParticipantInfo {
     bool     is_muted;
     float    audio_level;
     float    gain;
+    float    pan;  // 0.0 = full left, 0.5 = center, 1.0 = full right
     bool     buffer_ready;
     size_t   queue_size;
     int      underrun_count;
