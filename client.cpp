@@ -1613,7 +1613,7 @@ int main() {
 
         // Run UI on main thread (required for GLFW on macOS)
         {
-            Gui app(810, 550, "Jam", false, 60);
+            Gui app(810, 555, "Jam", false, 60);
 
             // Clean lambda - just delegates to separate function
             app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });

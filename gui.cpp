@@ -1,6 +1,5 @@
 #include "gui.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -75,8 +74,9 @@ bool Knob(const char* label, float* p_value, float v_min, float v_max, const ImV
             label, ImVec2(s.x, s.y + (show_label ? line_height + style.ItemInnerSpacing.y : 0)));
     } else {
         ImGui::InvisibleButton(
-            label, ImVec2(radius_outer * 2,
-                          radius_outer * 2 + (show_label ? line_height + style.ItemInnerSpacing.y : 0)));
+            label,
+            ImVec2(radius_outer * 2,
+                   radius_outer * 2 + (show_label ? line_height + style.ItemInnerSpacing.y : 0)));
     }
 
     bool value_changed = false;
@@ -86,8 +86,10 @@ bool Knob(const char* label, float* p_value, float v_min, float v_max, const ImV
     if (is_active && io.MouseDelta.y != 0.0f) {
         float step = (v_max - v_min) / 200.0f;
         *p_value -= io.MouseDelta.y * step;
-        if (*p_value < v_min) *p_value = v_min;
-        if (*p_value > v_max) *p_value = v_max;
+        if (*p_value < v_min)
+            *p_value = v_min;
+        if (*p_value > v_max)
+            *p_value = v_max;
         value_changed = true;
     }
 
@@ -96,19 +98,19 @@ bool Knob(const char* label, float* p_value, float v_min, float v_max, const ImV
     float angle_sin = sinf(angle);
 
     // Draw filled center circle
-    draw_list->AddCircleFilled(center, radius_outer * 0.7f, ImGui::GetColorU32(ImGuiCol_Button), 16);
+    draw_list->AddCircleFilled(center, radius_outer * 0.7f, ImGui::GetColorU32(ImGuiCol_Button),
+                               16);
 
     // Draw background arc
     draw_list->PathArcTo(center, radius_outer, ANGLE_MIN, ANGLE_MAX, 16);
     draw_list->PathStroke(ImGui::GetColorU32(ImGuiCol_FrameBg), false, 3.0f);
 
     // Draw indicator line from center to edge
-    draw_list->AddLine(
-        ImVec2(center.x + angle_cos * (radius_outer * 0.35f),
-               center.y + angle_sin * (radius_outer * 0.35f)),
-        ImVec2(center.x + angle_cos * (radius_outer * 0.7f),
-               center.y + angle_sin * (radius_outer * 0.7f)),
-        ImGui::GetColorU32(ImGuiCol_SliderGrabActive), 2.0f);
+    draw_list->AddLine(ImVec2(center.x + angle_cos * (radius_outer * 0.35f),
+                              center.y + angle_sin * (radius_outer * 0.35f)),
+                       ImVec2(center.x + angle_cos * (radius_outer * 0.7f),
+                              center.y + angle_sin * (radius_outer * 0.7f)),
+                       ImGui::GetColorU32(ImGuiCol_SliderGrabActive), 2.0f);
 
     // Draw active arc (value indicator)
     draw_list->PathArcTo(center, radius_outer, ANGLE_MIN, angle + 0.02f, 16);
@@ -117,16 +119,16 @@ bool Knob(const char* label, float* p_value, float v_min, float v_max, const ImV
     // Draw label below knob
     if (show_label) {
         auto textSize = ImGui::CalcTextSize(label);
-        draw_list->AddText(
-            ImVec2(pos.x + ((size.x / 2) - (textSize.x / 2)), pos.y + radius_outer * 2 + style.ItemInnerSpacing.y),
-            ImGui::GetColorU32(ImGuiCol_Text), label);
+        draw_list->AddText(ImVec2(pos.x + ((size.x / 2) - (textSize.x / 2)),
+                                  pos.y + radius_outer * 2 + style.ItemInnerSpacing.y),
+                           ImGui::GetColorU32(ImGuiCol_Text), label);
     }
 
     // Tooltip on hover
     if (is_active || is_hovered) {
-        ImGui::SetNextWindowPos(ImVec2(pos.x - style.WindowPadding.x,
-                                       pos.y - (line_height * 2) - style.ItemInnerSpacing.y -
-                                           style.WindowPadding.y));
+        ImGui::SetNextWindowPos(
+            ImVec2(pos.x - style.WindowPadding.x,
+                   pos.y - (line_height * 2) - style.ItemInnerSpacing.y - style.WindowPadding.y));
         ImGui::BeginTooltip();
         if (tooltip != nullptr) {
             ImGui::Text("%s\nValue: %.3f", tooltip, static_cast<double>(*p_value));
@@ -145,24 +147,27 @@ bool Fader(const char* label, const ImVec2& size, int* v, int v_min, int v_max, 
            float power) {
     ImGuiDataType data_type = ImGuiDataType_S32;
     ImGuiWindow*  window    = ImGui::GetCurrentWindow();
-    if (window->SkipItems) return false;
+    if (window->SkipItems)
+        return false;
 
     ImGuiContext&     g     = *GImGui;
     const ImGuiStyle& style = g.Style;
     const ImGuiID     id    = window->GetID(label);
 
-    const ImVec2 label_size = ImGui::CalcTextSize(label, nullptr, true);
-    ImVec2 frame_bb_min = window->DC.CursorPos;
-    ImVec2 frame_bb_max = ImVec2(frame_bb_min.x + size.x, frame_bb_min.y + size.y);
+    const ImVec2 label_size   = ImGui::CalcTextSize(label, nullptr, true);
+    ImVec2       frame_bb_min = window->DC.CursorPos;
+    ImVec2       frame_bb_max = ImVec2(frame_bb_min.x + size.x, frame_bb_min.y + size.y);
     const ImRect frame_bb(frame_bb_min, frame_bb_max);
-    
-    float bb_extra_x = label_size.x > 0.0f ? style.ItemInnerSpacing.x + label_size.x : 0.0f;
+
+    float        bb_extra_x = label_size.x > 0.0f ? style.ItemInnerSpacing.x + label_size.x : 0.0f;
     const ImRect bb(frame_bb.Min, ImVec2(frame_bb.Max.x + bb_extra_x, frame_bb.Max.y));
 
     ImGui::ItemSize(bb, style.FramePadding.y);
-    if (!ImGui::ItemAdd(frame_bb, id)) return false;
+    if (!ImGui::ItemAdd(frame_bb, id))
+        return false;
 
-    if (format == nullptr) format = "%d";
+    if (format == nullptr)
+        format = "%d";
 
     const bool hovered = ImGui::ItemHoverable(frame_bb, id, ImGuiItemFlags_None);
     if ((hovered && g.IO.MouseClicked[0]) || g.NavActivateId == id) {
@@ -172,36 +177,35 @@ bool Fader(const char* label, const ImVec2& size, int* v, int v_min, int v_max, 
     }
 
     // Draw frame
-    const ImU32 frame_col =
-        ImGui::GetColorU32(g.ActiveId == id    ? ImGuiCol_FrameBgActive
-                          : g.HoveredId == id ? ImGuiCol_FrameBgHovered
-                                              : ImGuiCol_FrameBg);
+    const ImU32 frame_col = ImGui::GetColorU32(g.ActiveId == id    ? ImGuiCol_FrameBgActive
+                                               : g.HoveredId == id ? ImGuiCol_FrameBgHovered
+                                                                   : ImGuiCol_FrameBg);
     ImGui::RenderNavHighlight(frame_bb, id);
     ImGui::RenderFrame(frame_bb.Min, frame_bb.Max, frame_col, true, g.Style.FrameRounding);
 
     // Slider behavior
     ImRect     grab_bb;
-    const bool value_changed =
-        ImGui::SliderBehavior(frame_bb, id, data_type, v, &v_min, &v_max, format,
-                              ImGuiSliderFlags_Vertical, &grab_bb);
-    if (value_changed) ImGui::MarkItemEdited(id);
+    const bool value_changed = ImGui::SliderBehavior(frame_bb, id, data_type, v, &v_min, &v_max,
+                                                     format, ImGuiSliderFlags_Vertical, &grab_bb);
+    if (value_changed)
+        ImGui::MarkItemEdited(id);
 
     // Draw gutter (center line)
     ImRect gutter;
-    gutter.Min   = grab_bb.Min;
-    gutter.Max   = ImVec2(frame_bb.Max.x - 2.0f, frame_bb.Max.y - 2.0f);
-    float w      = ((gutter.Max.x - gutter.Min.x) - 4.0f) / 2.0f;
+    gutter.Min = grab_bb.Min;
+    gutter.Max = ImVec2(frame_bb.Max.x - 2.0f, frame_bb.Max.y - 2.0f);
+    float w    = ((gutter.Max.x - gutter.Min.x) - 4.0f) / 2.0f;
     gutter.Min.x += w;
     gutter.Max.x -= w;
-    window->DrawList->AddRectFilled(gutter.Min, gutter.Max, ImGui::GetColorU32(ImGuiCol_ButtonActive),
-                                    style.GrabRounding);
+    window->DrawList->AddRectFilled(gutter.Min, gutter.Max,
+                                    ImGui::GetColorU32(ImGuiCol_ButtonActive), style.GrabRounding);
 
     // Render grab handle
     window->DrawList->AddRectFilled(grab_bb.Min, grab_bb.Max, ImGui::GetColorU32(ImGuiCol_Text),
                                     style.GrabRounding);
 
     // Display value
-    char        value_buf[64];
+    char value_buf[64];
     std::snprintf(value_buf, sizeof(value_buf), format, static_cast<int>(*v * power));
     const char* value_buf_end = value_buf + strlen(value_buf);
     ImGui::RenderTextClipped(ImVec2(frame_bb.Min.x, frame_bb.Min.y + style.FramePadding.y),
@@ -222,8 +226,9 @@ bool TextCentered(const ImVec2& size, const char* label) {
 
     auto result   = ImGui::InvisibleButton(label, size);
     auto textSize = ImGui::CalcTextSize(label);
-    draw_list->AddText(ImVec2(pos.x + ((size.x / 2) - (textSize.x / 2)), pos.y + style.ItemInnerSpacing.y),
-                       ImGui::GetColorU32(ImGuiCol_Text), label);
+    draw_list->AddText(
+        ImVec2(pos.x + ((size.x / 2) - (textSize.x / 2)), pos.y + style.ItemInnerSpacing.y),
+        ImGui::GetColorU32(ImGuiCol_Text), label);
 
     return result;
 }
@@ -258,7 +263,8 @@ bool ToggleButton(const char* str_id, bool* v, const ImVec2& size) {
         col_bg = ImGui::GetColorU32(ImGuiCol_Button);
     }
 
-    draw_list->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), ImGui::GetColorU32(col_bg));
+    draw_list->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                             ImGui::GetColorU32(col_bg));
 
     auto textSize = ImGui::CalcTextSize(str_id);
     draw_list->AddText(ImVec2(pos.x + (size.x - textSize.x) / 2, pos.y + (size.y - textSize.y) / 2),
@@ -282,9 +288,9 @@ void ApplyZynlabTheme() {
     ImVec4* colors = style.Colors;
 
     // Background colors
-    colors[ImGuiCol_WindowBg]   = ImVec4(0.10f, 0.10f, 0.14f, 1.00f);
-    colors[ImGuiCol_ChildBg]    = ImVec4(0.08f, 0.08f, 0.12f, 1.00f);
-    colors[ImGuiCol_PopupBg]    = ImVec4(0.12f, 0.12f, 0.16f, 0.94f);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.10f, 0.10f, 0.14f, 1.00f);
+    colors[ImGuiCol_ChildBg]  = ImVec4(0.08f, 0.08f, 0.12f, 1.00f);
+    colors[ImGuiCol_PopupBg]  = ImVec4(0.12f, 0.12f, 0.16f, 0.94f);
 
     // Frame colors
     colors[ImGuiCol_FrameBg]        = ImVec4(0.20f, 0.20f, 0.28f, 1.00f);
@@ -344,13 +350,13 @@ void ApplyZynlabTheme() {
     colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
 
     // Rounding
-    style.FrameRounding    = 2.0f;
-    style.GrabRounding     = 2.0f;
-    style.WindowRounding   = 4.0f;
-    style.ChildRounding    = 2.0f;
-    style.PopupRounding    = 2.0f;
+    style.FrameRounding     = 2.0f;
+    style.GrabRounding      = 2.0f;
+    style.WindowRounding    = 4.0f;
+    style.ChildRounding     = 2.0f;
+    style.PopupRounding     = 2.0f;
     style.ScrollbarRounding = 2.0f;
-    style.TabRounding      = 2.0f;
+    style.TabRounding       = 2.0f;
 }
 
 ImVec4 GetTrackColor(int index, float saturation, float value) {
