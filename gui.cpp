@@ -538,6 +538,19 @@ void Gui::render_frame() {
     ImGui::PopStyleVar(3);
 
     ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
+
+    // Build initial layout on first frame (auto-dock Jam Client window)
+    static bool layout_built = false;
+    if (!layout_built) {
+        // Build the layout - this will dock "Jam Client" window when it's created
+        ImGui::DockBuilderRemoveNode(dockspace_id);
+        ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
+        ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
+        ImGui::DockBuilderDockWindow("Jam Client", dockspace_id);
+        ImGui::DockBuilderFinish(dockspace_id);
+        layout_built = true;
+    }
+
     ImGui::DockSpace(dockspace_id, ImVec2(0.0F, 0.0F), ImGuiDockNodeFlags_None);
     ImGui::End();
 
