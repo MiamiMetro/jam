@@ -25,7 +25,7 @@
 #include "audio_analysis.h"
 #include "audio_packet.h"
 #include "audio_stream.h"
-#include "imguiapp.h"
+#include "gui.h"
 #include "logger.h"
 #include "message_validator.h"
 #include "opus_decoder.h"
@@ -956,8 +956,7 @@ private:
     PeriodicTimer cleanup_timer_;
 };
 
-void DrawClientUI(Client& client) {
-    // Show demo window (can be closed) - only call when open
+void draw_client_ui(Client& client) {
     // Closed by default for better performance
     static bool demo_open = false;
     if (demo_open) {
@@ -1011,7 +1010,7 @@ void DrawClientUI(Client& client) {
     static const char*  plc_prefix       = "[PLC: ";
 
     if (ImGui::Begin("Client Info")) {
-        ImGui::Text("Hello from GLFW + OpenGL3!");
+        ImGui::Text("Jam Client v0.0.1");
         ImGui::Separator();
 
         // FPS and Frame Time side by side
@@ -1515,16 +1514,16 @@ int main() {
 
         // Run UI on main thread (required for GLFW on macOS)
         {
-            ImGuiApp app(900, 500, "Jam", false, 60);
+            Gui app(900, 500, "Jam", false, 60);
 
             // Clean lambda - just delegates to separate function
-            app.SetDrawCallback([&client_instance]() { DrawClientUI(client_instance); });
+            app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });
 
-            app.SetCloseCallback([&io_context]() {
+            app.set_close_callback([&io_context]() {
                 // Stop io_context to exit the application
                 io_context.stop();
             });
-            app.Run();
+            app.run();
         }
 
         // Clean up Client resources before exit

@@ -54,6 +54,6 @@ target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 # Client Target
 # ============================================================
 
-add_executable(client client.cpp imguiapp.cpp)
+add_executable(client client.cpp gui.cpp)
 target_link_libraries(client PRIVATE asio concurrentqueue spdlog::spdlog portaudio opus imgui_lib)
 
