@@ -227,6 +227,15 @@ public:
         return mic_muted_.load(std::memory_order_acquire);
     }
 
+    // Master input gain control (0.0 - 2.0, 1.0 = unity)
+    void set_input_gain(float gain) {
+        input_gain_.store(std::clamp(gain, 0.0F, 2.0F), std::memory_order_release);
+    }
+
+    float get_input_gain() const {
+        return input_gain_.load(std::memory_order_acquire);
+    }
+
     // Device and encoder info structure
     struct DeviceInfo {
         std::string input_device_name;
@@ -897,9 +906,10 @@ private:
                 // Mix microphone input if available and not muted
                 if (input_buffer != nullptr &&
                     !client->mic_muted_.load(std::memory_order_acquire)) {
-                    // Mix mic with WAV (average mixing to prevent clipping)
+                    // Apply input gain to mic and mix with WAV (average mixing to prevent clipping)
+                    float input_gain = client->input_gain_.load(std::memory_order_acquire);
                     for (unsigned long i = 0; i < frame_count; ++i) {
-                        mixed_input[i] = (mixed_input[i] + input_buffer[i]) * 0.5F;
+                        mixed_input[i] = (mixed_input[i] + input_buffer[i] * input_gain) * 0.5F;
                     }
                     // Calculate RMS for own audio level (from mixed signal)
                     float rms = audio_analysis::calculate_rms(mixed_input.data(),
@@ -927,20 +937,27 @@ private:
                 // This branch preserves exact backward compatibility when WAV is not in use
                 if (input_buffer != nullptr &&
                     !client->mic_muted_.load(std::memory_order_acquire)) {
-                    // Calculate RMS for own audio level
-                    float rms = audio_analysis::calculate_rms(input_buffer, frame_count);
+                    // Apply input gain to mic
+                    float input_gain = client->input_gain_.load(std::memory_order_acquire);
+                    std::array<float, 960> gained_input{};  // Max frame size
+                    for (unsigned long i = 0; i < frame_count; ++i) {
+                        gained_input[i] = input_buffer[i] * input_gain;
+                    }
+
+                    // Calculate RMS for own audio level (after gain)
+                    float rms = audio_analysis::calculate_rms(gained_input.data(), frame_count);
                     client->own_audio_level_.store(rms);
 
                     // Check if input is silence
-                    if (audio_analysis::is_silence(input_buffer, frame_count)) {
+                    if (audio_analysis::is_silence(gained_input.data(), frame_count)) {
                         // Encode silence to maintain packet timing
                         std::vector<float> silence_frame(frame_count, 0.0F);
                         encode_success = client->audio_encoder_.encode(
                             silence_frame.data(), static_cast<int>(frame_count), encoded_data);
                     } else {
-                        // Encode actual audio
+                        // Encode actual audio with gain applied
                         encode_success = client->audio_encoder_.encode(
-                            input_buffer, static_cast<int>(frame_count), encoded_data);
+                            gained_input.data(), static_cast<int>(frame_count), encoded_data);
                     }
                 } else {
                     // Mic muted or no input device - encode silence to maintain timing
@@ -981,6 +998,9 @@ private:
 
     // Microphone mute (thread-safe with atomic)
     std::atomic<bool> mic_muted_{false};  // Mute mic (doesn't send to server)
+
+    // Master input gain (thread-safe with atomic) - 1.0 = unity
+    std::atomic<float> input_gain_{1.0F};
 
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
@@ -1065,10 +1085,16 @@ static void draw_master_strip(Client& client, float available_height) {
                         static_cast<int>(fader_height));
         ImGui::SameLine();
 
-        // Master volume fader
+        // Master volume fader (0-200, 100 = unity gain)
         static int master_vol = 100;
-        JamGui::Fader("##MasterFader", ImVec2(METER_WIDTH, fader_height), &master_vol, 0, 127, "%d",
-                      100.0F / 127.0F);
+        // Sync from client when not dragging
+        if (!ImGui::IsItemActive()) {
+            master_vol = static_cast<int>(client.get_input_gain() * 100.0F);
+        }
+        if (JamGui::Fader("##MasterFader", ImVec2(METER_WIDTH, fader_height), &master_vol, 0, 200,
+                          "%d%%", 1.0F)) {
+            client.set_input_gain(static_cast<float>(master_vol) / 100.0F);
+        }
 
         ImGui::Spacing();
 
@@ -1254,17 +1280,16 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                         static_cast<int>(fader_height));
         ImGui::SameLine();
 
-        // Volume fader - use local cache to prevent jitter
+        // Volume fader - 0-200 range, 100 = unity gain (use local cache to prevent jitter)
         static std::unordered_map<uint32_t, int> vol_cache;
         if (!vol_cache.contains(p.id) || !ImGui::IsItemActive()) {
-            vol_cache[p.id] = static_cast<int>(p.gain * 64.0F);
+            vol_cache[p.id] = static_cast<int>(p.gain * 100.0F);
         }
         int vol = vol_cache[p.id];
-        vol     = std::clamp(vol, 0, 127);
-        if (JamGui::Fader("##vol", ImVec2(METER_WIDTH, fader_height), &vol, 0, 127, "%d",
-                          100.0F / 127.0F)) {
+        vol     = std::clamp(vol, 0, 200);
+        if (JamGui::Fader("##vol", ImVec2(METER_WIDTH, fader_height), &vol, 0, 200, "%d%%", 1.0F)) {
             vol_cache[p.id] = vol;
-            client.set_participant_gain(p.id, static_cast<float>(vol) / 64.0F);
+            client.set_participant_gain(p.id, static_cast<float>(vol) / 100.0F);
         }
 
         ImGui::Spacing();
@@ -1339,8 +1364,9 @@ static void draw_bottom_bar(Client& client) {
             break;
         }
     }
-    if (api_preview == nullptr)
+    if (api_preview == nullptr) {
         api_preview = "All";
+    }
     if (ImGui::BeginCombo("##ApiSelect", api_preview)) {
         if (ImGui::Selectable("All APIs", selected_api < 0)) {
             selected_api = -1;
@@ -1370,8 +1396,9 @@ static void draw_bottom_bar(Client& client) {
     }
     if (ImGui::BeginCombo("##InputDev", input_preview.c_str())) {
         for (const auto& dev: input_devices) {
-            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name)
+            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name) {
                 continue;
+            }
             char dev_label[256];
             std::snprintf(dev_label, sizeof(dev_label), "%s (%s)##dev_%d", dev.name.c_str(),
                           dev.api_name.c_str(), dev.index);
@@ -1397,8 +1424,9 @@ static void draw_bottom_bar(Client& client) {
     }
     if (ImGui::BeginCombo("##OutputDev", output_preview.c_str())) {
         for (const auto& dev: output_devices) {
-            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name)
+            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name) {
                 continue;
+            }
             char dev_label[256];
             std::snprintf(dev_label, sizeof(dev_label), "%s (%s)##dev_%d", dev.name.c_str(),
                           dev.api_name.c_str(), dev.index);
@@ -1504,9 +1532,9 @@ void draw_client_ui(Client& client) {
             // Audio status
             bool is_active = client.is_audio_stream_active();
             if (is_active) {
-                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f), "CONNECTED");
+                ImGui::TextColored(ImVec4(0.3F, 0.9F, 0.3F, 1.0F), "CONNECTED");
             } else {
-                ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.2f, 1.0f), "DISCONNECTED");
+                ImGui::TextColored(ImVec4(0.9F, 0.5F, 0.2F, 1.0F), "DISCONNECTED");
             }
 
             ImGui::Separator();
@@ -1519,7 +1547,7 @@ void draw_client_ui(Client& client) {
 
         // Get available height for channel strips
         float available_height =
-            ImGui::GetContentRegionAvail().y - 60;  // Reserve space for device bar + error
+            ImGui::GetContentRegionAvail().y - 65;  // Reserve space for device bar + error
 
         // Horizontal scrolling mixer area
         ImGui::BeginChild("Mixer", ImVec2(0, available_height), ImGuiChildFlags_None,
@@ -1557,551 +1585,6 @@ void draw_client_ui(Client& client) {
     ImGui::End();
 }
 
-// Keep the old UI as a fallback option (can be removed later)
-void draw_client_ui_old(Client& client) {
-    // Closed by default for better performance
-    static bool demo_open = false;
-    if (demo_open) {
-        ImGui::ShowDemoWindow(&demo_open);
-    }
-
-    // Cache static device/config info (only updates if devices change, which is rare)
-    static Client::DeviceInfo       cached_device_info;
-    static Client::EncoderInfo      cached_encoder_info;
-    static AudioStream::AudioConfig cached_audio_config;
-    static AudioStream::LatencyInfo cached_latency_info;
-    static std::string              cached_server_address;
-    static unsigned short           cached_server_port = 0;
-    static unsigned short           cached_local_port  = 0;
-    static bool                     info_cached        = false;
-
-    // Cache participant info and update every ~4 frames (60 FPS / 4 = ~15 updates/sec)
-    static std::vector<ParticipantInfo> cached_participants;
-    static size_t                       cached_participant_count    = 0;
-    static int                          frame_counter               = 0;
-    static constexpr int                PARTICIPANT_UPDATE_INTERVAL = 4;  // Update every 4 frames
-
-    // Update cached info periodically (only when needed)
-    if (!info_cached || frame_counter % 60 == 0) {  // Check every second for device changes
-        cached_device_info    = client.get_device_info();
-        cached_encoder_info   = client.get_encoder_info();
-        cached_audio_config   = client.get_audio_config();
-        cached_latency_info   = client.get_latency_info();
-        cached_server_address = client.get_server_address();
-        cached_server_port    = client.get_server_port();
-        cached_local_port     = client.get_local_port();
-        info_cached           = true;
-    }
-
-    // Update participant info more frequently (every few frames)
-    if (frame_counter % PARTICIPANT_UPDATE_INTERVAL == 0) {
-        cached_participants      = client.get_participant_info();
-        cached_participant_count = client.get_participant_count();
-    }
-    frame_counter++;
-
-    // Static strings to avoid allocations
-    static const ImVec4 speaking_color(0.0F, 1.0F, 0.0F, 1.0F);
-    static const ImVec4 not_speaking_color(0.5F, 0.5F, 0.5F, 1.0F);
-    static const char*  active_text      = "Active";
-    static const char*  inactive_text    = "Inactive";
-    static const char*  ok_text          = "OK";
-    static const char*  muted_text       = "[Muted] ";
-    static const char*  buffering_text   = "[Buffering] ";
-    static const char*  underruns_prefix = "[Underruns: ";
-    static const char*  plc_prefix       = "[PLC: ";
-
-    if (ImGui::Begin("Client Info (Old)")) {
-        ImGui::Text("Jam Client v0.0.1");
-        ImGui::Separator();
-
-        // FPS and Frame Time side by side
-        const float fps = ImGui::GetIO().Framerate;
-        ImGui::Text("FPS: %.1f", fps);
-        ImGui::SameLine(150.0F);
-        ImGui::Text("Frame Time: %.3f ms", 1000.0F / fps);
-
-        ImGui::Separator();
-        ImGui::Text("Connection:");
-        if (ImGui::BeginTable("Connection", 2, ImGuiTableFlags_BordersInnerV)) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::Text("Server: %s:%u", cached_server_address.c_str(), cached_server_port);
-            ImGui::TableNextColumn();
-            ImGui::Text("Local Port: %u", cached_local_port);
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::Text("Participants: %zu", cached_participant_count);
-            ImGui::TableNextColumn();
-            const bool audio_active = client.is_audio_stream_active();
-            ImGui::Text("Audio Stream: %s", audio_active ? active_text : inactive_text);
-            ImGui::EndTable();
-        }
-
-        ImGui::Separator();
-        ImGui::Text("Audio Devices:");
-
-        // Pending device selections (shared between collapsible and start button)
-        static PaDeviceIndex pending_input_device  = paNoDevice;
-        static PaDeviceIndex pending_output_device = paNoDevice;
-
-        // Device selection UI
-        if (ImGui::CollapsingHeader("Device Selection")) {
-            // Get device lists (cache them, refresh periodically)
-            static std::vector<AudioStream::DeviceInfo> input_devices;
-            static std::vector<AudioStream::DeviceInfo> output_devices;
-            static std::vector<AudioStream::ApiInfo>    apis;
-
-            static int           device_refresh_counter  = 0;
-            static constexpr int DEVICE_REFRESH_INTERVAL = 60;  // Refresh every second at 60 FPS
-            static int           selected_api_idx        = -1;  // -1 means "All APIs"
-
-            if (device_refresh_counter % DEVICE_REFRESH_INTERVAL == 0) {
-                input_devices  = AudioStream::get_input_devices();
-                output_devices = AudioStream::get_output_devices();
-                apis           = AudioStream::get_apis();
-            }
-            device_refresh_counter++;
-
-            // Initialize pending devices with current selections
-            if (pending_input_device == paNoDevice) {
-                pending_input_device = client.get_selected_input_device();
-            }
-            if (pending_output_device == paNoDevice) {
-                pending_output_device = client.get_selected_output_device();
-            }
-
-            // Single API filter (applies to both input and output)
-            ImGui::Text("API Filter:");
-            std::string api_preview =
-                (selected_api_idx >= 0 && selected_api_idx < static_cast<int>(apis.size()))
-                    ? apis[selected_api_idx].name
-                    : "All APIs";
-            if (ImGui::BeginCombo("##API", api_preview.c_str())) {
-                if (ImGui::Selectable("All APIs", selected_api_idx == -1)) {
-                    selected_api_idx = -1;
-                }
-                for (size_t i = 0; i < apis.size(); ++i) {
-                    bool is_selected = (selected_api_idx == static_cast<int>(i));
-                    if (ImGui::Selectable(apis[i].name.c_str(), is_selected)) {
-                        selected_api_idx = static_cast<int>(i);
-                    }
-                    if (is_selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-
-            ImGui::Spacing();
-
-            // Input device selection (filtered by API if selected)
-            ImGui::Text("Input Device:");
-            std::vector<size_t> filtered_input_indices;
-            for (size_t i = 0; i < input_devices.size(); ++i) {
-                if (selected_api_idx < 0 ||
-                    (selected_api_idx < static_cast<int>(apis.size()) &&
-                     input_devices[i].api_name == apis[selected_api_idx].name)) {
-                    filtered_input_indices.push_back(i);
-                }
-            }
-
-            std::string input_preview = "Select Input Device";
-            if (pending_input_device != paNoDevice) {
-                for (size_t i = 0; i < input_devices.size(); ++i) {
-                    if (input_devices[i].index == pending_input_device) {
-                        input_preview =
-                            input_devices[i].name + " (" + input_devices[i].api_name + ")";
-                        break;
-                    }
-                }
-            }
-
-            if (ImGui::BeginCombo("##InputDevice", input_preview.c_str())) {
-                for (size_t filtered_idx: filtered_input_indices) {
-                    size_t      i           = filtered_idx;
-                    bool        is_selected = (input_devices[i].index == pending_input_device);
-                    std::string label =
-                        input_devices[i].name + " (" + input_devices[i].api_name + ")";
-                    if (ImGui::Selectable(label.c_str(), is_selected)) {
-                        pending_input_device = input_devices[i].index;
-                    }
-                    if (is_selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-
-            ImGui::Spacing();
-
-            // Output device selection (filtered by API if selected)
-            ImGui::Text("Output Device:");
-            std::vector<size_t> filtered_output_indices;
-            for (size_t i = 0; i < output_devices.size(); ++i) {
-                if (selected_api_idx < 0 ||
-                    (selected_api_idx < static_cast<int>(apis.size()) &&
-                     output_devices[i].api_name == apis[selected_api_idx].name)) {
-                    filtered_output_indices.push_back(i);
-                }
-            }
-
-            std::string output_preview = "Select Output Device";
-            if (pending_output_device != paNoDevice) {
-                for (size_t i = 0; i < output_devices.size(); ++i) {
-                    if (output_devices[i].index == pending_output_device) {
-                        output_preview =
-                            output_devices[i].name + " (" + output_devices[i].api_name + ")";
-                        break;
-                    }
-                }
-            }
-
-            if (ImGui::BeginCombo("##OutputDevice", output_preview.c_str())) {
-                for (size_t filtered_idx: filtered_output_indices) {
-                    size_t      i           = filtered_idx;
-                    bool        is_selected = (output_devices[i].index == pending_output_device);
-                    std::string label =
-                        output_devices[i].name + " (" + output_devices[i].api_name + ")";
-                    if (ImGui::Selectable(label.c_str(), is_selected)) {
-                        pending_output_device = output_devices[i].index;
-                    }
-                    if (is_selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-
-            ImGui::Spacing();
-
-            // Set Defaults button
-            if (ImGui::Button("Set Defaults")) {
-                PaDeviceIndex default_input  = AudioStream::get_default_input_device();
-                PaDeviceIndex default_output = AudioStream::get_default_output_device();
-
-                if (default_input != paNoDevice) {
-                    pending_input_device = default_input;
-                }
-                if (default_output != paNoDevice) {
-                    pending_output_device = default_output;
-                }
-            }
-
-            ImGui::SameLine();
-
-            // Apply button
-            bool can_apply =
-                (pending_input_device != paNoDevice && pending_output_device != paNoDevice);
-            if (!can_apply) {
-                ImGui::BeginDisabled();
-            }
-            if (ImGui::Button("Apply Devices")) {
-                bool was_active = client.is_audio_stream_active();
-
-                // Stop current stream if active
-                if (was_active) {
-                    client.stop_audio_stream();
-                }
-
-                // Apply device changes
-                client.set_input_device(pending_input_device);
-                client.set_output_device(pending_output_device);
-
-                // Restart stream if it was active
-                if (was_active) {
-                    AudioStream::AudioConfig config = client.get_audio_config();
-                    if (!client.start_audio_stream(pending_input_device, pending_output_device,
-                                                   config)) {
-                        Log::error("Failed to restart audio stream with new devices");
-                    }
-                }
-            }
-            if (!can_apply) {
-                ImGui::EndDisabled();
-            }
-        }
-
-        // Start/Stop audio stream button (outside collapsible)
-        ImGui::Spacing();
-        bool is_active = client.is_audio_stream_active();
-        if (!is_active) {
-            if (ImGui::Button("Start Audio Stream")) {
-                // Initialize pending devices if not set
-                if (pending_input_device == paNoDevice) {
-                    pending_input_device = client.get_selected_input_device();
-                }
-                if (pending_output_device == paNoDevice) {
-                    pending_output_device = client.get_selected_output_device();
-                }
-
-                if (pending_input_device != paNoDevice && pending_output_device != paNoDevice) {
-                    // Apply devices first
-                    client.set_input_device(pending_input_device);
-                    client.set_output_device(pending_output_device);
-
-                    AudioStream::AudioConfig config = client.get_audio_config();
-                    if (!client.start_audio_stream(pending_input_device, pending_output_device,
-                                                   config)) {
-                        Log::error("Failed to start audio stream");
-                    }
-                } else {
-                    Log::error("Please select both input and output devices");
-                }
-            }
-        } else {
-            if (ImGui::Button("Stop Audio Stream")) {
-                client.stop_audio_stream();
-            }
-        }
-
-        // Display current device info
-        if (ImGui::BeginTable("AudioDevices", 2, ImGuiTableFlags_BordersInnerV)) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::Text("Input: %s", cached_device_info.input_device_name.c_str());
-            ImGui::Text("  API: %s", cached_device_info.input_api.c_str());
-            ImGui::Text("  Channels: %d", cached_device_info.input_channels);
-            ImGui::Text("  Sample Rate: %.0f Hz", cached_device_info.input_sample_rate);
-            ImGui::TableNextColumn();
-            ImGui::Text("Output: %s", cached_device_info.output_device_name.c_str());
-            ImGui::Text("  API: %s", cached_device_info.output_api.c_str());
-            ImGui::Text("  Channels: %d", cached_device_info.output_channels);
-            ImGui::Text("  Sample Rate: %.0f Hz", cached_device_info.output_sample_rate);
-            ImGui::EndTable();
-        }
-
-        ImGui::Separator();
-        ImGui::Text("Audio Config:");
-        if (ImGui::BeginTable("AudioConfig", 3, ImGuiTableFlags_BordersInnerV)) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::Text("Stream Config");
-            ImGui::Text("  Frames/buffer: %d", cached_audio_config.frames_per_buffer);
-            ImGui::Text("  Sample rate: %d Hz", cached_encoder_info.sample_rate);
-            ImGui::Text("  Bitrate: %d bps", cached_encoder_info.bitrate);
-            ImGui::Text("  Channels: %d in, %d out", cached_device_info.input_channels,
-                        cached_device_info.output_channels);
-            ImGui::TableNextColumn();
-            ImGui::Text("Latency");
-            ImGui::Text("  Input: %.3f ms", cached_latency_info.input_latency_ms);
-            ImGui::Text("  Output: %.3f ms", cached_latency_info.output_latency_ms);
-            ImGui::Text("  Sample rate: %.1f Hz", cached_latency_info.sample_rate);
-            ImGui::TableNextColumn();
-            ImGui::Text("Opus Encoder");
-            ImGui::Text("  %dch, %dHz", cached_encoder_info.channels,
-                        cached_encoder_info.sample_rate);
-            ImGui::Text("  Target: %d bps", cached_encoder_info.bitrate);
-            ImGui::Text("  Actual: %d bps", cached_encoder_info.actual_bitrate);
-            ImGui::Text("  Complexity: %d", cached_encoder_info.complexity);
-            ImGui::EndTable();
-        }
-
-        ImGui::Separator();
-        ImGui::Text("WAV File Playback:");
-
-        // Cache WAV state (update every frame for responsive UI)
-        static Client::WavState cached_wav_state;
-        cached_wav_state = client.get_wav_state();
-
-        // File path input
-        static char wav_file_path[512] = "";
-        ImGui::InputText("File Path", wav_file_path, sizeof(wav_file_path));
-        ImGui::SameLine();
-        if (ImGui::Button("Load")) {
-            if (strlen(wav_file_path) > 0) {
-                if (client.load_wav_file(wav_file_path)) {
-                    Log::info("WAV file loaded: {}", wav_file_path);
-                } else {
-                    Log::error("Failed to load WAV file: {}", wav_file_path);
-                }
-            }
-        }
-
-        if (cached_wav_state.is_loaded) {
-            // Playback controls
-            if (cached_wav_state.is_playing) {
-                if (ImGui::Button("Pause")) {
-                    client.wav_pause();
-                }
-            } else {
-                if (ImGui::Button("Play")) {
-                    client.wav_play();
-                }
-            }
-
-            ImGui::SameLine();
-
-            // Progress bar and seek
-            float progress = 0.0F;
-            if (cached_wav_state.total_frames > 0) {
-                progress = static_cast<float>(cached_wav_state.position) /
-                           static_cast<float>(cached_wav_state.total_frames);
-            }
-
-            // Display current position / total
-            char progress_text[64];
-            std::snprintf(progress_text, sizeof(progress_text), "%lld / %lld frames",
-                          static_cast<long long>(cached_wav_state.position),
-                          static_cast<long long>(cached_wav_state.total_frames));
-            ImGui::Text("%s", progress_text);
-
-            // Seek slider (only when paused - boundary discipline)
-            if (!cached_wav_state.is_playing) {
-                float seek_pos_float = static_cast<float>(cached_wav_state.position);
-                float max_pos_float  = static_cast<float>(cached_wav_state.total_frames);
-                if (ImGui::SliderFloat("Seek", &seek_pos_float, 0.0F, max_pos_float, "%.0f")) {
-                    int64_t seek_position = static_cast<int64_t>(seek_pos_float);
-                    client.wav_seek(seek_position);
-                }
-            } else {
-                // Show progress bar when playing (non-interactive)
-                ImGui::ProgressBar(progress, ImVec2(-1, 0), "");
-            }
-
-            // Volume/Gain control
-            float wav_gain = cached_wav_state.gain;
-            if (ImGui::SliderFloat("Volume", &wav_gain, 0.0F, 2.0F, "%.2f")) {
-                client.set_wav_gain(wav_gain);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Reset")) {
-                client.set_wav_gain(1.0F);
-            }
-
-            // Mute locally button (still sends over network)
-            bool muted_local = cached_wav_state.muted_local;
-            if (ImGui::Checkbox("Mute Locally", &muted_local)) {
-                client.set_wav_muted_local(muted_local);
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("(?)");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Mutes WAV file in your headphones/speakers, but still sends it to others over "
-                    "the network");
-            }
-
-            // File info
-            ImGui::Text("Sample Rate: %d Hz | Channels: %d", cached_wav_state.sample_rate,
-                        cached_wav_state.channels);
-        } else {
-            ImGui::Text("No WAV file loaded");
-        }
-
-        ImGui::Separator();
-        if (ImGui::BeginTable("NetworkYou", 2, ImGuiTableFlags_BordersInnerV)) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::Text("Network:");
-            const double rtt = client.get_rtt_ms();
-            if (rtt > 0.0) {
-                ImGui::Text("  RTT: %.3f ms", rtt);
-            } else {
-                ImGui::Text("  RTT: -- ms (no ping)");
-            }
-            ImGui::TableNextColumn();
-            ImGui::Text("You:");
-            const float own_level = client.get_own_audio_level();
-            ImGui::Text("  Audio Level: %.3f", own_level);
-            if (own_level > 0.01F) {
-                ImGui::SameLine();
-                ImGui::TextColored(speaking_color, " [Speaking]");
-            }
-            ImGui::EndTable();
-        }
-
-        // Microphone mute button
-        ImGui::Spacing();
-        bool mic_muted = client.get_mic_muted();
-        if (ImGui::Checkbox("Mute Microphone", &mic_muted)) {
-            client.set_mic_muted(mic_muted);
-        }
-        if (mic_muted) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0F, 0.0F, 0.0F, 1.0F), "[MICROPHONE MUTED]");
-        }
-
-        ImGui::Separator();
-        ImGui::Text("Participants:");
-
-        if (cached_participants.empty()) {
-            ImGui::Text("  No other participants");
-        } else {
-            if (ImGui::BeginTable(
-                    "Participants", 6,
-                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-                ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 50.0F);
-                ImGui::TableSetupColumn("Speaking", ImGuiTableColumnFlags_WidthFixed, 80.0F);
-                ImGui::TableSetupColumn("Level", ImGuiTableColumnFlags_WidthFixed, 80.0F);
-                ImGui::TableSetupColumn("Gain", ImGuiTableColumnFlags_WidthFixed, 60.0F);
-                ImGui::TableSetupColumn("Queue", ImGuiTableColumnFlags_WidthFixed, 60.0F);
-                ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableHeadersRow();
-
-                // Pre-allocate status string to avoid reallocations
-                static thread_local std::string status_buffer;
-                status_buffer.clear();
-                status_buffer.reserve(64);  // Pre-allocate reasonable size
-
-                for (const auto& p: cached_participants) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%u", p.id);
-
-                    ImGui::TableNextColumn();
-                    if (p.is_speaking) {
-                        ImGui::TextColored(speaking_color, "Yes");
-                    } else {
-                        ImGui::TextColored(not_speaking_color, "No");
-                    }
-
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%.3f", p.audio_level);
-                    // Visual level bar
-                    ImGui::SameLine();
-                    const float bar_width = ImGui::GetContentRegionAvail().x;
-                    ImGui::ProgressBar(p.audio_level, ImVec2(bar_width * 0.3F, 0.0F), "");
-
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%.2f", p.gain);
-
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%zu", p.queue_size);
-
-                    ImGui::TableNextColumn();
-                    // Build status string efficiently
-                    status_buffer.clear();
-                    if (p.is_muted) {
-                        status_buffer += muted_text;
-                    }
-                    if (!p.buffer_ready) {
-                        status_buffer += buffering_text;
-                    }
-                    if (p.underrun_count > 0) {
-                        status_buffer += underruns_prefix;
-                        status_buffer += std::to_string(p.underrun_count);
-                        status_buffer += "] ";
-                    }
-                    if (p.plc_count > 0) {
-                        status_buffer += plc_prefix;
-                        status_buffer += std::to_string(p.plc_count);
-                        status_buffer += "] ";
-                    }
-                    if (status_buffer.empty()) {
-                        ImGui::TextUnformatted(ok_text);
-                    } else {
-                        ImGui::TextUnformatted(status_buffer.c_str());
-                    }
-                }
-
-                ImGui::EndTable();
-            }
-        }
-    }
-    ImGui::End();
-}
-
 int main() {
     try {
         auto& log = Logger::instance();
@@ -2130,7 +1613,7 @@ int main() {
 
         // Run UI on main thread (required for GLFW on macOS)
         {
-            Gui app(800, 550, "Jam", false, 60);
+            Gui app(810, 550, "Jam", false, 60);
 
             // Clean lambda - just delegates to separate function
             app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });
