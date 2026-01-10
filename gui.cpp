@@ -25,7 +25,6 @@ void UvMeter(const char* label, const ImVec2& size, int* value, int v_min, int v
     ImGui::InvisibleButton(label, size);
 
     float step_height = size.y / static_cast<float>(v_max - v_min + 1);
-    float y           = pos.y + size.y;
     float hue         = 0.4f;
     float sat         = 0.6f;
 
@@ -34,7 +33,13 @@ void UvMeter(const char* label, const ImVec2& size, int* value, int v_min, int v
         // HSV gradient: 0.4 (green/cyan) at bottom to 0.15 (red/orange) at top
         hue = 0.4f - (static_cast<float>(i - v_min) / static_cast<float>(v_max - v_min)) * 0.25f;
         // Saturation: 0.0 (grey) when inactive, 0.6 when active
-        sat = (*value < i ? 0.0f : 0.6f);
+        // Bottom segment (i == v_min) is only active when value > 0
+        // Other segments are active when value >= threshold i
+        if (i == v_min) {
+            sat = (*value > i ? 0.6f : 0.0f);
+        } else {
+            sat = (*value >= i ? 0.6f : 0.0f);
+        }
 
         float segment_height = step_height * 4.0f;
         float segment_y      = pos.y + size.y - (static_cast<float>(i - v_min) * step_height);

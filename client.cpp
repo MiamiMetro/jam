@@ -1094,7 +1094,9 @@ static void draw_master_strip(Client& client, float available_height) {
     float       line_height = ImGui::GetTextLineHeightWithSpacing();
 
     // Dynamic fader height - scale with available space, min 200, max based on window
-    float fader_height = std::max(200.0F, available_height - 350.0F);
+    // Reserved space: title, mute btn, fader/meter, label, separator, latency section (4 lines),
+    // separator, WAV section
+    float fader_height = std::max(200.0F, available_height - 370.0F);
 
     // Padding constant
     constexpr float PADDING = 8.0F;
@@ -1162,12 +1164,16 @@ static void draw_master_strip(Client& client, float available_height) {
 
         // ========== LATENCY INFO (with padding) ==========
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        AudioStream::LatencyInfo latency = client.get_latency_info();
-        ImGui::Text("Latency:");
+        Client::DeviceInfo       device_info  = client.get_device_info();
+        AudioStream::LatencyInfo latency      = client.get_latency_info();
+        AudioStream::AudioConfig audio_config = client.get_audio_config();
+        ImGui::Text("%s", device_info.output_api.c_str());
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        ImGui::Text("In: %.1fms", latency.input_latency_ms);
+        ImGui::Text("In: %.1f ms", latency.input_latency_ms);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        ImGui::Text("Out: %.1fms", latency.output_latency_ms);
+        ImGui::Text("Out: %.1f ms", latency.output_latency_ms);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("SR: %d kHz", audio_config.sample_rate / 1000);
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -1641,7 +1647,8 @@ void draw_client_ui(Client& client) {
                         return std::to_string(bytes / 1024) + " KB";
                     }
                     char buf[32];
-                    std::snprintf(buf, sizeof(buf), "%.2f MB", bytes / (1024.0 * 1024.0));
+                    std::snprintf(buf, sizeof(buf), "%.2f MB",
+                                  static_cast<double>(bytes) / (1024.0 * 1024.0));
                     return std::string(buf);
                 };
 
