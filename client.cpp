@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -20,14 +21,15 @@
 #ifndef NOMINMAX
 #define NOMINMAX  // Prevent Windows from defining min/max macros
 #endif
-#include <winsock2.h>  // Must come before windows.h
-#include <windows.h>   // For SetThreadPriority
+#include <windows.h>
+#include <winsock2.h>
 #endif
 
 #include <asio.hpp>
 #include <asio/buffer.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
+#include <asio/socket_base.hpp>
 #include <concurrentqueue.h>
 #include <imgui.h>
 #include <opus.h>
@@ -526,7 +528,7 @@ public:
               const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
         // Add to total bytes sent
         total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
-        
+
         socket_.async_send_to(asio::buffer(data, len), server_endpoint_,
                               [keep_alive](std::error_code error_code, std::size_t) {
                                   if (error_code) {
@@ -1427,8 +1429,45 @@ static void draw_bottom_bar(Client& client) {
         for (const auto& api: available_apis) {
             char api_label[128];
             std::snprintf(api_label, sizeof(api_label), "%s##api_%d", api.name.c_str(), api.index);
-            if (ImGui::Selectable(api_label, api.index == selected_api)) {
+            bool is_selected = (api.index == selected_api);
+            if (ImGui::Selectable(api_label, is_selected)) {
+                int old_api  = selected_api;
                 selected_api = api.index;
+
+                // Auto-switch: when user selects an API, automatically switch to first devices with
+                // that API
+                if (old_api != selected_api && selected_api >= 0) {
+                    // Find first available input device with this API
+                    PaDeviceIndex new_input = paNoDevice;
+                    for (const auto& dev: input_devices) {
+                        if (dev.api_name == api.name) {
+                            new_input = dev.index;
+                            break;
+                        }
+                    }
+
+                    // Find first available output device with this API
+                    PaDeviceIndex new_output = paNoDevice;
+                    for (const auto& dev: output_devices) {
+                        if (dev.api_name == api.name) {
+                            new_output = dev.index;
+                            break;
+                        }
+                    }
+
+                    // Switch if we found both devices (preferred)
+                    if (new_input != paNoDevice && new_output != paNoDevice) {
+                        pending_input  = new_input;
+                        pending_output = new_output;
+                    } else if (new_input != paNoDevice) {
+                        // Found input but not output - switch input only
+                        pending_input = new_input;
+                    } else if (new_output != paNoDevice) {
+                        // Found output but not input - switch output only
+                        pending_output = new_output;
+                    }
+                    // If neither found, just keep filter active (user can manually select)
+                }
             }
         }
         ImGui::EndCombo();
@@ -1585,31 +1624,32 @@ void draw_client_ui(Client& client) {
             // Total bytes sent/received (throttled updates to reduce CPU usage)
             static std::string cached_rx_str = "0 B";
             static std::string cached_tx_str = "0 B";
-            static auto last_update = std::chrono::steady_clock::now();
-            
+            static auto        last_update   = std::chrono::steady_clock::now();
+
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count() >= 1000) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count() >=
+                1000) {
                 uint64_t total_rx = client.get_total_bytes_rx();
                 uint64_t total_tx = client.get_total_bytes_tx();
-                
+
                 // Format as KB or MB
                 auto format_bytes = [](uint64_t bytes) -> std::string {
                     if (bytes < 1024) {
                         return std::to_string(bytes) + " B";
-                    } else if (bytes < 1024 * 1024) {
-                        return std::to_string(bytes / 1024) + " KB";
-                    } else {
-                        char buf[32];
-                        std::snprintf(buf, sizeof(buf), "%.2f MB", bytes / (1024.0 * 1024.0));
-                        return std::string(buf);
                     }
+                    if (bytes < static_cast<uint64_t>(1024 * 1024)) {
+                        return std::to_string(bytes / 1024) + " KB";
+                    }
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "%.2f MB", bytes / (1024.0 * 1024.0));
+                    return std::string(buf);
                 };
-                
+
                 cached_rx_str = format_bytes(total_rx);
                 cached_tx_str = format_bytes(total_tx);
-                last_update = now;
+                last_update   = now;
             }
-            
+
             ImGui::Text("RX: %s", cached_rx_str.c_str());
             ImGui::SameLine();
             ImGui::Text("TX: %s", cached_tx_str.c_str());
