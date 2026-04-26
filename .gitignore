@@ -1,12 +1,31 @@
-build
-out
-cmake-build-*/
-.vscode
-.vscode-test
-.cursor
-.idea
-node_modules
-.cache
+# Operating system files
 .DS_Store
-*.ini
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.vscode-test/
+.idea/
+.cursor/
+.claude
+.agents
+
+skills-lock.json
+
+# Build artifacts and outputs
+build/
+out/
+cmake-build-*/
 hls/
+
+# Dependencies / caches
+node_modules/
+.cache/
+
+# Project notes and static output
+notes/
+html/
+
+# Config and logs
+*.ini
+*.log
