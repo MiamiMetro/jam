@@ -96,14 +96,6 @@ public:
     }
 
 private:
-    static std::string fixed_string(const char* data, size_t capacity) {
-        size_t len = 0;
-        while (len < capacity && data[len] != '\0') {
-            ++len;
-        }
-        return std::string(data, len);
-    }
-
     void handle_receive_error(std::error_code error_code) {
         Log::error("receive error: {}", error_code.message());
         client_manager_.remove_client(remote_endpoint_);
@@ -143,37 +135,17 @@ private:
 
         switch (chdr.type) {
             case CtrlHdr::Cmd::JOIN: {
-                std::string room_id = "default";
-                std::string room_handle;
-                std::string user_id;
-                std::string display_name;
-                bool        has_join_token = false;
-                if (bytes >= sizeof(JoinCtrlHdr)) {
-                    JoinCtrlHdr join_hdr{};
-                    std::memcpy(&join_hdr, recv_buf_.data(), sizeof(JoinCtrlHdr));
-                    room_id        = fixed_string(join_hdr.room_id, ROOM_ID_SIZE);
-                    room_handle    = fixed_string(join_hdr.room_handle, ROOM_HANDLE_SIZE);
-                    user_id        = fixed_string(join_hdr.user_id, USER_ID_SIZE);
-                    display_name   = fixed_string(join_hdr.display_name, DISPLAY_NAME_SIZE);
-                    has_join_token = fixed_string(join_hdr.join_token, JOIN_TOKEN_SIZE).size() > 0;
-                }
-                uint32_t client_id =
-                    client_manager_.register_client(remote_endpoint_, now, room_id, room_handle,
-                                                    user_id, display_name, has_join_token);
-                Log::info("Client JOIN: {}:{} (ID: {}, room: {}, user: {}, token: {})",
-                          remote_endpoint_.address().to_string(), remote_endpoint_.port(),
-                          client_id, room_id.empty() ? "default" : room_id,
-                          display_name.empty() ? user_id : display_name,
-                          has_join_token ? "present" : "missing");
+                uint32_t client_id = client_manager_.register_client(remote_endpoint_, now);
+                Log::info("Client JOIN: {}:{} (ID: {})", remote_endpoint_.address().to_string(),
+                          remote_endpoint_.port(), client_id);
                 break;
             }
             case CtrlHdr::Cmd::LEAVE: {
                 Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
                           remote_endpoint_.port());
-                std::string room_id = client_manager_.get_room_id(remote_endpoint_);
                 uint32_t leaving_client_id = client_manager_.remove_client(remote_endpoint_);
                 if (leaving_client_id > 0) {
-                    broadcast_participant_leave(leaving_client_id, room_id);
+                    broadcast_participant_leave(leaving_client_id);
                 }
                 break;
             }
@@ -229,21 +201,21 @@ private:
 
     void alive_check_timer_callback() {
         auto now = std::chrono::steady_clock::now();
-        auto timed_out_clients =
+        auto timed_out_ids =
             client_manager_.remove_timed_out_clients(now, server_config::CLIENT_TIMEOUT);
 
-        for (const auto& timed_out: timed_out_clients) {
-            Log::info("Client timed out (ID: {})", timed_out.client_id);
-            broadcast_participant_leave(timed_out.client_id, timed_out.room_id);
+        for (uint32_t timed_out_id: timed_out_ids) {
+            Log::info("Client timed out (ID: {})", timed_out_id);
+            broadcast_participant_leave(timed_out_id);
         }
     }
 
-    void broadcast_participant_leave(uint32_t participant_id, const std::string& room_id) {
+    void broadcast_participant_leave(uint32_t participant_id) {
         // Broadcast to all clients that a participant has left
         auto buf = packet_builder::create_participant_leave_packet(participant_id);
 
         // Get endpoints from manager (safe copy)
-        auto endpoints = client_manager_.get_room_endpoints(room_id.empty() ? "default" : room_id);
+        auto endpoints = client_manager_.get_all_endpoints();
 
         for (const auto& endpoint: endpoints) {
             send(buf->data(), sizeof(CtrlHdr), endpoint, buf);
@@ -257,7 +229,7 @@ private:
         // keep_alive ensures packet data remains valid during async sends
 
         // Get endpoints from manager (safe copy, excluding sender)
-        auto endpoints = client_manager_.get_room_endpoints_except(sender);
+        auto endpoints = client_manager_.get_endpoints_except(sender);
 
         for (const auto& endpoint: endpoints) {
             send(packet_data, packet_size, endpoint, keep_alive);
@@ -274,26 +246,18 @@ private:
     PeriodicTimer alive_check_timer_;
 };
 
-int main(int argc, char** argv) {
+int main() {
     try {
         asio::io_context io_context;
-        short            server_port = 9999;
-        for (int i = 1; i < argc; ++i) {
-            std::string arg = argv[i];
-            if ((arg == "--port" || arg == "-p") && i + 1 < argc) {
-                server_port = static_cast<short>(std::stoi(argv[++i]));
-            } else if (arg.rfind("--port=", 0) == 0) {
-                server_port = static_cast<short>(std::stoi(arg.substr(7)));
-            }
-        }
+        constexpr short  SERVER_PORT = 9999;
 
         auto& log = Logger::instance();
         log.init(true, false, false, "", spdlog::level::info);
 
-        Log::info("Starting SFU server on 0.0.0.0:{}", server_port);
+        Log::info("Starting SFU server on 127.0.0.1:{}", SERVER_PORT);
         Log::info("Forwarding audio packets between clients");
 
-        Server server(io_context, server_port);
+        Server server(io_context, SERVER_PORT);
 
         io_context.run();
     } catch (std::exception& e) {

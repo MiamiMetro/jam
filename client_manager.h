@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -18,32 +17,16 @@ public:
     using endpoint   = asio::ip::udp::endpoint;
     using time_point = std::chrono::steady_clock::time_point;
 
-    struct DepartedClient {
-        uint32_t    client_id = 0;
-        std::string room_id;
-    };
-
     ClientManager() : next_client_id_(1) {}
 
     // Register a new client (returns assigned client ID)
     uint32_t register_client(const endpoint& ep, time_point now) {
-        return register_client(ep, now, "default", "", "", "", false);
-    }
-
-    uint32_t register_client(const endpoint& ep, time_point now, const std::string& room_id,
-                             const std::string& room_handle, const std::string& user_id,
-                             const std::string& display_name, bool has_join_token) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto&                       client = clients_[ep];
         if (client.client_id == 0) {
             client.client_id = next_client_id_++;
         }
-        client.last_alive     = now;
-        client.room_id        = room_id.empty() ? "default" : room_id;
-        client.room_handle    = room_handle;
-        client.user_id        = user_id;
-        client.display_name   = display_name;
-        client.has_join_token = has_join_token;
+        client.last_alive = now;
         return client.client_id;
     }
 
@@ -79,12 +62,6 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = clients_.find(ep);
         return it != clients_.end() ? it->second.client_id : 0;
-    }
-
-    std::string get_room_id(const endpoint& ep) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto                        it = clients_.find(ep);
-        return it != clients_.end() ? it->second.room_id : "default";
     }
 
     // Check if any clients exist
@@ -123,51 +100,21 @@ public:
         return endpoints;
     }
 
-    std::vector<endpoint> get_room_endpoints_except(const endpoint& exclude) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<endpoint>       endpoints;
-        auto                        sender_it = clients_.find(exclude);
-        if (sender_it == clients_.end()) {
-            return endpoints;
-        }
-        const auto& room_id = sender_it->second.room_id;
-        endpoints.reserve(clients_.size());
-        for (const auto& [ep, info]: clients_) {
-            if (ep != exclude && info.room_id == room_id) {
-                endpoints.push_back(ep);
-            }
-        }
-        return endpoints;
-    }
-
-    std::vector<endpoint> get_room_endpoints(const std::string& room_id) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<endpoint>       endpoints;
-        endpoints.reserve(clients_.size());
-        for (const auto& [ep, info]: clients_) {
-            if (info.room_id == room_id) {
-                endpoints.push_back(ep);
-            }
-        }
-        return endpoints;
-    }
-
     // Remove timed out clients (returns list of timed out client IDs)
-    std::vector<DepartedClient> remove_timed_out_clients(time_point now,
-                                                         std::chrono::seconds timeout) {
+    std::vector<uint32_t> remove_timed_out_clients(time_point now, std::chrono::seconds timeout) {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<DepartedClient> timed_out_clients;
+        std::vector<uint32_t>       timed_out_ids;
 
         for (auto it = clients_.begin(); it != clients_.end();) {
             if (now - it->second.last_alive > timeout) {
-                timed_out_clients.push_back({it->second.client_id, it->second.room_id});
+                timed_out_ids.push_back(it->second.client_id);
                 it = clients_.erase(it);
             } else {
                 ++it;
             }
         }
 
-        return timed_out_clients;
+        return timed_out_ids;
     }
 
     // Access client info with lock (use with caution - callback must be fast)

@@ -16,7 +16,6 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -59,21 +58,11 @@
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
-struct NativeJamSession {
-    std::string room_id;
-    std::string room_handle;
-    std::string user_id;
-    std::string display_name;
-    std::string join_token;
-};
-
 class Client {
 public:
-    Client(asio::io_context& io_context, const std::string& server_address, short server_port,
-           NativeJamSession native_session = {})
+    Client(asio::io_context& io_context, const std::string& server_address, short server_port)
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
-          native_session_(std::move(native_session)),
           selected_input_device_(AudioStream::NO_DEVICE),
           selected_output_device_(AudioStream::NO_DEVICE),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
@@ -132,7 +121,12 @@ public:
 
         Log::info("Connected and receiving!");
 
-        send_join_message();
+        // Send JOIN message
+        CtrlHdr chdr{};
+        chdr.magic = CTRL_MAGIC;
+        chdr.type  = CtrlHdr::Cmd::JOIN;
+        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
+        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
     }
 
     // Stop connection (stops sending/receiving UDP packets)
@@ -220,25 +214,6 @@ public:
     void stop_audio_stream() {
         audio_.stop_audio_stream();
         stop_pcm_sender_thread();
-    }
-
-    void send_join_message() {
-        JoinCtrlHdr join_hdr{};
-        join_hdr.magic = CTRL_MAGIC;
-        join_hdr.type  = CtrlHdr::Cmd::JOIN;
-        copy_fixed(join_hdr.room_id, native_session_.room_id);
-        copy_fixed(join_hdr.room_handle, native_session_.room_handle);
-        copy_fixed(join_hdr.user_id, native_session_.user_id);
-        copy_fixed(join_hdr.display_name, native_session_.display_name);
-        copy_fixed(join_hdr.join_token, native_session_.join_token);
-        std::memcpy(ctrl_tx_buf_.data(), &join_hdr, sizeof(JoinCtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(JoinCtrlHdr));
-        Log::info("Sent JOIN for room '{}' handle '{}' user '{}' token {}",
-                  native_session_.room_id.empty() ? "default" : native_session_.room_id,
-                  native_session_.room_handle, native_session_.display_name.empty()
-                                                   ? native_session_.user_id
-                                                   : native_session_.display_name,
-                  native_session_.join_token.empty() ? "missing" : "present");
     }
 
     // Getters for UI access
@@ -1564,7 +1539,7 @@ private:
 
     std::array<char, 1024>         recv_buf_;
     std::array<unsigned char, 128> sync_tx_buf_;
-    std::array<unsigned char, sizeof(JoinCtrlHdr)> ctrl_tx_buf_;
+    std::array<unsigned char, 128> ctrl_tx_buf_;
 
     AudioStream              audio_;
     OpusEncoderWrapper       audio_encoder_;
@@ -1593,15 +1568,6 @@ private:
 
     // Microphone mute (thread-safe with atomic)
     std::atomic<bool> mic_muted_{false};  // Mute mic (doesn't send to server)
-
-    template <size_t N>
-    static void copy_fixed(char (&dest)[N], const std::string& value) {
-        const size_t len = std::min(value.size(), N - 1);
-        std::memcpy(dest, value.data(), len);
-        dest[len] = '\0';
-    }
-
-    NativeJamSession native_session_;
 
     // Master input gain (thread-safe with atomic) - 1.0 = unity
     std::atomic<float> input_gain_{1.0F};
@@ -2397,14 +2363,11 @@ void draw_client_ui(Client& client) {
 
 struct ClientStartupOptions {
     int requested_frames = 0;
-    std::string server_address = "127.0.0.1";
-    short server_port = 9999;
     bool list_audio_devices = false;
     bool audio_open_smoke = false;
     bool low_latency_check = false;
     std::optional<AudioCodec> startup_codec;
     std::string required_audio_api;
-    NativeJamSession native_session;
 };
 
 int run_audio_open_smoke(const ClientStartupOptions& startup_options);
@@ -2413,49 +2376,16 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
     ClientStartupOptions options;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        auto next_value = [&](const std::string& name) -> std::optional<std::string> {
-            const std::string prefix = name + "=";
-            if (arg.rfind(prefix, 0) == 0) {
-                return arg.substr(prefix.size());
-            }
-            if (arg == name && i + 1 < argc) {
-                return std::string(argv[++i]);
-            }
-            return std::nullopt;
-        };
-
-        if (auto value = next_value("--frames"); value.has_value()) {
-            options.requested_frames = std::stoi(*value);
-        } else if (auto value = next_value("--buffer-frames"); value.has_value()) {
-            options.requested_frames = std::stoi(*value);
+        if ((arg == "--frames" || arg == "--buffer-frames") && i + 1 < argc) {
+            options.requested_frames = std::stoi(argv[++i]);
         } else if (arg == "--list-audio-devices" || arg == "--audio-devices") {
             options.list_audio_devices = true;
         } else if (arg == "--audio-open-smoke") {
             options.audio_open_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
-        } else if (auto value = next_value("--server"); value.has_value()) {
-            options.server_address = *value;
-        } else if (auto value = next_value("--host"); value.has_value()) {
-            options.server_address = *value;
-        } else if (auto value = next_value("--port"); value.has_value()) {
-            options.server_port = static_cast<short>(std::stoi(*value));
-        } else if (auto value = next_value("--room"); value.has_value()) {
-            options.native_session.room_id = *value;
-        } else if (auto value = next_value("--room-id"); value.has_value()) {
-            options.native_session.room_id = *value;
-        } else if (auto value = next_value("--room-handle"); value.has_value()) {
-            options.native_session.room_handle = *value;
-        } else if (auto value = next_value("--user-id"); value.has_value()) {
-            options.native_session.user_id = *value;
-        } else if (auto value = next_value("--display-name"); value.has_value()) {
-            options.native_session.display_name = *value;
-        } else if (auto value = next_value("--join-token"); value.has_value()) {
-            options.native_session.join_token = *value;
-        } else if (auto value = next_value("--token"); value.has_value()) {
-            options.native_session.join_token = *value;
-        } else if (auto value = next_value("--codec"); value.has_value()) {
-            std::string codec = *value;
+        } else if (arg == "--codec" && i + 1 < argc) {
+            std::string codec = argv[++i];
             std::transform(codec.begin(), codec.end(), codec.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (codec == "opus") {
@@ -2463,10 +2393,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             } else if (codec == "pcm" || codec == "raw" || codec == "pcm_int16") {
                 options.startup_codec = AudioCodec::PcmInt16;
             }
-        } else if (auto value = next_value("--require-api"); value.has_value()) {
-            options.required_audio_api = *value;
-        } else if (auto value = next_value("--api"); value.has_value()) {
-            options.required_audio_api = *value;
+        } else if ((arg == "--require-api" || arg == "--api") && i + 1 < argc) {
+            options.required_audio_api = argv[++i];
         }
     }
     return options;
@@ -2587,8 +2515,7 @@ int main(int argc, char** argv) {
 
         asio::io_context io_context;
 
-        Client client_instance(io_context, startup_options.server_address, startup_options.server_port,
-                               startup_options.native_session);
+        Client client_instance(io_context, "127.0.0.1", 9999);
         if (!startup_options.required_audio_api.empty()) {
             const auto input_dev =
                 find_device_for_api(startup_options.required_audio_api, true);
