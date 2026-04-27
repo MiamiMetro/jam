@@ -66,10 +66,10 @@ public:
         opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(bitrate));
         opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
         opus_encoder_ctl(encoder_, OPUS_SET_APPLICATION(OPUS_APPLICATION_RESTRICTED_LOWDELAY));
-        opus_encoder_ctl(encoder_, OPUS_SET_VBR(1));  // Variable bitrate for better quality
-        opus_encoder_ctl(encoder_, OPUS_SET_VBR_CONSTRAINT(0));  // Unconstrained VBR for music
-        opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(1));      // Forward error correction for UDP
-        opus_encoder_ctl(encoder_, OPUS_SET_PACKET_LOSS_PERC(5));  // Expect some packet loss
+        opus_encoder_ctl(encoder_, OPUS_SET_VBR(0));  // CBR-style pacing for jamming
+        opus_encoder_ctl(encoder_, OPUS_SET_VBR_CONSTRAINT(1));
+        opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(0));  // Avoid extra FEC delay/bit use
+        opus_encoder_ctl(encoder_, OPUS_SET_PACKET_LOSS_PERC(0));
         opus_encoder_ctl(encoder_,
                          OPUS_SET_DTX(0));  // Disable DTX for music (no silence detection)
 
@@ -94,6 +94,11 @@ public:
     bool encode(const float* input, int frame_size, std::vector<unsigned char>& output) {
         if (encoder_ == nullptr) {
             Log::error("Opus encoder not initialized.");
+            output.clear();
+            return false;
+        }
+        if (!is_legal_frame_size(sample_rate_, frame_size)) {
+            Log::error("Illegal Opus frame size: {} samples at {} Hz", frame_size, sample_rate_);
             output.clear();
             return false;
         }
@@ -128,6 +133,18 @@ public:
         int32_t actual_bitrate;
         opus_encoder_ctl(encoder_, OPUS_GET_BITRATE(&actual_bitrate));
         return actual_bitrate;
+    }
+
+    static bool is_legal_frame_size(int sample_rate, int frame_size) {
+        // Opus accepts 2.5, 5, 10, 20, 40, or 60 ms frames.
+        constexpr int durations_per_400_ms[] = {1, 2, 4, 8, 16, 24};
+        for (int duration: durations_per_400_ms) {
+            if ((sample_rate * duration) / 400 == frame_size &&
+                (sample_rate * duration) % 400 == 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
 private:

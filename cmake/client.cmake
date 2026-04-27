@@ -7,9 +7,9 @@ include(cmake/common.cmake)
 # ============================================================
 
 FetchContent_Declare(
-    portaudio
-    GIT_REPOSITORY https://github.com/PortAudio/portaudio.git
-    GIT_TAG        b0cc303e95fdb7c6c953337051378071c9043e88
+    rtaudio
+    GIT_REPOSITORY https://github.com/thestk/rtaudio.git
+    GIT_TAG        6.0.1
 )
 
 FetchContent_Declare(
@@ -27,9 +27,10 @@ FetchContent_Declare(
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RTAUDIO_API_ASIO ON CACHE BOOL "Build RtAudio ASIO backend" FORCE)
 find_package(OpenGL REQUIRED)
 
-FetchContent_MakeAvailable(portaudio imgui glfw)
+FetchContent_MakeAvailable(rtaudio imgui glfw)
 
 # ============================================================
 # Client Wrappers
@@ -55,5 +56,5 @@ target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 # ============================================================
 
 add_executable(client client.cpp gui.cpp)
-target_link_libraries(client PRIVATE asio concurrentqueue spdlog::spdlog portaudio opus imgui_lib)
+target_link_libraries(client PRIVATE asio concurrentqueue spdlog::spdlog rtaudio opus imgui_lib)
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <concurrentqueue.h>
 #include <cstdint>
@@ -15,6 +16,10 @@ struct OpusPacket {
     uint16_t                              size = 0;  // Actual data size (<= AUDIO_BUF_SIZE)
     std::array<uint8_t, AUDIO_BUF_SIZE>   data;      // Fixed buffer (no allocations)
     std::chrono::steady_clock::time_point timestamp;
+    AudioCodec                            codec = AudioCodec::Opus;
+    uint32_t                              sequence = 0;
+    uint16_t                              frame_count = 0;
+    uint8_t                               channels = 1;
 
     // Helper to get data pointer and size (compatible with old vector API)
     const uint8_t* get_data() const {
@@ -47,6 +52,19 @@ struct ParticipantData {
     std::array<size_t, 8> queue_size_history = {};  // Rolling history for adaptive buffer
     size_t                history_index      = 0;   // Current index in history
     size_t                plc_count          = 0;   // PLC invocations (for diagnostics)
+    AudioCodec            last_codec         = AudioCodec::Opus;
+    std::atomic<int64_t>   packet_age_last_ns{0};
+    std::atomic<int64_t>   packet_age_max_ns{0};
+    std::atomic<int64_t>   packet_age_avg_ns{0};
+    std::atomic<size_t>    queue_depth_max{0};
+    std::atomic<size_t>    queue_depth_avg{0};
+    std::atomic<int64_t>   queue_depth_drift_milli{0};
+    bool                   sequence_initialized = false;
+    uint32_t               next_expected_sequence = 0;
+    std::atomic<uint64_t>   sequence_gaps{0};
+    std::atomic<uint64_t>   sequence_late_or_reordered{0};
+    std::atomic<uint64_t>   jitter_depth_drops{0};
+    std::atomic<uint64_t>   jitter_age_drops{0};
 };
 
 // Lightweight view for UI (snapshot of ParticipantData)
@@ -59,6 +77,16 @@ struct ParticipantInfo {
     float    pan;  // 0.0 = full left, 0.5 = center, 1.0 = full right
     bool     buffer_ready;
     size_t   queue_size;
+    size_t   queue_size_avg;
+    size_t   queue_size_max;
+    double   queue_drift_packets;
     int      underrun_count;
     size_t   plc_count;  // PLC invocations for diagnostics
+    double   packet_age_last_ms;
+    double   packet_age_avg_ms;
+    double   packet_age_max_ms;
+    uint64_t sequence_gaps;
+    uint64_t sequence_late_or_reordered;
+    uint64_t jitter_depth_drops;
+    uint64_t jitter_age_drops;
 };

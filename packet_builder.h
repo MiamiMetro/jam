@@ -42,4 +42,21 @@ inline uint16_t extract_encoded_bytes(const unsigned char* packet_data) {
     return encoded_bytes;
 }
 
+inline uint16_t extract_v2_payload_bytes(const unsigned char* packet_data) {
+    uint16_t payload_bytes;
+    std::memcpy(&payload_bytes,
+                packet_data + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint32_t) +
+                    sizeof(uint32_t) + sizeof(uint16_t),
+                sizeof(uint16_t));
+    return payload_bytes;
+}
+
+inline const unsigned char* audio_v1_payload(const unsigned char* packet_data) {
+    return packet_data + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+}
+
+inline const unsigned char* audio_v2_payload(const unsigned char* packet_data) {
+    return packet_data + sizeof(AudioHdrV2) - AUDIO_BUF_SIZE;
+}
+
 }  // namespace packet_builder

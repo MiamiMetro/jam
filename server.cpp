@@ -76,7 +76,7 @@ public:
             handle_ping_message(bytes);
         } else if (hdr.magic == CTRL_MAGIC) {
             handle_ctrl_message(bytes);
-        } else if (hdr.magic == AUDIO_MAGIC) {
+        } else if (hdr.magic == AUDIO_MAGIC || hdr.magic == AUDIO_V2_MAGIC) {
             handle_audio_message(bytes);
         }
 
@@ -165,10 +165,13 @@ private:
     }
 
     void handle_audio_message(std::size_t bytes) {
-        // Minimum size check (magic + sender_id + encoded_bytes)
-        constexpr size_t MIN_AUDIO_PACKET_SIZE =
-            sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
-        if (!message_validator::is_valid_audio_packet(bytes, MIN_AUDIO_PACKET_SIZE)) {
+        MsgHdr hdr{};
+        std::memcpy(&hdr, recv_buf_.data(), sizeof(MsgHdr));
+
+        const size_t min_audio_packet_size =
+            hdr.magic == AUDIO_V2_MAGIC ? sizeof(AudioHdrV2) - AUDIO_BUF_SIZE
+                                        : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+        if (!message_validator::is_valid_audio_packet(bytes, min_audio_packet_size)) {
             Log::debug("Audio packet too small: {} bytes", bytes);
             do_receive();
             return;

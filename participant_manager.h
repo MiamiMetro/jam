@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -13,6 +14,8 @@
 // Manages remote participants (other clients) and their audio state
 class ParticipantManager {
 public:
+    static constexpr size_t MAX_AUDIO_CALLBACK_PARTICIPANTS = 32;
+
     ParticipantManager() = default;
 
     // Register a new participant with decoder initialization
@@ -23,18 +26,18 @@ public:
             return true;  // Already registered
         }
 
-        ParticipantData new_participant;
-        new_participant.decoder = std::make_unique<OpusDecoderWrapper>();
+        auto new_participant = std::make_shared<ParticipantData>();
+        new_participant->decoder = std::make_unique<OpusDecoderWrapper>();
 
-        if (!new_participant.decoder->create(sample_rate, channels)) {
+        if (!new_participant->decoder->create(sample_rate, channels)) {
             Log::error("Failed to create decoder for participant {} ({}Hz, {}ch)", id, sample_rate,
                        channels);
             return false;
         }
 
-        new_participant.pcm_buffer.fill(0.0F);  // Initialize preallocated buffer
-        new_participant.last_packet_time = std::chrono::steady_clock::now();
-        participants_[id]                = std::move(new_participant);
+        new_participant->pcm_buffer.fill(0.0F);  // Initialize preallocated buffer
+        new_participant->last_packet_time = std::chrono::steady_clock::now();
+        participants_[id]                 = std::move(new_participant);
 
         Log::info("New participant {} joined (decoder: {}Hz, {}ch)", id, sample_rate, channels);
         return true;
@@ -62,7 +65,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = participants_.find(id);
         if (it != participants_.end()) {
-            func(it->second);
+            func(*it->second);
             return true;
         }
         return false;
@@ -77,15 +80,30 @@ public:
         for (const auto& [id, data]: participants_) {
             ParticipantInfo info;
             info.id             = id;
-            info.is_speaking    = data.is_speaking;
-            info.is_muted       = data.is_muted;
-            info.audio_level    = data.current_level;
-            info.gain           = data.gain;
-            info.pan            = data.pan;
-            info.buffer_ready   = data.buffer_ready;
-            info.queue_size     = data.opus_queue.size_approx();
-            info.underrun_count = data.underrun_count;
-            info.plc_count      = data.plc_count;
+            info.is_speaking    = data->is_speaking;
+            info.is_muted       = data->is_muted;
+            info.audio_level    = data->current_level;
+            info.gain           = data->gain;
+            info.pan            = data->pan;
+            info.buffer_ready   = data->buffer_ready;
+            info.queue_size     = data->opus_queue.size_approx();
+            info.queue_size_avg = data->queue_depth_avg.load(std::memory_order_relaxed);
+            info.queue_size_max = data->queue_depth_max.load(std::memory_order_relaxed);
+            info.queue_drift_packets =
+                data->queue_depth_drift_milli.load(std::memory_order_relaxed) / 1000.0;
+            info.underrun_count = data->underrun_count;
+            info.plc_count      = data->plc_count;
+            info.packet_age_last_ms =
+                data->packet_age_last_ns.load(std::memory_order_relaxed) / 1e6;
+            info.packet_age_avg_ms =
+                data->packet_age_avg_ns.load(std::memory_order_relaxed) / 1e6;
+            info.packet_age_max_ms =
+                data->packet_age_max_ns.load(std::memory_order_relaxed) / 1e6;
+            info.sequence_gaps = data->sequence_gaps.load(std::memory_order_relaxed);
+            info.sequence_late_or_reordered =
+                data->sequence_late_or_reordered.load(std::memory_order_relaxed);
+            info.jitter_depth_drops = data->jitter_depth_drops.load(std::memory_order_relaxed);
+            info.jitter_age_drops = data->jitter_age_drops.load(std::memory_order_relaxed);
             result.push_back(info);
         }
 
@@ -100,7 +118,7 @@ public:
 
         for (auto it = participants_.begin(); it != participants_.end();) {
             auto elapsed =
-                std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_packet_time);
+                std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last_packet_time);
 
             if (elapsed > timeout) {
                 Log::info("Participant {} timed out ({}s since last packet)", it->first,
@@ -130,28 +148,27 @@ public:
     // Iterate over all participants (thread-safe, for audio mixing)
     template <typename Func>
     void for_each(Func&& func) {
-        // CRITICAL: Don't hold mutex during decode/mix
-        // 1. Lock and copy participant IDs
-        std::vector<uint32_t> ids;
+        std::array<std::pair<uint32_t, std::shared_ptr<ParticipantData>>,
+                   MAX_AUDIO_CALLBACK_PARTICIPANTS>
+            snapshot;
+        size_t snapshot_count = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            ids.reserve(participants_.size());
-            for (const auto& [id, _]: participants_) {
-                ids.push_back(id);
+            for (const auto& [id, participant]: participants_) {
+                if (snapshot_count >= snapshot.size()) {
+                    break;
+                }
+                snapshot[snapshot_count++] = {id, participant};
             }
         }
 
-        // 2. Process each participant without holding global lock
-        for (uint32_t id: ids) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto                        it = participants_.find(id);
-            if (it != participants_.end()) {
-                func(id, it->second);
-            }
+        for (size_t i = 0; i < snapshot_count; ++i) {
+            auto& [id, participant] = snapshot[i];
+            func(id, *participant);
         }
     }
 
 private:
-    mutable std::mutex                            mutex_;
-    std::unordered_map<uint32_t, ParticipantData> participants_;
+    mutable std::mutex                                             mutex_;
+    std::unordered_map<uint32_t, std::shared_ptr<ParticipantData>> participants_;
 };

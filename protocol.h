@@ -8,6 +8,7 @@
 constexpr uint32_t PING_MAGIC  = 0x50494E47;  // 'PING'
 constexpr uint32_t CTRL_MAGIC  = 0x4354524C;  // 'CTRL'
 constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
+constexpr uint32_t AUDIO_V2_MAGIC = 0x41553249;  // 'AU2I'
 
 // Buffer sizes
 constexpr size_t AUDIO_BUF_SIZE = 512;
@@ -16,6 +17,7 @@ constexpr size_t AUDIO_BUF_SIZE = 512;
 constexpr size_t MAX_OPUS_QUEUE_SIZE       = 10;  // Maximum packets in queue (safety limit)
 constexpr size_t TARGET_OPUS_QUEUE_SIZE    = 3;   // Target queue size for adaptive management
 constexpr size_t MIN_JITTER_BUFFER_PACKETS = 3;   // Minimum packets before playback starts
+constexpr int    MAX_JITTER_PACKET_AGE_MS  = 40;  // Drop audio older than this at playout
 
 // Type aliases
 template <size_t N>
@@ -47,6 +49,22 @@ struct CtrlHdr : MsgHdr {
 struct AudioHdr : MsgHdr {
     uint32_t              sender_id;      // Unique sender identifier
     uint16_t              encoded_bytes;  // size of the encoded Opus data
+    Bytes<AUDIO_BUF_SIZE> buf;
+};
+
+enum class AudioCodec : uint8_t {
+    Opus     = 1,
+    PcmInt16 = 2,
+};
+
+struct AudioHdrV2 : MsgHdr {
+    uint32_t              sender_id;      // Server-owned sender identifier
+    uint32_t              sequence;       // Sender-local packet sequence
+    uint32_t              sample_rate;    // Packet sample rate
+    uint16_t              frame_count;    // Frames per packet
+    uint16_t              payload_bytes;  // Audio payload bytes
+    uint8_t               channels;       // Channel count in payload
+    AudioCodec            codec;          // Payload codec
     Bytes<AUDIO_BUF_SIZE> buf;
 };
 

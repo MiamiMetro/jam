@@ -33,7 +33,6 @@
 #include <concurrentqueue.h>
 #include <imgui.h>
 #include <opus.h>
-#include <portaudio.h>
 #include <spdlog/common.h>
 
 #include "audio_analysis.h"
@@ -60,8 +59,8 @@ public:
     Client(asio::io_context& io_context, const std::string& server_address, short server_port)
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
-          selected_input_device_(paNoDevice),
-          selected_output_device_(paNoDevice),
+          selected_input_device_(AudioStream::NO_DEVICE),
+          selected_output_device_(AudioStream::NO_DEVICE),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
           cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
@@ -89,10 +88,10 @@ public:
         selected_output_device_ = AudioStream::get_default_output_device();
 
         // Initialize device info with default devices
-        if (selected_input_device_ != paNoDevice) {
+        if (selected_input_device_ != AudioStream::NO_DEVICE) {
             set_input_device(selected_input_device_);
         }
-        if (selected_output_device_ != paNoDevice) {
+        if (selected_output_device_ != AudioStream::NO_DEVICE) {
             set_output_device(selected_output_device_);
         }
 
@@ -143,41 +142,42 @@ public:
         Log::info("Disconnected (no longer sending/receiving)");
     }
 
-    bool start_audio_stream(PaDeviceIndex input_device, PaDeviceIndex output_device,
+    bool start_audio_stream(AudioStream::DeviceIndex input_device,
+                            AudioStream::DeviceIndex output_device,
                             const AudioStream::AudioConfig& config = AudioStream::AudioConfig{}) {
+        stop_pcm_sender_thread();
+
         // Store config FIRST before any validation that could cause early return
         // This ensures audio_config_ is always set, even if validation fails
         audio_config_ = config;
 
         // Get input channel count from device info before creating encoder
         // (audio_.get_input_channel_count() returns 0 before stream starts)
-        const auto* input_info = AudioStream::get_device_info(input_device);
-        if (input_info == nullptr) {
+        const auto* input_info_ptr = AudioStream::get_device_info(input_device);
+        if (input_info_ptr == nullptr) {
             Log::error("Invalid input device");
             return false;
         }
-        int input_channels = std::min(input_info->maxInputChannels, 1);  // Mono input
+        auto input_info = *input_info_ptr;
+        int input_channels = std::min(input_info.max_input_channels, 1);  // Mono input
 
         // Get output device info
-        const auto* output_info = AudioStream::get_device_info(output_device);
-        if (output_info == nullptr) {
+        const auto* output_info_ptr = AudioStream::get_device_info(output_device);
+        if (output_info_ptr == nullptr) {
             Log::error("Invalid output device");
             return false;
         }
+        auto output_info = *output_info_ptr;
 
         // Store device info
-        device_info_.input_device_name  = input_info->name;
-        device_info_.input_api          = (Pa_GetHostApiInfo(input_info->hostApi) != nullptr)
-                                              ? Pa_GetHostApiInfo(input_info->hostApi)->name
-                                              : "Unknown";
+        device_info_.input_device_name  = input_info.name;
+        device_info_.input_api          = input_info.api_name;
         device_info_.input_channels     = input_channels;
-        device_info_.input_sample_rate  = input_info->defaultSampleRate;
-        device_info_.output_device_name = output_info->name;
-        device_info_.output_api         = (Pa_GetHostApiInfo(output_info->hostApi) != nullptr)
-                                              ? Pa_GetHostApiInfo(output_info->hostApi)->name
-                                              : "Unknown";
-        device_info_.output_channels    = std::min(output_info->maxOutputChannels, 1);
-        device_info_.output_sample_rate = output_info->defaultSampleRate;
+        device_info_.input_sample_rate  = input_info.default_sample_rate;
+        device_info_.output_device_name = output_info.name;
+        device_info_.output_api         = output_info.api_name;
+        device_info_.output_channels    = output_info.max_output_channels >= 2 ? 2 : 1;
+        device_info_.output_sample_rate = output_info.default_sample_rate;
 
         // Initialize Opus encoder for sending own audio BEFORE starting stream
         // This prevents data race where callback might access encoder during initialization
@@ -198,6 +198,7 @@ public:
         bool success =
             audio_.start_audio_stream(input_device, output_device, config, audio_callback, this);
         if (success) {
+            start_pcm_sender_thread();
             audio_.print_latency_info();
         } else {
             // Clean up encoder if stream start failed
@@ -208,6 +209,7 @@ public:
 
     void stop_audio_stream() {
         audio_.stop_audio_stream();
+        stop_pcm_sender_thread();
     }
 
     // Getters for UI access
@@ -278,6 +280,15 @@ public:
         int complexity;
     };
 
+    struct CallbackTimingInfo {
+        double last_ms;
+        double max_ms;
+        double avg_ms;
+        double deadline_ms;
+        uint64_t callback_count;
+        uint64_t over_deadline_count;
+    };
+
     DeviceInfo get_device_info() const {
         return device_info_;
     }
@@ -304,6 +315,29 @@ public:
 
     AudioStream::AudioConfig get_audio_config() const {
         return audio_config_;
+    }
+
+    void set_requested_frames_per_buffer(int frames_per_buffer) {
+        audio_config_.frames_per_buffer = frames_per_buffer;
+    }
+
+    CallbackTimingInfo get_callback_timing_info() const {
+        CallbackTimingInfo info{};
+        info.last_ms = callback_last_ns_.load(std::memory_order_relaxed) / 1e6;
+        info.max_ms = callback_max_ns_.load(std::memory_order_relaxed) / 1e6;
+        info.avg_ms = callback_avg_ns_.load(std::memory_order_relaxed) / 1e6;
+        info.deadline_ms = callback_deadline_ns_.load(std::memory_order_relaxed) / 1e6;
+        info.callback_count = callback_count_.load(std::memory_order_relaxed);
+        info.over_deadline_count = callback_over_deadline_count_.load(std::memory_order_relaxed);
+        return info;
+    }
+
+    AudioCodec get_audio_codec() const {
+        return audio_codec_.load(std::memory_order_acquire);
+    }
+
+    void set_audio_codec(AudioCodec codec) {
+        audio_codec_.store(codec, std::memory_order_release);
     }
 
     // WAV file playback methods
@@ -365,15 +399,15 @@ public:
 
     // Device selection methods (removed - use AudioStream static methods directly)
 
-    PaDeviceIndex get_selected_input_device() const {
+    AudioStream::DeviceIndex get_selected_input_device() const {
         return selected_input_device_;
     }
 
-    PaDeviceIndex get_selected_output_device() const {
+    AudioStream::DeviceIndex get_selected_output_device() const {
         return selected_output_device_;
     }
 
-    bool set_input_device(PaDeviceIndex device_index) {
+    bool set_input_device(AudioStream::DeviceIndex device_index) {
         if (!AudioStream::is_device_valid(device_index)) {
             Log::error("Invalid input device index: {}", device_index);
             return false;
@@ -384,16 +418,14 @@ public:
         const auto* input_info = AudioStream::get_device_info(device_index);
         if (input_info != nullptr) {
             device_info_.input_device_name = input_info->name;
-            device_info_.input_api         = (Pa_GetHostApiInfo(input_info->hostApi) != nullptr)
-                                                 ? Pa_GetHostApiInfo(input_info->hostApi)->name
-                                                 : "Unknown";
-            device_info_.input_channels    = std::min(input_info->maxInputChannels, 1);
-            device_info_.input_sample_rate = input_info->defaultSampleRate;
+            device_info_.input_api         = input_info->api_name;
+            device_info_.input_channels    = std::min(input_info->max_input_channels, 1);
+            device_info_.input_sample_rate = input_info->default_sample_rate;
         }
         return true;
     }
 
-    bool set_output_device(PaDeviceIndex device_index) {
+    bool set_output_device(AudioStream::DeviceIndex device_index) {
         if (!AudioStream::is_device_valid(device_index)) {
             Log::error("Invalid output device index: {}", device_index);
             return false;
@@ -404,17 +436,16 @@ public:
         const auto* output_info = AudioStream::get_device_info(device_index);
         if (output_info != nullptr) {
             device_info_.output_device_name = output_info->name;
-            device_info_.output_api         = (Pa_GetHostApiInfo(output_info->hostApi) != nullptr)
-                                                  ? Pa_GetHostApiInfo(output_info->hostApi)->name
-                                                  : "Unknown";
-            device_info_.output_channels    = std::min(output_info->maxOutputChannels, 1);
-            device_info_.output_sample_rate = output_info->defaultSampleRate;
+            device_info_.output_api         = output_info->api_name;
+            device_info_.output_channels    = output_info->max_output_channels >= 2 ? 2 : 1;
+            device_info_.output_sample_rate = output_info->default_sample_rate;
         }
         return true;
     }
 
     // Hot-swap audio devices (stops current stream and starts new one)
-    bool swap_audio_devices(PaDeviceIndex input_device, PaDeviceIndex output_device) {
+    bool swap_audio_devices(AudioStream::DeviceIndex input_device,
+                            AudioStream::DeviceIndex output_device) {
         bool was_active = audio_.is_stream_active();
 
         // Stop current stream if active
@@ -497,8 +528,9 @@ public:
             handle_ping_message(bytes);
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
             handle_ctrl_message(bytes);
-        } else if (hdr.magic == AUDIO_MAGIC &&
-                   bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) {
+        } else if ((hdr.magic == AUDIO_MAGIC &&
+                    bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) ||
+                   (hdr.magic == AUDIO_V2_MAGIC && bytes >= sizeof(AudioHdrV2) - AUDIO_BUF_SIZE)) {
             handle_audio_message(bytes);
         } else {
             // Log unknown message with hex dump for debugging
@@ -529,16 +561,146 @@ public:
         // Add to total bytes sent
         total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
 
-        socket_.async_send_to(asio::buffer(data, len), server_endpoint_,
-                              [keep_alive](std::error_code error_code, std::size_t) {
-                                  if (error_code) {
-                                      Log::error("send error: {}", error_code.message());
-                                  }
-                                  // keep_alive keeps the data alive until send completes
-                              });
+        asio::post(io_context_, [this, data, len, keep_alive]() {
+            socket_.async_send_to(asio::buffer(data, len), server_endpoint_,
+                                  [keep_alive](std::error_code error_code, std::size_t) {
+                                      if (error_code) {
+                                          Log::error("send error: {}", error_code.message());
+                                      }
+                                      // keep_alive keeps the data alive until send completes
+                                  });
+        });
     }
 
 private:
+    struct PcmSendFrame {
+        std::array<unsigned char, AUDIO_BUF_SIZE> payload{};
+        uint16_t payload_bytes = 0;
+        uint16_t frame_count = 0;
+        uint32_t sample_rate = 48000;
+    };
+
+    struct OpusSendFrame {
+        std::array<float, 960> samples{};
+        uint16_t frame_count = 0;
+        uint32_t sample_rate = 48000;
+    };
+
+    void start_pcm_sender_thread() {
+        if (pcm_sender_running_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        pcm_sender_thread_ = std::thread([this]() { pcm_sender_loop(); });
+    }
+
+    void stop_pcm_sender_thread() {
+        pcm_sender_running_.store(false, std::memory_order_release);
+        if (pcm_sender_thread_.joinable()) {
+            pcm_sender_thread_.join();
+        }
+
+        PcmSendFrame discarded;
+        while (pcm_send_queue_.try_dequeue(discarded)) {
+        }
+        OpusSendFrame discarded_opus;
+        while (opus_send_queue_.try_dequeue(discarded_opus)) {
+        }
+    }
+
+    void pcm_sender_loop() {
+        while (pcm_sender_running_.load(std::memory_order_acquire)) {
+            PcmSendFrame frame;
+            if (pcm_send_queue_.try_dequeue(frame)) {
+                uint32_t seq = audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
+                auto packet = audio_packet::create_audio_packet_v2(
+                    AudioCodec::PcmInt16, seq, frame.sample_rate, frame.frame_count, 1,
+                    frame.payload.data(), frame.payload_bytes);
+                send(packet->data(), packet->size(), packet);
+                continue;
+            }
+
+            OpusSendFrame opus_frame;
+            if (opus_send_queue_.try_dequeue(opus_frame)) {
+                std::vector<unsigned char> encoded_data;
+                if (audio_encoder_.encode(opus_frame.samples.data(), opus_frame.frame_count,
+                                          encoded_data) &&
+                    encoded_data.size() <= AUDIO_BUF_SIZE) {
+                    uint32_t seq = audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
+                    auto packet = audio_packet::create_audio_packet_v2(
+                        AudioCodec::Opus, seq, opus_frame.sample_rate, opus_frame.frame_count, 1,
+                        encoded_data.data(), static_cast<uint16_t>(encoded_data.size()));
+                    send(packet->data(), packet->size(), packet);
+                }
+                continue;
+            }
+
+            {
+                std::this_thread::yield();
+                continue;
+            }
+        }
+    }
+
+    void enqueue_pcm_send_frame(const unsigned char* payload, uint16_t payload_bytes,
+                                uint16_t frame_count, uint32_t sample_rate) {
+        while (pcm_send_queue_.size_approx() > 2) {
+            PcmSendFrame discarded;
+            if (!pcm_send_queue_.try_dequeue(discarded)) {
+                break;
+            }
+            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        PcmSendFrame frame;
+        std::memcpy(frame.payload.data(), payload, payload_bytes);
+        frame.payload_bytes = payload_bytes;
+        frame.frame_count = frame_count;
+        frame.sample_rate = sample_rate;
+        pcm_send_queue_.enqueue(frame);
+    }
+
+    void enqueue_opus_send_frame(const float* samples, uint16_t frame_count, uint32_t sample_rate) {
+        if (!OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate), frame_count)) {
+            opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        while (opus_send_queue_.size_approx() > 2) {
+            OpusSendFrame discarded;
+            if (!opus_send_queue_.try_dequeue(discarded)) {
+                break;
+            }
+            opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        OpusSendFrame frame;
+        std::copy_n(samples, frame_count, frame.samples.begin());
+        frame.frame_count = frame_count;
+        frame.sample_rate = sample_rate;
+        opus_send_queue_.enqueue(frame);
+    }
+
+    static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
+        size_t previous_max = participant.queue_depth_max.load(std::memory_order_relaxed);
+        while (depth > previous_max &&
+               !participant.queue_depth_max.compare_exchange_weak(
+                   previous_max, depth, std::memory_order_relaxed)) {
+        }
+
+        size_t previous_avg = participant.queue_depth_avg.load(std::memory_order_relaxed);
+        size_t next_avg = previous_avg == 0 ? depth : ((previous_avg * 31) + depth) / 32;
+        participant.queue_depth_avg.store(next_avg, std::memory_order_relaxed);
+
+        const auto drift_milli =
+            (static_cast<int64_t>(depth) - static_cast<int64_t>(TARGET_OPUS_QUEUE_SIZE)) * 1000;
+        const auto previous_drift =
+            participant.queue_depth_drift_milli.load(std::memory_order_relaxed);
+        const auto next_drift =
+            previous_drift == 0 ? drift_milli : ((previous_drift * 31) + drift_milli) / 32;
+        participant.queue_depth_drift_milli.store(next_drift, std::memory_order_relaxed);
+    }
+
     void ping_timer_callback() {
         static uint32_t seq = 0;
         SyncHdr         shdr{};
@@ -628,27 +790,33 @@ private:
     }
 
     void handle_audio_message(std::size_t bytes) {
-        if (!message_validator::is_valid_audio_packet(
-                bytes, sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t))) {
+        MsgHdr msg_hdr{};
+        std::memcpy(&msg_hdr, recv_buf_.data(), sizeof(MsgHdr));
+        const bool is_v2 = msg_hdr.magic == AUDIO_V2_MAGIC;
+        const size_t min_packet_size =
+            is_v2 ? sizeof(AudioHdrV2) - AUDIO_BUF_SIZE
+                  : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+
+        if (!message_validator::is_valid_audio_packet(bytes, min_packet_size)) {
             return;
         }
 
-        // Extract sender_id and encoded_bytes using packet_builder
-        uint32_t sender_id = packet_builder::extract_sender_id(
-            reinterpret_cast<const unsigned char*>(recv_buf_.data()));
-        uint16_t encoded_bytes = packet_builder::extract_encoded_bytes(
-            reinterpret_cast<const unsigned char*>(recv_buf_.data()));
+        const auto* packet_bytes = reinterpret_cast<const unsigned char*>(recv_buf_.data());
+        uint32_t sender_id = packet_builder::extract_sender_id(packet_bytes);
+        uint16_t payload_bytes =
+            is_v2 ? packet_builder::extract_v2_payload_bytes(packet_bytes)
+                  : packet_builder::extract_encoded_bytes(packet_bytes);
 
-        size_t expected_size = sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) + encoded_bytes;
+        size_t expected_size = min_packet_size + payload_bytes;
         if (!message_validator::has_complete_payload(bytes, expected_size)) {
-            Log::error("Incomplete audio packet: got {}, expected {} (encoded_bytes={})", bytes,
-                       expected_size, encoded_bytes);
+            Log::error("Incomplete audio packet: got {}, expected {} (payload_bytes={})", bytes,
+                       expected_size, payload_bytes);
             return;
         }
 
         // Additional safety check: ensure encoded_bytes is reasonable
-        if (!message_validator::is_encoded_bytes_valid(encoded_bytes, AUDIO_BUF_SIZE)) {
-            Log::error("Invalid audio packet: encoded_bytes {} exceeds max {}", encoded_bytes,
+        if (!message_validator::is_encoded_bytes_valid(payload_bytes, AUDIO_BUF_SIZE)) {
+            Log::error("Invalid audio packet: payload_bytes {} exceeds max {}", payload_bytes,
                        AUDIO_BUF_SIZE);
             return;
         }
@@ -679,32 +847,59 @@ private:
         // Add to total bytes received
         total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
 
-        // Get opus data pointer
-        const unsigned char* audio_data = reinterpret_cast<const unsigned char*>(
-            recv_buf_.data() + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
+        const unsigned char* audio_data =
+            is_v2 ? packet_builder::audio_v2_payload(packet_bytes)
+                  : packet_builder::audio_v1_payload(packet_bytes);
 
-        // CRITICAL: Enqueue Opus packet, DON'T decode here
+        // CRITICAL: Enqueue audio packet, DON'T decode here
         // Decoding happens in time-driven audio_callback
         participant_manager_.with_participant(sender_id, [&](ParticipantData& participant) {
             OpusPacket packet;
             // Use memcpy for zero-allocation copy (fixed buffer)
-            if (encoded_bytes <= AUDIO_BUF_SIZE) {
-                std::memcpy(packet.data.data(), audio_data, encoded_bytes);
-                packet.size      = encoded_bytes;
+            if (payload_bytes <= AUDIO_BUF_SIZE) {
+                std::memcpy(packet.data.data(), audio_data, payload_bytes);
+                packet.size      = payload_bytes;
                 packet.timestamp = std::chrono::steady_clock::now();
+                if (is_v2) {
+                    AudioHdrV2 audio_hdr{};
+                    std::memcpy(&audio_hdr, recv_buf_.data(), sizeof(AudioHdrV2) - AUDIO_BUF_SIZE);
+                    packet.codec       = audio_hdr.codec;
+                    packet.sequence    = audio_hdr.sequence;
+                    packet.frame_count = audio_hdr.frame_count;
+                    packet.channels    = audio_hdr.channels;
+                    if (!participant.sequence_initialized) {
+                        participant.sequence_initialized = true;
+                        participant.next_expected_sequence = packet.sequence + 1;
+                    } else if (packet.sequence == participant.next_expected_sequence) {
+                        participant.next_expected_sequence++;
+                    } else if (packet.sequence > participant.next_expected_sequence) {
+                        participant.sequence_gaps.fetch_add(
+                            packet.sequence - participant.next_expected_sequence,
+                            std::memory_order_relaxed);
+                        participant.next_expected_sequence = packet.sequence + 1;
+                    } else {
+                        participant.sequence_late_or_reordered.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                } else {
+                    packet.codec       = AudioCodec::Opus;
+                    packet.frame_count = static_cast<uint16_t>(audio_config_.frames_per_buffer);
+                    packet.channels    = 1;
+                }
             } else {
-                Log::error("Packet too large: {} bytes (max {})", encoded_bytes, AUDIO_BUF_SIZE);
+                Log::error("Packet too large: {} bytes (max {})", payload_bytes, AUDIO_BUF_SIZE);
                 return;
             }
 
             size_t queue_size = participant.opus_queue.size_approx();
+            observe_participant_queue_depth(participant, queue_size);
 
-            // Adaptive queue management: drop old packets if queue is too large
-            // This keeps latency bounded to TARGET_OPUS_QUEUE_SIZE + 2 packets
-            while (queue_size > TARGET_OPUS_QUEUE_SIZE + 2) {
+            // Bounded jitter management: drop old packets if queue is too large.
+            while (queue_size > TARGET_OPUS_QUEUE_SIZE) {
                 OpusPacket discarded;
                 if (participant.opus_queue.try_dequeue(discarded)) {
                     queue_size--;
+                    participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     break;
                 }
@@ -712,31 +907,66 @@ private:
 
             if (queue_size < MAX_OPUS_QUEUE_SIZE) {
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
+                size_t queue_after_enqueue = queue_size + 1;
+                observe_participant_queue_depth(participant, queue_after_enqueue);
                 participant.last_packet_time = packet.timestamp;
 
                 // Mark buffer as ready once we have enough packets
                 if (!participant.buffer_ready &&
-                    queue_size >= participant.jitter_buffer_min_packets) {
+                    queue_after_enqueue >= participant.jitter_buffer_min_packets) {
                     participant.buffer_ready = true;
                     Log::info("Jitter buffer ready for participant {} ({} packets)", sender_id,
-                              queue_size);
+                              queue_after_enqueue);
                 }
             } else {
                 // Buffer overflow - drop oldest packet (safety limit)
                 OpusPacket discarded;
                 participant.opus_queue.try_dequeue(discarded);
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
+                observe_participant_queue_depth(participant, participant.opus_queue.size_approx());
                 participant.last_packet_time = packet.timestamp;
             }
         });
     }
 
     static int audio_callback(const void* input, void* output, unsigned long frame_count,
-                              const PaStreamCallbackTimeInfo* /*unused*/,
-                              PaStreamCallbackFlags /*unused*/, void* user_data) {
+                              void* user_data) {
         const auto* input_buffer  = static_cast<const float*>(input);
         auto*       output_buffer = static_cast<float*>(output);
         auto*       client        = static_cast<Client*>(user_data);
+        const auto callback_start = std::chrono::steady_clock::now();
+        struct TimingScope {
+            Client* client;
+            std::chrono::steady_clock::time_point start;
+            unsigned long frame_count;
+
+            ~TimingScope() {
+                auto elapsed = std::chrono::steady_clock::now() - start;
+                auto elapsed_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+                auto deadline_ns = static_cast<int64_t>(
+                    (static_cast<double>(frame_count) * 1e9) /
+                    static_cast<double>(client->audio_config_.sample_rate));
+
+                client->callback_last_ns_.store(elapsed_ns, std::memory_order_relaxed);
+                client->callback_deadline_ns_.store(deadline_ns, std::memory_order_relaxed);
+                client->callback_count_.fetch_add(1, std::memory_order_relaxed);
+
+                int64_t previous_max = client->callback_max_ns_.load(std::memory_order_relaxed);
+                while (elapsed_ns > previous_max &&
+                       !client->callback_max_ns_.compare_exchange_weak(
+                           previous_max, elapsed_ns, std::memory_order_relaxed)) {
+                }
+
+                int64_t previous_avg = client->callback_avg_ns_.load(std::memory_order_relaxed);
+                int64_t next_avg = previous_avg == 0 ? elapsed_ns : ((previous_avg * 31) + elapsed_ns) / 32;
+                client->callback_avg_ns_.store(next_avg, std::memory_order_relaxed);
+
+                if (elapsed_ns > deadline_ns) {
+                    client->callback_over_deadline_count_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } timing_scope{client, callback_start, frame_count};
 
 #ifdef _WIN32
         // Boost thread priority on Windows for minimal audio latency
@@ -748,7 +978,7 @@ private:
 #endif
 
         if (output_buffer == nullptr) {
-            return paContinue;
+            return 0;
         }
 
         const size_t out_channels  = client->audio_.get_output_channel_count();
@@ -768,10 +998,65 @@ private:
             OpusPacket opus_packet;
 
             if (participant.opus_queue.try_dequeue(opus_packet)) {
-                // Decode into preallocated buffer (zero allocations)
-                int decoded_samples = participant.decoder->decode_into(
-                    opus_packet.get_data(), static_cast<int>(opus_packet.get_size()),
-                    participant.pcm_buffer.data(), static_cast<int>(frame_count));
+                auto now = std::chrono::steady_clock::now();
+                auto packet_age = now - opus_packet.timestamp;
+                auto packet_age_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(packet_age).count();
+                const auto max_packet_age_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::milliseconds(MAX_JITTER_PACKET_AGE_MS))
+                        .count();
+
+                while (packet_age_ns > max_packet_age_ns) {
+                    participant.jitter_age_drops.fetch_add(1, std::memory_order_relaxed);
+                    if (!participant.opus_queue.try_dequeue(opus_packet)) {
+                        participant.underrun_count++;
+                        return;
+                    }
+                    now = std::chrono::steady_clock::now();
+                    packet_age = now - opus_packet.timestamp;
+                    packet_age_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(packet_age).count();
+                }
+
+                participant.packet_age_last_ns.store(packet_age_ns, std::memory_order_relaxed);
+                int64_t previous_age_max =
+                    participant.packet_age_max_ns.load(std::memory_order_relaxed);
+                while (packet_age_ns > previous_age_max &&
+                       !participant.packet_age_max_ns.compare_exchange_weak(
+                           previous_age_max, packet_age_ns, std::memory_order_relaxed)) {
+                }
+                int64_t previous_age_avg =
+                    participant.packet_age_avg_ns.load(std::memory_order_relaxed);
+                int64_t next_age_avg =
+                    previous_age_avg == 0 ? packet_age_ns : ((previous_age_avg * 31) + packet_age_ns) / 32;
+                participant.packet_age_avg_ns.store(next_age_avg, std::memory_order_relaxed);
+
+                participant.last_codec = opus_packet.codec;
+                int decoded_samples = 0;
+                if (opus_packet.codec == AudioCodec::PcmInt16) {
+                    const size_t expected_bytes = frame_count * sizeof(int16_t);
+                    if (opus_packet.get_size() != expected_bytes) {
+                        static int pcm_size_mismatch_count = 0;
+                        if (++pcm_size_mismatch_count % 100 == 0) {
+                            Log::warn("PCM size mismatch for participant {}: got {}, expected {}",
+                                      participant_id, opus_packet.get_size(), expected_bytes);
+                        }
+                        return;
+                    }
+                    for (unsigned long i = 0; i < frame_count; ++i) {
+                        int16_t sample = 0;
+                        std::memcpy(&sample, opus_packet.get_data() + i * sizeof(sample),
+                                    sizeof(sample));
+                        participant.pcm_buffer[i] = static_cast<float>(sample) / 32767.0F;
+                    }
+                    decoded_samples = static_cast<int>(frame_count);
+                } else {
+                    // Decode into preallocated buffer (zero allocations)
+                    decoded_samples = participant.decoder->decode_into(
+                        opus_packet.get_data(), static_cast<int>(opus_packet.get_size()),
+                        participant.pcm_buffer.data(), static_cast<int>(frame_count));
+                }
 
                 if (decoded_samples <= 0) {
                     // Decode failed - use silence
@@ -822,6 +1107,7 @@ private:
 
                 // Adaptive jitter buffer: track queue size history and adjust minimum
                 size_t current_queue_size = participant.opus_queue.size_approx();
+                observe_participant_queue_depth(participant, current_queue_size);
                 participant.queue_size_history[participant.history_index] = current_queue_size;
                 participant.history_index =
                     (participant.history_index + 1) % participant.queue_size_history.size();
@@ -852,10 +1138,13 @@ private:
             } else {
                 // Underrun - use PLC instead of silence for smoother audio
                 size_t current_queue_size = participant.opus_queue.size_approx();
+                observe_participant_queue_depth(participant, current_queue_size);
 
-                // Use Opus PLC to generate concealment audio
-                int plc_samples = participant.decoder->decode_plc(participant.pcm_buffer.data(),
+                int plc_samples = 0;
+                if (participant.last_codec == AudioCodec::Opus) {
+                    plc_samples = participant.decoder->decode_plc(participant.pcm_buffer.data(),
                                                                   static_cast<int>(frame_count));
+                }
 
                 if (plc_samples > 0) {
                     // Mix PLC output (same as normal decode path)
@@ -937,95 +1226,78 @@ private:
 
         // Encode and send own audio (always send to maintain timing, even if silence)
         // Mix WAV with microphone input before encoding
-        if (client->audio_encoder_.is_initialized() && client->audio_.is_stream_active()) {
-            std::vector<unsigned char> encoded_data;
-            bool                       encode_success = false;
+        if (client->audio_.is_stream_active()) {
+            if (client->audio_codec_.load(std::memory_order_acquire) == AudioCodec::PcmInt16) {
+                std::array<float, 960> pcm_input{};
+                if (wav_active && wav_frames_read > 0) {
+                    float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
+                    for (int i = 0; i < wav_frames_read; ++i) {
+                        pcm_input[static_cast<size_t>(i)] = wav_buffer[static_cast<size_t>(i)] * wav_gain;
+                    }
+                }
+                if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
+                    float input_gain = client->input_gain_.load(std::memory_order_acquire);
+                    for (unsigned long i = 0; i < frame_count; ++i) {
+                        float mic_sample = input_buffer[i] * input_gain;
+                        pcm_input[i] = wav_active ? (pcm_input[i] + mic_sample) * 0.5F : mic_sample;
+                    }
+                } else if (wav_active) {
+                    for (unsigned long i = 0; i < frame_count; ++i) {
+                        pcm_input[i] *= 0.5F;
+                    }
+                }
 
-            // Prepare mixed input buffer (WAV + mic)
-            std::array<float, 480>
-                mixed_input{};  // Buffer for mixed audio (sized for max possible frame_count)
+                float rms = audio_analysis::calculate_rms(pcm_input.data(), frame_count);
+                client->own_audio_level_.store(rms);
 
+                const size_t payload_bytes = frame_count * sizeof(int16_t);
+                if (payload_bytes <= AUDIO_BUF_SIZE) {
+                    std::array<unsigned char, AUDIO_BUF_SIZE> pcm_payload{};
+                    for (unsigned long i = 0; i < frame_count; ++i) {
+                        float clamped = std::clamp(pcm_input[i], -1.0F, 1.0F);
+                        auto sample = static_cast<int16_t>(std::lrint(clamped * 32767.0F));
+                        std::memcpy(pcm_payload.data() + i * sizeof(sample), &sample, sizeof(sample));
+                    }
+                    client->enqueue_pcm_send_frame(
+                        pcm_payload.data(), static_cast<uint16_t>(payload_bytes),
+                        static_cast<uint16_t>(frame_count),
+                        static_cast<uint32_t>(client->audio_config_.sample_rate));
+                }
+                return 0;
+            }
+
+            if (!client->audio_encoder_.is_initialized()) {
+                return 0;
+            }
+
+            std::array<float, 960> opus_input{};
             if (wav_active && wav_frames_read > 0) {
-                // Copy WAV data first and apply gain
-                // mixed_input is already zero-initialized, so any remaining frames are silence
                 float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
                 for (int i = 0; i < wav_frames_read; ++i) {
-                    mixed_input[i] = wav_buffer[i] * wav_gain;
-                }
-                // Note: If wav_frames_read < frame_count, remaining frames stay as 0.0F (silence)
-
-                // Mix microphone input if available and not muted
-                if (input_buffer != nullptr &&
-                    !client->mic_muted_.load(std::memory_order_acquire)) {
-                    // Apply input gain to mic and mix with WAV (average mixing to prevent clipping)
-                    float input_gain = client->input_gain_.load(std::memory_order_acquire);
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        mixed_input[i] = (mixed_input[i] + input_buffer[i] * input_gain) * 0.5F;
-                    }
-                    // Calculate RMS for own audio level (from mixed signal)
-                    float rms = audio_analysis::calculate_rms(mixed_input.data(),
-                                                              static_cast<int>(frame_count));
-                    client->own_audio_level_.store(rms);
-                } else {
-                    // No mic or mic muted - apply same scaling to WAV for consistent volume
-                    // When mixing with mic we use 0.5F, so apply 0.5F here too to keep WAV volume
-                    // consistent
-                    constexpr float MIX_SCALE = 0.5F;
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        mixed_input[i] *= MIX_SCALE;
-                    }
-                    // Calculate RMS for own audio level (from WAV signal)
-                    float rms = audio_analysis::calculate_rms(mixed_input.data(),
-                                                              static_cast<int>(frame_count));
-                    client->own_audio_level_.store(rms);
-                }
-
-                // Encode mixed audio (WAV + optional mic, or just WAV)
-                encode_success = client->audio_encoder_.encode(
-                    mixed_input.data(), static_cast<int>(frame_count), encoded_data);
-            } else {
-                // No WAV active - use original behavior (mic only or silence)
-                // This branch preserves exact backward compatibility when WAV is not in use
-                if (input_buffer != nullptr &&
-                    !client->mic_muted_.load(std::memory_order_acquire)) {
-                    // Apply input gain to mic
-                    float input_gain = client->input_gain_.load(std::memory_order_acquire);
-                    std::array<float, 960> gained_input{};  // Max frame size
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        gained_input[i] = input_buffer[i] * input_gain;
-                    }
-
-                    // Calculate RMS for own audio level (after gain)
-                    float rms = audio_analysis::calculate_rms(gained_input.data(), frame_count);
-                    client->own_audio_level_.store(rms);
-
-                    // Check if input is silence
-                    if (audio_analysis::is_silence(gained_input.data(), frame_count)) {
-                        // Encode silence to maintain packet timing
-                        std::vector<float> silence_frame(frame_count, 0.0F);
-                        encode_success = client->audio_encoder_.encode(
-                            silence_frame.data(), static_cast<int>(frame_count), encoded_data);
-                    } else {
-                        // Encode actual audio with gain applied
-                        encode_success = client->audio_encoder_.encode(
-                            gained_input.data(), static_cast<int>(frame_count), encoded_data);
-                    }
-                } else {
-                    // Mic muted or no input device - encode silence to maintain timing
-                    std::vector<float> silence_frame(frame_count, 0.0F);
-                    encode_success = client->audio_encoder_.encode(
-                        silence_frame.data(), static_cast<int>(frame_count), encoded_data);
+                    opus_input[static_cast<size_t>(i)] = wav_buffer[static_cast<size_t>(i)] * wav_gain;
                 }
             }
 
-            // Send packet if encoding succeeded
-            if (encode_success && static_cast<uint16_t>(encoded_data.size()) <= AUDIO_BUF_SIZE) {
-                auto packet = audio_packet::create_audio_packet(encoded_data);
-                client->send(packet->data(), packet->size(), packet);
+            if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
+                float input_gain = client->input_gain_.load(std::memory_order_acquire);
+                for (unsigned long i = 0; i < frame_count; ++i) {
+                    float mic_sample = input_buffer[i] * input_gain;
+                    opus_input[i] = wav_active ? (opus_input[i] + mic_sample) * 0.5F : mic_sample;
+                }
+            } else if (wav_active) {
+                for (unsigned long i = 0; i < frame_count; ++i) {
+                    opus_input[i] *= 0.5F;
+                }
             }
+
+            float rms = audio_analysis::calculate_rms(opus_input.data(), frame_count);
+            client->own_audio_level_.store(rms);
+            client->enqueue_opus_send_frame(
+                opus_input.data(), static_cast<uint16_t>(frame_count),
+                static_cast<uint32_t>(client->audio_config_.sample_rate));
         }
 
-        return paContinue;
+        return 0;
     }
 
     asio::io_context& io_context_;
@@ -1039,6 +1311,14 @@ private:
     AudioStream              audio_;
     OpusEncoderWrapper       audio_encoder_;
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
+    std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
+    std::atomic<uint32_t>    audio_tx_sequence_{0};
+    moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
+    moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
+    std::atomic<bool>                         pcm_sender_running_{false};
+    std::thread                               pcm_sender_thread_;
+    std::atomic<uint64_t>                     pcm_send_drops_{0};
+    std::atomic<uint64_t>                     opus_send_drops_{0};
 
     ParticipantManager participant_manager_;
     WavFilePlayback    wav_playback_;
@@ -1063,13 +1343,21 @@ private:
     std::atomic<uint64_t> total_bytes_rx_{0};
     std::atomic<uint64_t> total_bytes_tx_{0};
 
+    // Audio callback timing diagnostics
+    std::atomic<int64_t>  callback_last_ns_{0};
+    std::atomic<int64_t>  callback_max_ns_{0};
+    std::atomic<int64_t>  callback_avg_ns_{0};
+    std::atomic<int64_t>  callback_deadline_ns_{0};
+    std::atomic<uint64_t> callback_count_{0};
+    std::atomic<uint64_t> callback_over_deadline_count_{0};
+
     // Device and encoder info storage
     DeviceInfo  device_info_;
     EncoderInfo encoder_info_;
 
     // Selected devices (for UI)
-    PaDeviceIndex selected_input_device_;
-    PaDeviceIndex selected_output_device_;
+    AudioStream::DeviceIndex selected_input_device_;
+    AudioStream::DeviceIndex selected_output_device_;
 
     PeriodicTimer ping_timer_;
     PeriodicTimer alive_timer_;
@@ -1162,11 +1450,29 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Separator();
         ImGui::Spacing();
 
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Codec:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        AudioCodec current_codec = client.get_audio_codec();
+        int codec_choice = current_codec == AudioCodec::PcmInt16 ? 0 : 1;
+        if (ImGui::RadioButton("PCM##codec", codec_choice == 0)) {
+            client.set_audio_codec(AudioCodec::PcmInt16);
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        if (ImGui::RadioButton("Opus##codec", codec_choice == 1)) {
+            client.set_audio_codec(AudioCodec::Opus);
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
         // ========== LATENCY INFO (with padding) ==========
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         Client::DeviceInfo       device_info  = client.get_device_info();
         AudioStream::LatencyInfo latency      = client.get_latency_info();
         AudioStream::AudioConfig audio_config = client.get_audio_config();
+        Client::CallbackTimingInfo callback_timing = client.get_callback_timing_info();
         ImGui::Text("%s", device_info.output_api.c_str());
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("In: %.1f ms", latency.input_latency_ms);
@@ -1174,6 +1480,20 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Text("Out: %.1f ms", latency.output_latency_ms);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("SR: %d kHz", audio_config.sample_rate / 1000);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Buf: %d/%d", latency.actual_buffer_frames, latency.requested_buffer_frames);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Buf ms: %.2f", latency.buffer_duration_ms);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Cb: %.2f/%.2f ms", callback_timing.avg_ms, callback_timing.deadline_ms);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Max: %.2f ms", callback_timing.max_ms);
+        if (callback_timing.over_deadline_count > 0) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Late: %llu",
+                               static_cast<unsigned long long>(
+                                   callback_timing.over_deadline_count));
+        }
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -1369,6 +1689,27 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
         if (ImGui::CollapsingHeader(stats_label, ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Queue: %zu", p.queue_size);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Q avg/max: %zu/%zu", p.queue_size_avg, p.queue_size_max);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Q drift: %.2f", p.queue_drift_packets);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Age: %.1f ms", p.packet_age_avg_ms);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Max age: %.1f ms", p.packet_age_max_ms);
+            if (p.sequence_gaps > 0 || p.sequence_late_or_reordered > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Seq gap/late: %llu/%llu",
+                                   static_cast<unsigned long long>(p.sequence_gaps),
+                                   static_cast<unsigned long long>(
+                                       p.sequence_late_or_reordered));
+            }
+            if (p.jitter_depth_drops > 0 || p.jitter_age_drops > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Drop q/age: %llu/%llu",
+                                   static_cast<unsigned long long>(p.jitter_depth_drops),
+                                   static_cast<unsigned long long>(p.jitter_age_drops));
+            }
             if (p.underrun_count > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Underruns: %d",
@@ -1397,14 +1738,16 @@ static void draw_bottom_bar(Client& client) {
     static std::vector<AudioStream::ApiInfo>    available_apis;
     static int                                  selected_api        = -1;
     static int                                  refresh_counter     = 0;
-    static PaDeviceIndex                        pending_input       = paNoDevice;
-    static PaDeviceIndex                        pending_output      = paNoDevice;
+    static AudioStream::DeviceIndex             pending_input       = AudioStream::NO_DEVICE;
+    static AudioStream::DeviceIndex             pending_output      = AudioStream::NO_DEVICE;
+    static int                                  pending_buffer_frames = 0;
     static bool                                 devices_initialized = false;
 
     if (!devices_initialized) {
-        pending_input       = client.get_selected_input_device();
-        pending_output      = client.get_selected_output_device();
-        devices_initialized = true;
+        pending_input         = client.get_selected_input_device();
+        pending_output        = client.get_selected_output_device();
+        pending_buffer_frames = client.get_audio_config().frames_per_buffer;
+        devices_initialized   = true;
     }
 
     if (refresh_counter++ % 60 == 0) {
@@ -1444,7 +1787,7 @@ static void draw_bottom_bar(Client& client) {
                 // that API
                 if (old_api != selected_api && selected_api >= 0) {
                     // Find first available input device with this API
-                    PaDeviceIndex new_input = paNoDevice;
+                    AudioStream::DeviceIndex new_input = AudioStream::NO_DEVICE;
                     for (const auto& dev: input_devices) {
                         if (dev.api_name == api.name) {
                             new_input = dev.index;
@@ -1453,7 +1796,7 @@ static void draw_bottom_bar(Client& client) {
                     }
 
                     // Find first available output device with this API
-                    PaDeviceIndex new_output = paNoDevice;
+                    AudioStream::DeviceIndex new_output = AudioStream::NO_DEVICE;
                     for (const auto& dev: output_devices) {
                         if (dev.api_name == api.name) {
                             new_output = dev.index;
@@ -1462,13 +1805,14 @@ static void draw_bottom_bar(Client& client) {
                     }
 
                     // Switch if we found both devices (preferred)
-                    if (new_input != paNoDevice && new_output != paNoDevice) {
+                    if (new_input != AudioStream::NO_DEVICE &&
+                        new_output != AudioStream::NO_DEVICE) {
                         pending_input  = new_input;
                         pending_output = new_output;
-                    } else if (new_input != paNoDevice) {
+                    } else if (new_input != AudioStream::NO_DEVICE) {
                         // Found input but not output - switch input only
                         pending_input = new_input;
-                    } else if (new_output != paNoDevice) {
+                    } else if (new_output != AudioStream::NO_DEVICE) {
                         // Found output but not input - switch output only
                         pending_output = new_output;
                     }
@@ -1538,10 +1882,32 @@ static void draw_bottom_bar(Client& client) {
 
     ImGui::SameLine();
 
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Buffer:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(90);
+    const int buffer_options[] = {64, 96, 120, 128, 240, 256, 512};
+    char buffer_preview[32];
+    std::snprintf(buffer_preview, sizeof(buffer_preview), "%d", pending_buffer_frames);
+    if (ImGui::BeginCombo("##BufferFrames", buffer_preview)) {
+        for (int frames: buffer_options) {
+            char label[32];
+            std::snprintf(label, sizeof(label), "%d##buffer_%d", frames, frames);
+            if (ImGui::Selectable(label, frames == pending_buffer_frames)) {
+                pending_buffer_frames = frames;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::SameLine();
+
     // Check if devices changed
-    PaDeviceIndex active_input  = client.get_selected_input_device();
-    PaDeviceIndex active_output = client.get_selected_output_device();
-    bool devices_changed = (pending_input != active_input) || (pending_output != active_output);
+    AudioStream::DeviceIndex active_input  = client.get_selected_input_device();
+    AudioStream::DeviceIndex active_output = client.get_selected_output_device();
+    bool devices_changed = (pending_input != active_input) || (pending_output != active_output) ||
+                           (pending_buffer_frames != client.get_audio_config().frames_per_buffer);
 
     if (devices_changed) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8F, 0.6F, 0.2F, 1.0F));
@@ -1549,6 +1915,7 @@ static void draw_bottom_bar(Client& client) {
         if (ImGui::Button("APPLY")) {
             client.set_input_device(pending_input);
             client.set_output_device(pending_output);
+            client.set_requested_frames_per_buffer(pending_buffer_frames);
             if (client.is_audio_stream_active()) {
                 client.swap_audio_devices(pending_input, pending_output);
             }
@@ -1567,9 +1934,11 @@ static void draw_bottom_bar(Client& client) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2F, 0.6F, 0.3F, 1.0F));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3F, 0.7F, 0.4F, 1.0F));
             if (ImGui::Button("START")) {
-                if (pending_input != paNoDevice && pending_output != paNoDevice) {
+                if (pending_input != AudioStream::NO_DEVICE &&
+                    pending_output != AudioStream::NO_DEVICE) {
                     client.set_input_device(pending_input);
                     client.set_output_device(pending_output);
+                    client.set_requested_frames_per_buffer(pending_buffer_frames);
                     AudioStream::AudioConfig config = client.get_audio_config();
                     client.start_audio_stream(pending_input, pending_output, config);
                 }
@@ -1731,9 +2100,9 @@ int main() {
 
         // Auto-start audio stream with default devices
         {
-            PaDeviceIndex input_dev  = client_instance.get_selected_input_device();
-            PaDeviceIndex output_dev = client_instance.get_selected_output_device();
-            if (input_dev != paNoDevice && output_dev != paNoDevice) {
+            AudioStream::DeviceIndex input_dev  = client_instance.get_selected_input_device();
+            AudioStream::DeviceIndex output_dev = client_instance.get_selected_output_device();
+            if (input_dev != AudioStream::NO_DEVICE && output_dev != AudioStream::NO_DEVICE) {
                 AudioStream::AudioConfig config = client_instance.get_audio_config();
                 if (client_instance.start_audio_stream(input_dev, output_dev, config)) {
                     Log::info("Auto-started audio stream with default devices");
