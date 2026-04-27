@@ -2,12 +2,16 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <exception>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -77,8 +81,8 @@ public:
 
         // Initialize audio config with defaults (but don't start stream yet)
         audio_config_.sample_rate       = 48000;
-        audio_config_.bitrate           = 64000;
-        audio_config_.complexity        = 2;
+        audio_config_.bitrate           = AudioStream::AudioConfig::DEFAULT_BITRATE;
+        audio_config_.complexity        = AudioStream::AudioConfig::DEFAULT_COMPLEXITY;
         audio_config_.frames_per_buffer = 120;  // 2.5ms validated low-latency default
         audio_config_.input_gain        = 1.0F;
         audio_config_.output_gain       = 1.0F;
@@ -597,6 +601,8 @@ private:
 
     void stop_pcm_sender_thread() {
         pcm_sender_running_.store(false, std::memory_order_release);
+        pcm_sender_wake_.store(true, std::memory_order_release);
+        pcm_sender_cv_.notify_one();
         if (pcm_sender_thread_.joinable()) {
             pcm_sender_thread_.join();
         }
@@ -637,10 +643,11 @@ private:
                 continue;
             }
 
-            {
-                std::this_thread::yield();
-                continue;
-            }
+            std::unique_lock<std::mutex> lock(pcm_sender_wait_mutex_);
+            pcm_sender_cv_.wait_for(lock, 1ms, [this]() {
+                return !pcm_sender_running_.load(std::memory_order_acquire) ||
+                       pcm_sender_wake_.exchange(false, std::memory_order_acq_rel);
+            });
         }
     }
 
@@ -669,6 +676,7 @@ private:
         frame.sample_rate = sample_rate;
         frame.capture_time = std::chrono::steady_clock::now();
         pcm_send_queue_.enqueue(frame);
+        wake_pcm_sender_thread();
     }
 
     void enqueue_opus_send_frame(const float* samples, uint16_t frame_count, uint32_t sample_rate) {
@@ -677,7 +685,8 @@ private:
             return;
         }
 
-        while (opus_send_queue_.size_approx() > 2) {
+        const size_t max_queue_frames = max_send_queue_frames(frame_count);
+        while (opus_send_queue_.size_approx() >= max_queue_frames) {
             OpusSendFrame discarded;
             if (!opus_send_queue_.try_dequeue(discarded)) {
                 break;
@@ -690,6 +699,12 @@ private:
         frame.frame_count = frame_count;
         frame.sample_rate = sample_rate;
         opus_send_queue_.enqueue(frame);
+        wake_pcm_sender_thread();
+    }
+
+    void wake_pcm_sender_thread() {
+        pcm_sender_wake_.store(true, std::memory_order_release);
+        pcm_sender_cv_.notify_one();
     }
 
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
@@ -722,6 +737,9 @@ private:
     static size_t jitter_floor_for_packet(const OpusPacket& packet) {
         if (packet.codec == AudioCodec::PcmInt16 && packet.frame_count <= 120) {
             return 2;
+        }
+        if (packet.codec == AudioCodec::Opus && packet.frame_count <= 120) {
+            return 5;
         }
         return MIN_JITTER_BUFFER_PACKETS;
     }
@@ -1532,6 +1550,9 @@ private:
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
     std::atomic<bool>                         pcm_sender_running_{false};
     std::thread                               pcm_sender_thread_;
+    std::condition_variable                   pcm_sender_cv_;
+    std::mutex                                pcm_sender_wait_mutex_;
+    std::atomic<bool>                         pcm_sender_wake_{false};
     std::atomic<uint64_t>                     pcm_send_drops_{0};
     std::atomic<uint64_t>                     opus_send_drops_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_last_ns_{0};
@@ -2345,6 +2366,7 @@ struct ClientStartupOptions {
     bool list_audio_devices = false;
     bool audio_open_smoke = false;
     bool low_latency_check = false;
+    std::optional<AudioCodec> startup_codec;
     std::string required_audio_api;
 };
 
@@ -2362,6 +2384,15 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.audio_open_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
+        } else if (arg == "--codec" && i + 1 < argc) {
+            std::string codec = argv[++i];
+            std::transform(codec.begin(), codec.end(), codec.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (codec == "opus") {
+                options.startup_codec = AudioCodec::Opus;
+            } else if (codec == "pcm" || codec == "raw" || codec == "pcm_int16") {
+                options.startup_codec = AudioCodec::PcmInt16;
+            }
         } else if ((arg == "--require-api" || arg == "--api") && i + 1 < argc) {
             options.required_audio_api = argv[++i];
         }
@@ -2498,6 +2529,11 @@ int main(int argc, char** argv) {
             client_instance.set_requested_frames_per_buffer(startup_options.requested_frames);
             Log::info("Startup requested buffer override: {} frames",
                       startup_options.requested_frames);
+        }
+        if (startup_options.startup_codec.has_value()) {
+            client_instance.set_audio_codec(*startup_options.startup_codec);
+            Log::info("Startup codec override: {}",
+                      *startup_options.startup_codec == AudioCodec::Opus ? "Opus" : "PCM");
         }
 
         // Auto-start audio stream with default devices

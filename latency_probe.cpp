@@ -36,8 +36,8 @@ namespace {
 
 constexpr int   SAMPLE_RATE = 48000;
 constexpr int   CHANNELS = 1;
-constexpr int   BITRATE = 64000;
-constexpr int   COMPLEXITY = 2;
+constexpr int   BITRATE = 96000;
+constexpr int   COMPLEXITY = 5;
 constexpr int   TOTAL_PACKETS = 220;
 constexpr int   IMPULSE_PACKET = 20;
 constexpr int   CLICK_SAMPLES = 32;

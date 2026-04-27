@@ -29,8 +29,8 @@ public:
 
     struct AudioConfig {
         static constexpr int   DEFAULT_SAMPLE_RATE       = 48000;
-        static constexpr int   DEFAULT_BITRATE           = 64000;
-        static constexpr int   DEFAULT_COMPLEXITY        = 2;
+        static constexpr int   DEFAULT_BITRATE           = 96000;
+        static constexpr int   DEFAULT_COMPLEXITY        = 5;
         static constexpr int   DEFAULT_FRAMES_PER_BUFFER = 240;  // 5ms (optimal for stability)
         static constexpr float DEFAULT_INPUT_GAIN        = 1.0F;
         static constexpr float DEFAULT_OUTPUT_GAIN       = 1.0F;

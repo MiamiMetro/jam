@@ -12,14 +12,34 @@ This section is the plan to follow. Older detailed notes below are history/evide
 
 ### Current Phase
 
-Phase 2 closeout: stabilize, review, and decide whether the low-latency PCM client path is acceptable to commit.
+Roadmap realignment after reviewing old notes. Decide the next production audio phase before writing more audio code.
 
 ### Phase Status
 
 - [x] Phase 1: RtAudio backend swap and backend observability.
 - [x] Phase 2: Low-latency PCM client path closeout.
-- [ ] Phase 3: Real low-latency backend/device validation.
-- [ ] Phase 4: Deeper playout correction/resampling, only if justified by Phase 2 or Phase 3 evidence.
+- [ ] Phase 3: Production audio architecture. Planning only.
+- [ ] Phase 4: Cross-platform backend/device validation. Blocked on current Windows machine; macOS/CoreAudio still untested.
+- [ ] Phase 5: Deeper playout correction/resampling. Deferred until production codec/backend direction is locked.
+
+### Product Target
+
+- Platforms: macOS and Windows, with macOS slightly more important.
+- Transport/server shape: keep UDP/SFU and `boost::asio`; local tests do not show the network/SFU as the current bottleneck.
+- Production internet default: Opus, because bandwidth is not free.
+- Low-latency/reference mode: PCM, because it proved the client/playout/backend path and remains useful for LAN/studio/high-bandwidth sessions.
+- Main quality rule: low latency is invalid if it causes robotic/corrupt audio.
+
+### Durable Findings From Old Notes
+
+- Original bottleneck diagnosis remains valid: client callback work, jitter/playout policy, codec frame assumptions, and backend/device latency matter more than raw UDP in local tests.
+- The audio callback must stay deterministic: no allocation, locks, logging, blocking I/O, packet building, socket send, or codec encode.
+- Much of the original callback cleanup is now done: PCM/Opus send queues exist, packet build/send moved out of callback, and callback timing/health diagnostics exist.
+- Original Opus warning remains valid: standard Opus supports legal frame durations such as `120` samples at 48 kHz, but not arbitrary `96` or `64` sample frames.
+- Current PCM result changes the old roadmap: PCM was originally planned later, but is now already implemented and validated as the reference path.
+- Competitor lesson remains valid: product should be hybrid. JackTrip validates uncompressed/low-buffer reference mode; SonoBus validates PCM plus Opus modes; Jamulus validates tight sequence-aware jitter and custom low-delay Opus behavior.
+- Mixed-preset rooms are a product requirement, not polish. Buffer size and jitter depth are local; codec and frame count must be signaled per packet.
+- Automated tests must include latency and corruption proxies; human listening remains a release gate because tests can miss robotic/corrupt audio.
 
 ### Phase 2 Done Criteria
 
@@ -32,24 +52,36 @@ Phase 2 closeout: stabilize, review, and decide whether the low-latency PCM clie
 - [x] Extended `96` run is documented.
 - [x] Current code diff is reviewed for hacks, regressions, and accidental broad changes.
 - [x] Phase 2 acceptance decision is written down.
-- [ ] Commit/no-commit decision is made after review and user testing.
+- [x] Commit/no-commit decision is made after review and user testing.
+  - Result: user committed Phase 2 after reviewed-build listening passed.
 
 ### Current Allowed Work
 
-Only these tasks are allowed before Phase 2 is accepted or rejected:
+Only these tasks are allowed before the next implementation phase starts:
 
-- [x] Clean this todo so it is phase-based and followable.
-- [x] Review the current diff.
-- [x] Decide whether bounded PCM hold/drop is acceptable as a Phase 2 implementation or needs rework.
-- [x] Run only targeted verification needed for that review.
-- [x] Update `LOW_LATENCY_AUDIO_AUDIT.md` with evidence, not future tasks.
+- [x] Review old notes in `notes/`, `latency_findings.md`, and `feature_roadmap.md`.
+- [x] Classify which old findings are stale, completed, or still active.
+- [x] Rewrite this control board so it reflects Windows + macOS production goals.
+- [ ] Decide Phase 3 done criteria before coding.
+- [x] Decide whether Phase 3 targets standard Opus at `120` first or Jamulus-style custom Opus.
+  - Decision: target standard Opus at `120` frames first.
+  - Reason: `120` frames is legal standard Opus at 48 kHz, matches the validated default callback size, and avoids custom Opus complexity until standard Opus fails a concrete gate.
+- [x] Decide what mixed-preset support must mean in Phase 3.
+  - Decision: Phase 3 supports mixed codec packets enough for PCM and Opus clients to coexist when frame counts match.
+  - Boundary: arbitrary mixed frame sizes are deferred until a real resampling/playout layer.
+- [x] Decide test harness requirements for proving Opus does not create robotic/corrupt audio.
+  - Decision: Phase 3 requires automated `120` Opus probe coverage plus real two-client listening.
+  - Boundary: Opus does not need to beat PCM latency; it must provide a bandwidth-realistic clear mode.
+- [x] Write the Phase 3 implementation checklist only after those decisions are made.
 
 ### Current Blockers
 
-- Real ASIO validation is blocked on this machine because no ASIO input/output devices are visible.
+- Production Opus is not validated for low-latency jamming yet.
+- Real ASIO validation is blocked on this Windows machine because no ASIO input/output devices are visible.
+- macOS/CoreAudio validation has not been run yet.
 - `64` frame promotion is blocked because it still sounds robotic/corrupt.
 - Mixed PCM frame sizes between clients are not supported in Phase 2; clients should use the same frame setting until a real resampling/playout layer exists.
-- Further latency reduction below stable `96` is blocked until Phase 2 closeout is accepted.
+- Further latency reduction below stable `96` PCM is blocked until production codec, backend validation, and playout direction are agreed.
 
 ### Current Product Decision Draft
 
@@ -57,13 +89,97 @@ Only these tasks are allowed before Phase 2 is accepted or rejected:
 - Ultra: `96` frames.
 - Experimental CLI-only: `64` frames.
 - Invalid/bad on current setup: `32` frames.
+- PCM is shippable as LAN/studio/reference mode, not as the only default production internet mode.
+- Opus should become the production internet default after it passes the same clarity and diagnostics gates.
 - Network/SFU is not the current bottleneck in local tests.
 - Client/backend/playout is the current bottleneck.
 - Normal UI buffer choices are limited to packet-safe PCM sizes: `96`, `120`, `128`, `240`, `256`.
 
 ### Next Step
 
-Run targeted verification after the review fixes, then decide commit/no-commit after user testing.
+Finish the Phase 3 production-audio plan. Next grill-me decision: define required mixed-preset support for Phase 3.
+
+### Phase 3 Decision: Production Opus Target
+
+Decision:
+- Phase 3 targets standard Opus at `120` frames first.
+
+Rationale:
+- `120` frames at 48 kHz is a valid standard Opus duration of `2.5 ms`.
+- The PCM path already validated `120` as the stable default callback size.
+- Standard Opus is the lowest-complexity production bandwidth path to test first.
+- `96` and `64` remain invalid targets for standard Opus; do not retest them as standard Opus modes.
+- Jamulus-style custom Opus remains a fallback only if standard `120` Opus fails clarity, latency, or stability gates.
+
+Product implication:
+- `120` Opus is the candidate production internet default.
+- `96` PCM remains the current Ultra/reference path.
+
+### Phase 3 Decision: Mixed-Preset Boundary
+
+Decision:
+- Phase 3 must route packets by packet metadata: codec and frame count.
+- Phase 3 must allow `120` Opus and `120` PCM clients to coexist.
+- Phase 3 may keep `96` PCM as Ultra/reference, but mixed `96` and `120` frame-size rooms are not guaranteed until Phase 5.
+
+Rationale:
+- Codec choice is a production requirement because internet mode needs Opus and reference/LAN mode needs PCM.
+- Arbitrary mixed frame sizes require resampling or a stronger playout scheduler.
+- Solving arbitrary mixed frame sizes now would turn Phase 3 into a larger DSP/playout project and delay the production Opus gate.
+
+### Phase 3 Done Criteria
+
+- [ ] `client` builds.
+- [ ] `latency_probe` builds.
+- [x] Automated `latency_probe` Opus run at `120` frames passes without encode/decode failures.
+- [x] Automated Opus run reports latency and corruption indicators.
+- [x] Two local real clients can run `120` Opus through local `server.exe`.
+- [x] User listening result for `120` Opus is clear, not robotic/corrupt.
+- [x] Real-client Opus run has no repeated rebuffering.
+- [x] Real-client Opus run has no Opus encode/decode failure stream.
+- [x] Real-client Opus run has no high health-warning rates.
+- [x] Packet age is documented for the accepted `120` Opus run.
+- [x] Regression check: PCM `120` still works.
+  - Hidden 60-second `--frames 120 --codec pcm` validation stayed at `tx_drops pcm/opus=0/0` on both clients with no health/rebuffer/decode/send errors.
+- [x] Regression check: PCM `96` still works.
+  - Hidden 60-second `--frames 96 --codec pcm` validation stayed at `tx_drops pcm/opus=0/0` on both clients with no health/rebuffer/decode/send errors.
+
+Acceptance rule:
+- Opus does not need to beat PCM latency.
+- Opus must be clear and bandwidth-realistic.
+- PCM remains the lowest-latency/reference mode if it continues to outperform Opus.
+
+### Phase 3 Implementation Checklist
+
+- [x] Inspect current Opus path against the Phase 3 done criteria.
+  - Finding: `latency_probe` already supports `--codec opus --frames 120` and reports corruption indicators.
+  - Finding: real client Opus packets use `AudioHdrV2` codec and frame-count metadata.
+  - Boundary confirmed: current real-client decode path assumes incoming packet frame count matches the local callback frame count; arbitrary mixed frame sizes remain deferred.
+- [x] Add or extend `latency_probe` coverage for `--codec opus --frames 120`.
+  - Finding: existing probe coverage is sufficient for the first Phase 3 gate.
+  - Clean sequential runs must be used; parallel probes share the same SFU room and invalidate receive counts.
+- [ ] Verify Opus sender/receiver uses `AudioHdrV2` metadata consistently.
+- [x] Run automated `120` Opus probe and document results.
+  - `jitter 3`: encode/decode clean, but `3` underruns/PLC frames in `10s`; warning.
+  - `jitter 4`: encode/decode clean, but `2` underruns/PLC frames in `10s`; warning.
+  - `jitter 5`: clean in `10s`, `0` underruns, `0` PLC, `0` encode/decode failures, measured latency `25.7708 ms`.
+  - Interpretation: standard `120` Opus works, but its safe initial jitter target is currently higher than PCM.
+- [x] Run two real clients at `120` Opus through local `server.exe`.
+  - Result: user reported `95%` clear and bandwidth much better than PCM.
+  - Decision: candidate pass, but not final Phase 3 acceptance because artifacts remain.
+- [ ] Fix only issues directly blocking the Phase 3 gate.
+  - Current blocker: `120` Opus is mostly clear, but not yet fully clear.
+  - User-provided live diagnostics showed `opus_send_drops` rising steadily during the first Opus test.
+  - Change: Opus sender queue now uses the same small-frame headroom policy as PCM instead of dropping above `2` queued frames.
+  - Change: Opus production/probe settings moved from `64 kbps` complexity `2` to `96 kbps` complexity `5`.
+  - Two-minute hidden-client validation after the fix: both clients stayed at `tx_drops pcm/opus=0/0`; no health/rebuffer/decode/send errors were found in captured logs.
+  - Visible listening after the fix: user reported audio is clear.
+- [x] Regression-check PCM `120`.
+- [x] Regression-check PCM `96`.
+- [x] Decide whether standard `120` Opus is accepted or whether custom Opus is justified.
+  - Decision: accept standard `120` Opus for Phase 3.
+  - Decision: do not escalate to custom Opus now.
+  - Reason: user listening is clear, two-minute Opus logs are clean, bandwidth is much better than PCM, and PCM `120`/`96` regressions are clean.
 
 ### Phase 2 Acceptance Decision
 
@@ -104,7 +220,71 @@ Reason:
 - Remaining backend/device validation is external to Phase 2.
 
 Remaining decision:
-- Commit/no-commit after user decides this tested state is ready to preserve.
+- Done: user committed Phase 2 after reviewed-build listening passed.
+
+### Phase 3 Entry Criteria
+
+- [x] Phase 2 is committed.
+- [ ] A real low-latency backend/device is visible to the app.
+  - Current result: ASIO is compiled but has no visible input/output devices.
+- [ ] `client --backend-check --require-api <API> --frames 96` succeeds for that backend.
+  - Current result: WASAPI succeeds, but it is not accepted as the real low-latency backend target because backend latency is unknown.
+
+### Phase 3 Candidate Commands
+
+- Windows ASIO: `client --backend-check --require-api ASIO --frames 96`
+- Current fallback check: `client --backend-check --require-api WASAPI --frames 96`
+
+### Phase 3 Exit Criteria
+
+- Pass: a real low-latency backend opens at `96` and survives two-client listening/diagnostics.
+- Blocked: no real low-latency backend/device is visible on the available machine.
+
+### Phase 3 Current Result
+
+Blocked on this machine.
+
+Evidence:
+- `client --backend-check` targets ASIO and fails because ASIO has no visible input/output devices.
+- `client --backend-check --require-api WASAPI --frames 96` opens actual `96` frames, but backend latency remains unavailable/zero.
+
+### Next Decision
+
+- Option A: pause Phase 3 until a real ASIO/JACK/CoreAudio-class backend is available.
+- Option B: start Phase 4 planning for a real playout/resampling layer to reduce `PCM hold` pressure.
+- Recommended answer: choose Option A if hardware/driver access is realistic soon; choose Option B if this app must improve further on WASAPI-only machines.
+
+### Interruption: Power Usage Investigation
+
+- [x] Inspect likely high-power loops.
+  - Finding: GUI renders at a capped `60` FPS with vsync disabled.
+  - Finding: PCM sender thread used `std::this_thread::yield()` in an empty-queue loop, which can wake constantly.
+- [x] Replace PCM sender busy-spin with notification-based wait.
+  - Implementation: enqueue paths wake the sender thread through a condition variable.
+  - Guardrail: audio callback only stores an atomic flag and calls `notify_one`; it does not take the sender wait mutex.
+  - Verification: `cmake --build build --target client`.
+- [x] User checks Task Manager power/CPU after sender wait fix.
+  - Result: user reported audio is clear and power usage is low.
+- [x] If power remains high, investigate GUI render rate/vsync next.
+  - Decision: not needed now; sender busy-wait fix addressed the reported issue.
+
+### Phase 4 Planning Draft
+
+Goal:
+- Reduce or eliminate `PCM hold` pressure and support cleaner playout on WASAPI-only machines without making `96` worse.
+
+Non-goals:
+- Do not promote `64` unless it becomes clear in listening and counters.
+- Do not hand-roll a large DSP subsystem if a proven library can be integrated cleanly.
+- Do not break the accepted Phase 2 product state: `120` default, `96` Ultra.
+
+Candidate approaches:
+- Library resampling/time-stretch: use a proven small resampler for clock drift and mixed packet/callback sizes.
+- Bounded custom slip/stretch: continue Jamulus-style packet/frame decisions with explicit counters.
+- Backend wait: postpone Phase 4 until real ASIO/JACK/CoreAudio validation is possible.
+
+Recommended next decision:
+- Prefer a proven resampler/library if Phase 4 proceeds, because ad hoc audio correction is exactly where previous attempts produced robotic/corrupt sound.
 
 ## Historical Work Log
 
