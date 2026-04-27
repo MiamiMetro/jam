@@ -12,6 +12,11 @@ constexpr uint32_t AUDIO_V2_MAGIC = 0x41553249;  // 'AU2I'
 
 // Buffer sizes
 constexpr size_t AUDIO_BUF_SIZE = 512;
+constexpr size_t ROOM_ID_SIZE = 64;
+constexpr size_t ROOM_HANDLE_SIZE = 64;
+constexpr size_t USER_ID_SIZE = 64;
+constexpr size_t DISPLAY_NAME_SIZE = 64;
+constexpr size_t JOIN_TOKEN_SIZE = 256;
 
 // Jitter buffer configuration (CLIENT/LISTENER ONLY - server just relays packets)
 constexpr size_t MAX_OPUS_QUEUE_SIZE       = 10;  // Maximum packets in queue (safety limit)
@@ -44,6 +49,14 @@ struct CtrlHdr : MsgHdr {
         PARTICIPANT_LEAVE = 4,  // Server broadcasts when participant leaves
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
+};
+
+struct JoinCtrlHdr : CtrlHdr {
+    char room_id[ROOM_ID_SIZE];
+    char room_handle[ROOM_HANDLE_SIZE];
+    char user_id[USER_ID_SIZE];
+    char display_name[DISPLAY_NAME_SIZE];
+    char join_token[JOIN_TOKEN_SIZE];
 };
 
 struct AudioHdr : MsgHdr {
