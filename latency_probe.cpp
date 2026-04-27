@@ -8,7 +8,9 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -53,6 +55,7 @@ enum class ProbeCodec {
 struct ProbeConfig {
     int frame_size = 240;
     int jitter_min_packets = 3;
+    int total_packets = TOTAL_PACKETS;
     ProbeCodec codec = ProbeCodec::Opus;
 };
 
@@ -60,6 +63,8 @@ struct Args {
     std::string host = "127.0.0.1";
     unsigned short port = 9999;
     bool sweep = false;
+    int duration_seconds = 0;
+    double playout_ppm = 0.0;
     ProbeConfig config;
 };
 
@@ -80,7 +85,11 @@ struct ProbeMetrics {
     int non_finite_samples = 0;
     int out_of_range_samples = 0;
     int repeated_blocks = 0;
+    int queue_depth_observations = 0;
+    long long queue_depth_sum = 0;
+    int min_queue_depth_after_ready = std::numeric_limits<int>::max();
     int max_queue_depth = 0;
+    int final_queue_depth = 0;
     float max_discontinuity = 0.0F;
     int detected_output_sample = -1;
 };
@@ -103,6 +112,10 @@ public:
 
     void send_join() {
         send_ctrl(CtrlHdr::Cmd::JOIN);
+    }
+
+    void send_alive() {
+        send_ctrl(CtrlHdr::Cmd::ALIVE);
     }
 
     void send_leave() {
@@ -196,6 +209,10 @@ public:
 
     void send_join() {
         send_ctrl(CtrlHdr::Cmd::JOIN);
+    }
+
+    void send_alive() {
+        send_ctrl(CtrlHdr::Cmd::ALIVE);
     }
 
     void send_leave() {
@@ -308,7 +325,7 @@ void inspect_samples(const std::array<float, MAX_FRAME_SAMPLES>& pcm, int decode
 }
 
 void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeMetrics& metrics,
-                      clock_type::time_point start_time) {
+                      clock_type::time_point start_time, double playout_ppm) {
     OpusDecoderWrapper decoder;
     if (config.codec == ProbeCodec::Opus && !decoder.create(SAMPLE_RATE, CHANNELS)) {
         throw std::runtime_error("failed to create Opus decoder");
@@ -318,14 +335,19 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
     std::array<float, MAX_FRAME_SAMPLES> pcm{};
     std::vector<float> previous_block(static_cast<size_t>(config.frame_size), 0.0F);
     bool have_previous_block = false;
-    auto frame_duration =
-        std::chrono::duration_cast<clock_type::duration>(std::chrono::duration<double>(
-            static_cast<double>(config.frame_size) / static_cast<double>(SAMPLE_RATE)));
+    const double playout_rate =
+        static_cast<double>(SAMPLE_RATE) * (1.0 + (playout_ppm / 1'000'000.0));
+    auto frame_duration = std::chrono::duration_cast<clock_type::duration>(
+        std::chrono::duration<double>(static_cast<double>(config.frame_size) / playout_rate));
 
-    for (int tick = 0; tick < TOTAL_PACKETS + 80; ++tick) {
+    for (int tick = 0; tick < config.total_packets + 80; ++tick) {
         std::this_thread::sleep_until(start_time + frame_duration * tick);
+        if (tick % std::max(1, SAMPLE_RATE / config.frame_size) == 0) {
+            receiver.send_alive();
+        }
 
         int current_queue_depth = static_cast<int>(receiver.queue_size());
+        metrics.final_queue_depth = current_queue_depth;
         metrics.max_queue_depth = std::max(metrics.max_queue_depth, current_queue_depth);
         if (!buffer_ready && current_queue_depth >= config.jitter_min_packets) {
             buffer_ready = true;
@@ -335,6 +357,15 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
         if (!buffer_ready) {
             continue;
         }
+
+        if (current_queue_depth == 0 && receiver.received_count() >= config.total_packets) {
+            break;
+        }
+
+        metrics.queue_depth_observations++;
+        metrics.queue_depth_sum += current_queue_depth;
+        metrics.min_queue_depth_after_ready =
+            std::min(metrics.min_queue_depth_after_ready, current_queue_depth);
 
         ReceivedPacket packet;
         if (receiver.pop_packet(packet)) {
@@ -362,7 +393,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             }
             inspect_samples(pcm, decoded_samples, output_base_sample, config, metrics,
                             previous_block, have_previous_block);
-        } else if (receiver.received_count() < TOTAL_PACKETS) {
+        } else if (receiver.received_count() < config.total_packets) {
             metrics.underruns++;
             if (config.codec == ProbeCodec::Opus) {
                 int plc_samples = decoder.decode_plc(pcm.data(), config.frame_size);
@@ -393,8 +424,11 @@ void run_sender_loop(const ProbeConfig& config, ProbeSender& sender, ProbeMetric
         std::chrono::duration_cast<clock_type::duration>(std::chrono::duration<double>(
             static_cast<double>(config.frame_size) / static_cast<double>(SAMPLE_RATE)));
 
-    for (int packet_index = 0; packet_index < TOTAL_PACKETS; ++packet_index) {
+    for (int packet_index = 0; packet_index < config.total_packets; ++packet_index) {
         std::this_thread::sleep_until(start_time + frame_duration * packet_index);
+        if (packet_index % std::max(1, SAMPLE_RATE / config.frame_size) == 0) {
+            sender.send_alive();
+        }
         fill_probe_frame(packet_index, config, frame);
         bool sent = false;
         if (config.codec == ProbeCodec::Opus) {
@@ -441,7 +475,7 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     auto start_time = clock_type::now() + 100ms;
 
     std::thread playout_thread(run_playout_loop, std::cref(config), std::ref(receiver),
-                               std::ref(metrics), start_time);
+                               std::ref(metrics), start_time, args.playout_ppm);
     std::thread sender_thread(run_sender_loop, std::cref(config), std::ref(sender),
                               std::ref(metrics), start_time);
 
@@ -483,12 +517,22 @@ bool has_corruption_indicators(const ProbeResult& result) {
 void print_result(const Args& args, const ProbeResult& result) {
     const auto& c = result.config;
     const auto& m = result.metrics;
+    const double avg_queue =
+        m.queue_depth_observations > 0
+            ? static_cast<double>(m.queue_depth_sum) / static_cast<double>(m.queue_depth_observations)
+            : 0.0;
+    const int min_queue =
+        m.min_queue_depth_after_ready == std::numeric_limits<int>::max()
+            ? 0
+            : m.min_queue_depth_after_ready;
     std::cout << "latency_probe v1\n";
     std::cout << "server: " << args.host << ":" << args.port << "\n";
     std::cout << "codec: " << codec_name(c.codec) << "\n";
     std::cout << "sample_rate: " << SAMPLE_RATE << "\n";
     std::cout << "frames_per_packet: " << c.frame_size << "\n";
     std::cout << "jitter_min_packets: " << c.jitter_min_packets << "\n";
+    std::cout << "playout_ppm: " << args.playout_ppm << "\n";
+    std::cout << "total_packets: " << c.total_packets << "\n";
     std::cout << "impulse_packet: " << IMPULSE_PACKET << "\n";
     std::cout << "sent_packets: " << m.sent_packets << "\n";
     std::cout << "encode_failures: " << m.encode_failures << "\n";
@@ -497,7 +541,12 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "detected_output_sample: " << m.detected_output_sample << "\n";
     std::cout << "latency_samples: " << result.latency_samples << "\n";
     std::cout << "latency_ms: " << result.latency_ms << "\n";
+    std::cout << "avg_queue_depth: " << avg_queue << "\n";
+    std::cout << "queue_drift_from_jitter: "
+              << (avg_queue - static_cast<double>(c.jitter_min_packets)) << "\n";
+    std::cout << "min_queue_depth_after_ready: " << min_queue << "\n";
     std::cout << "max_queue_depth: " << m.max_queue_depth << "\n";
+    std::cout << "final_queue_depth: " << m.final_queue_depth << "\n";
     std::cout << "underruns: " << m.underruns << "\n";
     std::cout << "plc_frames: " << m.plc_frames << "\n";
     std::cout << "decode_failures: " << m.decode_failures << "\n";
@@ -512,19 +561,30 @@ void print_result(const Args& args, const ProbeResult& result) {
 }
 
 void print_sweep_header() {
-    std::cout << "codec,frames,jitter,latency_ms,latency_samples,sent,received,decoded,max_queue,"
-                 "encode_failures,underruns,plc,decode_failures,size_mismatch,non_finite,out_of_range,"
-                 "repeated_blocks,max_discontinuity,status\n";
+    std::cout << "codec,frames,jitter,playout_ppm,latency_ms,latency_samples,sent,received,decoded,max_queue,"
+                 "avg_queue,queue_drift,min_queue,final_queue,encode_failures,underruns,plc,"
+                 "decode_failures,size_mismatch,non_finite,out_of_range,repeated_blocks,"
+                 "max_discontinuity,status\n";
 }
 
-void print_sweep_row(const ProbeResult& result) {
+void print_sweep_row(const Args& args, const ProbeResult& result) {
     const auto& c = result.config;
     const auto& m = result.metrics;
+    const double avg_queue =
+        m.queue_depth_observations > 0
+            ? static_cast<double>(m.queue_depth_sum) / static_cast<double>(m.queue_depth_observations)
+            : 0.0;
+    const int min_queue =
+        m.min_queue_depth_after_ready == std::numeric_limits<int>::max()
+            ? 0
+            : m.min_queue_depth_after_ready;
     std::cout << codec_name(c.codec) << ',' << c.frame_size << ',' << c.jitter_min_packets << ','
-              << result.latency_ms << ',' << result.latency_samples << ',' << m.sent_packets << ','
+              << args.playout_ppm << ',' << result.latency_ms << ',' << result.latency_samples << ',' << m.sent_packets << ','
               << m.received_packets << ',' << m.decoded_packets << ',' << m.max_queue_depth << ','
-              << m.encode_failures << ',' << m.underruns << ',' << m.plc_frames << ','
-              << m.decode_failures << ',' << m.decoded_size_mismatches << ',' << m.non_finite_samples << ','
+              << avg_queue << ',' << (avg_queue - static_cast<double>(c.jitter_min_packets)) << ','
+              << min_queue << ',' << m.final_queue_depth << ',' << m.encode_failures << ','
+              << m.underruns << ',' << m.plc_frames << ',' << m.decode_failures << ','
+              << m.decoded_size_mismatches << ',' << m.non_finite_samples << ','
               << m.out_of_range_samples << ',' << m.repeated_blocks << ','
               << m.max_discontinuity << ',' << (has_corruption_indicators(result) ? "warn" : "ok")
               << "\n";
@@ -542,6 +602,12 @@ Args parse_args(int argc, char** argv) {
             args.config.frame_size = std::stoi(argv[++i]);
         } else if (arg == "--jitter" && i + 1 < argc) {
             args.config.jitter_min_packets = std::stoi(argv[++i]);
+        } else if (arg == "--packets" && i + 1 < argc) {
+            args.config.total_packets = std::stoi(argv[++i]);
+        } else if (arg == "--seconds" && i + 1 < argc) {
+            args.duration_seconds = std::stoi(argv[++i]);
+        } else if (arg == "--playout-ppm" && i + 1 < argc) {
+            args.playout_ppm = std::stod(argv[++i]);
         } else if (arg == "--codec" && i + 1 < argc) {
             std::string codec = argv[++i];
             if (codec == "opus") {
@@ -554,6 +620,15 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--sweep") {
             args.sweep = true;
         }
+    }
+    if (args.duration_seconds > 0) {
+        const int64_t total_samples =
+            static_cast<int64_t>(args.duration_seconds) * static_cast<int64_t>(SAMPLE_RATE);
+        args.config.total_packets =
+            static_cast<int>((total_samples + args.config.frame_size - 1) / args.config.frame_size);
+    }
+    if (args.config.total_packets <= IMPULSE_PACKET) {
+        throw std::runtime_error("--packets/--seconds must run past the impulse packet");
     }
     return args;
 }
@@ -570,9 +645,10 @@ int main(int argc, char** argv) {
             print_sweep_header();
             for (int frames: frame_sizes) {
                 for (int jitter: jitter_values) {
-                    ProbeConfig config{frames, jitter, args.config.codec};
+                    ProbeConfig config{frames, jitter, args.config.total_packets,
+                                       args.config.codec};
                     ProbeResult result = run_probe(args, config);
-                    print_sweep_row(result);
+                    print_sweep_row(args, result);
                 }
             }
             return 0;

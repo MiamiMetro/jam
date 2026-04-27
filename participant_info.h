@@ -36,12 +36,18 @@ struct ParticipantData {
     moodycamel::ConcurrentQueue<OpusPacket> opus_queue;
     std::unique_ptr<OpusDecoderWrapper>     decoder;
     std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
+    std::array<float, 960>                  last_pcm_buffer{};
+    size_t                                  last_pcm_samples = 0;
+    bool                                    last_pcm_valid = false;
+    bool                                    pcm_concealment_used = false;
+    std::atomic<uint64_t>                   pcm_drift_drops{0};
 
     // Participant state
     bool                                  is_muted = false;
     float                                 gain     = 1.0F;
     float                                 pan      = 0.5F;  // 0.0 = full left, 0.5 = center, 1.0 = full right
     std::chrono::steady_clock::time_point last_packet_time;
+    size_t                                jitter_buffer_floor_packets = MIN_JITTER_BUFFER_PACKETS;
     size_t                                jitter_buffer_min_packets = MIN_JITTER_BUFFER_PACKETS;
     bool                                  buffer_ready              = false;
     int                                   underrun_count            = 0;
@@ -65,6 +71,7 @@ struct ParticipantData {
     std::atomic<uint64_t>   sequence_late_or_reordered{0};
     std::atomic<uint64_t>   jitter_depth_drops{0};
     std::atomic<uint64_t>   jitter_age_drops{0};
+    std::atomic<uint64_t>   pcm_concealment_frames{0};
 };
 
 // Lightweight view for UI (snapshot of ParticipantData)
@@ -89,4 +96,6 @@ struct ParticipantInfo {
     uint64_t sequence_late_or_reordered;
     uint64_t jitter_depth_drops;
     uint64_t jitter_age_drops;
+    uint64_t pcm_concealment_frames;
+    uint64_t pcm_drift_drops;
 };

@@ -104,6 +104,9 @@ public:
                 data->sequence_late_or_reordered.load(std::memory_order_relaxed);
             info.jitter_depth_drops = data->jitter_depth_drops.load(std::memory_order_relaxed);
             info.jitter_age_drops = data->jitter_age_drops.load(std::memory_order_relaxed);
+            info.pcm_concealment_frames =
+                data->pcm_concealment_frames.load(std::memory_order_relaxed);
+            info.pcm_drift_drops = data->pcm_drift_drops.load(std::memory_order_relaxed);
             result.push_back(info);
         }
 

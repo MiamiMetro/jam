@@ -6,7 +6,107 @@ Date: 2026-04-26
 
 This file is the source of truth for the latency work. Update it before and after each implementation step so decisions, progress, and verification are not floating only in chat.
 
-## Current Objective
+## Control Board
+
+This section is the plan to follow. Older detailed notes below are history/evidence and should not create new work unless a control-board item says so.
+
+### Current Phase
+
+Phase 2 closeout: stabilize, review, and decide whether the low-latency PCM client path is acceptable to commit.
+
+### Phase Status
+
+- [x] Phase 1: RtAudio backend swap and backend observability.
+- [x] Phase 2: Low-latency PCM client path closeout.
+- [ ] Phase 3: Real low-latency backend/device validation.
+- [ ] Phase 4: Deeper playout correction/resampling, only if justified by Phase 2 or Phase 3 evidence.
+
+### Phase 2 Done Criteria
+
+- [x] `120` frames is default and clear.
+- [x] `96` frames is available as Ultra and clear.
+- [x] `64` frames remains hidden/experimental because it is robotic/corrupt.
+- [x] `32` frames is documented as invalid/bad on this setup.
+- [x] Bad low-buffer configurations can trigger health warnings from counters, not only human listening.
+- [x] Bounded PCM hold/drop behavior is implemented and visible in diagnostics.
+- [x] Extended `96` run is documented.
+- [x] Current code diff is reviewed for hacks, regressions, and accidental broad changes.
+- [x] Phase 2 acceptance decision is written down.
+- [ ] Commit/no-commit decision is made after review and user testing.
+
+### Current Allowed Work
+
+Only these tasks are allowed before Phase 2 is accepted or rejected:
+
+- [x] Clean this todo so it is phase-based and followable.
+- [x] Review the current diff.
+- [x] Decide whether bounded PCM hold/drop is acceptable as a Phase 2 implementation or needs rework.
+- [x] Run only targeted verification needed for that review.
+- [x] Update `LOW_LATENCY_AUDIO_AUDIT.md` with evidence, not future tasks.
+
+### Current Blockers
+
+- Real ASIO validation is blocked on this machine because no ASIO input/output devices are visible.
+- `64` frame promotion is blocked because it still sounds robotic/corrupt.
+- Mixed PCM frame sizes between clients are not supported in Phase 2; clients should use the same frame setting until a real resampling/playout layer exists.
+- Further latency reduction below stable `96` is blocked until Phase 2 closeout is accepted.
+
+### Current Product Decision Draft
+
+- Default: `120` frames.
+- Ultra: `96` frames.
+- Experimental CLI-only: `64` frames.
+- Invalid/bad on current setup: `32` frames.
+- Network/SFU is not the current bottleneck in local tests.
+- Client/backend/playout is the current bottleneck.
+- Normal UI buffer choices are limited to packet-safe PCM sizes: `96`, `120`, `128`, `240`, `256`.
+
+### Next Step
+
+Run targeted verification after the review fixes, then decide commit/no-commit after user testing.
+
+### Phase 2 Acceptance Decision
+
+Draft decision: accept bounded PCM hold/drop for Phase 2 as a limited, visible stabilization mechanism.
+
+Rationale:
+- `120` and `96` are clear in manual tests.
+- Extended `96` run is warning-free.
+- Hold/drop counters and rates make the stopgap visible instead of hidden.
+- `64` is still rejected, so the stopgap is not being used to falsely promote an unstable tier.
+- A real resampler belongs to a later phase because it is a larger algorithmic change.
+
+Required before closing Phase 2:
+- Targeted post-review smoke/verification is complete.
+- User confirms the reviewed build still sounds clear at `96` or `120`.
+- User decides whether this state is acceptable to commit.
+
+### Post-Review Verification
+
+- [x] `cmake --build build --target client`
+- [x] `cmake --build build --target latency_probe`
+- [x] `client --audio-open-smoke --require-api WASAPI --frames 96`
+- [x] `client --backend-check --require-api WASAPI --frames 96`
+- [x] `client --backend-check` fails clearly because ASIO has no visible input/output devices.
+- [x] User listening confirmation on reviewed build.
+  - Result: two reviewed-build clients at `96` sounded clear.
+
+### Phase 2 Final Acceptance
+
+Accepted.
+
+Reason:
+- Reviewed build passes targeted smoke checks.
+- User confirmed reviewed-build `96` audio is clear.
+- `120` remains the safe default.
+- `96` remains Ultra.
+- `64` remains CLI-only experimental and is not promoted.
+- Remaining backend/device validation is external to Phase 2.
+
+Remaining decision:
+- Commit/no-commit after user decides this tested state is ready to preserve.
+
+## Historical Work Log
 
 Implement the first production raw PCM int16 path with explicit packet metadata while keeping the server as a dumb UDP/SFU forwarder.
 
@@ -179,6 +279,83 @@ Locked drift metrics scope:
 - Display the smoothed signed drift in the existing participant stats.
 - Verify with client build and two-client local smoke.
 
+Current implementation: Gate 8 automated long-run drift probe.
+
+Locked long-run probe scope:
+- Extend `latency_probe`, not the GUI client.
+- Add configurable probe length.
+- Report queue fill average/min/final and drift relative to jitter target.
+- Do not add adaptive correction in this step.
+- Verify with short local run first; 10-minute run remains a follow-up because it is intentionally long.
+
+Current implementation: Gate 8 10-minute baseline drift run.
+
+Locked 10-minute baseline scope:
+- Run the automated PCM probe through local `server.exe`.
+- Use `240` frames and jitter target `3` first, matching the stable default.
+- Record exact probe output in the audit.
+- Do not change correction behavior until the baseline is known.
+- Finding: first 10-minute attempt was invalid because `latency_probe` clients sent `JOIN` but not periodic `ALIVE`, so the server timed out the synthetic endpoints.
+- Fix scope: add periodic `ALIVE` from both probe endpoints during long runs, then rerun.
+
+Current implementation: Gate 8 10-minute real RtAudio client baseline.
+
+Locked real-client baseline scope:
+- Run local `server.exe` plus two real `client.exe` processes.
+- Use current default settings first: PCM, `240` requested frames, jitter target `3`.
+- Verify log-level stability: join, jitter ready, no steady-state rebuffer/decode/send errors.
+- Do not commit or change correction behavior in this step.
+
+Current implementation: automate real-client lower-buffer tests.
+
+Locked lower-buffer automation scope:
+- Add a minimal `client --frames N` startup override.
+- Keep UI behavior unchanged.
+- Use the override only for repeatable local test runs at `120` and `128`.
+- Do not add presets or correction logic in this step.
+
+Finding:
+- Normal visible baseline at default `240` transfers audio correctly.
+- WASAPI accepts `120` and `128` actual buffers, but both settings immediately rebuffer after jitter ready in the current playout policy.
+- Do not treat `120/128` as usable yet; next code work must target startup/playout stability for smaller callback periods.
+- Update: keeping PCM playback ready after a transient empty queue fixed the "one second then gone" failure at `120`.
+- Remaining issue: `120` is audible but occasionally broken; diagnostics show `ready=true`, `underruns=0`, and rising queue-depth drops, so the receive cap is too tight for this smaller callback period.
+
+Current implementation: make validated `120` the explicit low-latency default.
+
+Locked default/preset scope:
+- Change default requested buffer from `240` to `120`.
+- Keep `240` available as the safe fallback.
+- Add minimal UI presets/labels for `Low Latency 120` and `Safe 240`.
+- Keep manual buffer selection available.
+- Verify default startup opens actual `120`.
+
+Current implementation: test next-lower PCM buffer candidate.
+
+Locked lower-than-120 scope:
+- Test `96` frames with the current PCM path before touching adaptive correction.
+- Use real clients through local `server.exe`.
+- Treat this as exploratory; do not change the default away from validated `120` unless `96` gets the same quality proof.
+- Record whether the backend accepts actual `96`, whether audio is audible, and whether counters stay clean.
+
+Current implementation: expose validated `96` as Ultra.
+
+Locked 96-exposure scope:
+- Keep default at validated `120`.
+- Label `96` as `Ultra`.
+- Keep `120` as `Low`.
+- Keep `240` as `Safe`.
+- Document that `96` is device-dependent and validated on this machine, not universally guaranteed.
+- Verify default startup still opens `120`.
+
+Current implementation: find lower buffer failure boundary.
+
+Locked lower-boundary scope:
+- Test below `96`, starting with `64`.
+- Confirm actual backend buffer, not just requested value.
+- Treat this as falsification: if lower values keep working, investigate hidden buffering and packet age before changing defaults.
+- Do not promote any lower value without listening and clean counters.
+
 Locked participant snapshot scope:
 - Keep participant lifecycle behavior unchanged.
 - Store participants behind stable shared ownership.
@@ -298,7 +475,7 @@ Decision status: Open.
   - File: `LOW_LATENCY_AUDIO_AUDIT.md`
 - [x] Create implementation todo.
   - File: `LOW_LATENCY_TODO.md`
-- [ ] Keep this file updated before and after every code step.
+- Historical discipline note: keep this file updated before and after every code step.
   - Verification: every completed code step has a checked item and finding.
 
 ### Gate 1: RtAudio Backend Swap
@@ -554,7 +731,7 @@ Decision status: Open.
   - Implementation: `OPUS_SET_VBR(0)` for CBR-style packet pacing.
   - Verification: `cmake --build build --target client` and `cmake --build build --target latency_probe`.
   - Verification: Opus sweep still sends/decodes legal `120` and `240` frame sizes; `96` and `64` fail cleanly with encode failures.
-- [ ] Consider Jamulus-style custom Opus modes only if needed for 64/128 sample compressed mode.
+- Deferred note: consider Jamulus-style custom Opus modes only if needed for 64/128 sample compressed mode.
 
 ### Gate 7: Backend Low-Latency Polish
 
@@ -598,134 +775,322 @@ Decision status: Open.
   - Verification: `cmake --build build --target client`.
   - Verification: two hidden local clients connected through local `server.exe`; both opened `1` input channel and `2` output channels, reported actual `240` frames / `5.000 ms`, registered the other participant, and reached jitter buffer ready.
   - Caveat: smoke teardown still causes one peer to report a single rebuffer when the other process is force-killed; this is not a steady-state audio failure.
-- [ ] Add simple adaptive resampling or controlled frame slip/stretch.
-- [ ] Verify 10+ minute session does not grow latency or periodically underrun.
+- [x] Add automated long-run drift probe controls.
+  - Changed: `latency_probe.cpp`.
+  - Implementation: added `--packets` and `--seconds` so probe length can scale from short smoke to 10-minute runs.
+  - Implementation: probe now reports average queue depth, queue drift from jitter target, min queue depth after ready, max queue depth, and final queue depth.
+  - Verification: `cmake --build build --target latency_probe`.
+  - Verification: `latency_probe --server 127.0.0.1 --port 9999 --codec pcm --frames 240 --jitter 3 --seconds 5` ran through local `server.exe`.
+  - Finding: 5-second PCM run sent/received/decoded `1000/1000/1000` packets with `15 ms` detected latency, average queue depth `3.03`, drift `+0.03`, max queue `7`, and one underrun. This proves the automated probe can catch the same underrun/corruption risk we hear when buffers are too aggressive.
+- [x] Fix automated probe liveness for long runs.
+  - Changed: `latency_probe.cpp`.
+  - Finding: first 10-minute attempt was invalid because synthetic endpoints did not send periodic `ALIVE`, causing server timeout after only `3732` received packets.
+  - Implementation: sender and receiver probe loops now send `ALIVE` roughly once per second.
+  - Verification: `cmake --build build --target latency_probe`.
+  - Verification: 30-second PCM run sent/received/decoded `6000/6000/6000` packets with `0` underruns.
+- [x] Add simple adaptive resampling or controlled frame slip/stretch.
+  - Implemented first as bounded PCM hold/drop instead of continuous resampling.
+  - Rationale: use visible, limited correction before adding a more complex resampler.
+- [x] Verify 10+ minute automated PCM probe does not periodically underrun.
+  - Verification: corrected 10-minute probe through local `server.exe`.
+  - Command: `latency_probe --server 127.0.0.1 --port 9999 --codec pcm --frames 240 --jitter 3 --seconds 600`.
+  - Result: sent/received/decoded `120000/120000/120000`, underruns `0`, decode failures `0`, latency `25 ms`.
+  - Queue result: average queue depth `4.10`, drift from jitter target `+1.10`, min after ready `1`, max `9`.
+  - Interpretation: the local PCM path is stable for 10 minutes at default `240/3`, but the effective queue runs about one packet above the nominal jitter target.
+- [x] Verify 10+ minute real RtAudio client session does not show steady-state rebuffer/decode/send errors.
+  - Verification: local `server.exe` plus two real `client.exe` processes ran for about `10m37s`.
+  - Settings observed: WASAPI, `1` input channel, `2` output channels, actual buffer `240` frames / `5.000 ms`.
+  - Both clients registered the other participant and reached jitter buffer ready.
+  - Filtered logs showed no steady-state decode failures, PCM size mismatches, send errors, invalid packets, or rebuffering during the run.
+  - Caveat: one rebuffer appeared on client A exactly when the test stopped client B, matching the known teardown artifact.
+- [x] Add real-client startup buffer override for repeatable tests.
+  - Changed: `client.cpp`.
+  - Implementation: added `client --frames N` / `client --buffer-frames N`.
+  - Verification: `cmake --build build --target client`.
+  - Verification: `client --frames 120` opened actual `120` frames / `2.500 ms`.
+  - Verification: `client --frames 128` opened actual `128` frames / `2.667 ms`.
+- [x] Test lower real-client buffers.
+  - Result: `120` and `128` both reached jitter ready, then immediately logged one rebuffer per client.
+  - Interpretation: backend accepts lower buffers, but current playout startup/timing policy is not stable enough there.
+  - Baseline check: restarted visible default `240`; user confirmed audio transfer is correct.
+- [x] Fix lower-buffer startup/playout stability enough for `120` candidate testing.
+  - Changed: `client.cpp`.
+  - Implementation: PCM receive misses no longer permanently disable playback; a missed PCM callback outputs silence and keeps playback armed for the next packet.
+  - Implementation: receive queue cap now allows small-frame packets (`<=128`) up to `6` packets before dropping, while `240` keeps the previous tighter cap.
+  - Verification: `cmake --build build --target client`.
+  - Verification: visible `120` session no longer stopped after one second; user confirmed audio was audible, mostly clear, with occasional artifacts on whistle/bursty sounds.
+- [x] Run extended real-client `120` candidate test.
+  - Verification: two visible clients with `--frames 120` through local `server.exe` ran for about `10m45s`.
+  - Result: both clients stayed `ready=true`, `underruns=0`, no sequence gaps, no decode failures, no PCM size mismatches.
+  - Remaining issue: queue-depth drops and PCM sender drops still accumulate, so `120` is usable but not yet clean.
+- [x] Reduce remaining `120` artifacts by addressing sender drops and receive queue drop policy.
+  - In progress: increased small-frame sender queue headroom from `3` to `8` frames and receive queue headroom from `6` to `8` packets for `<=128` frame packets.
+  - Verification: `cmake --build build --target client`.
+  - Early `120` visible-session result: PCM sender drops fell to `0`; client B receive queue drops stayed `0`; client A had an early receive-drop burst around `284` and then stopped increasing during the sampled window.
+  - User listening result: audio is clear at `120`.
+  - Extended observation caveat: user accidentally closed one client around `20:07:41`, so the later single-client logs are not a valid two-client audio test.
+  - Valid pre-close observation: sender drops stayed `0`, underruns stayed `0`, sequence gaps stayed `0`, and receive drops were stable rather than continuously increasing.
+  - Current verification: run a clean uninterrupted 10-minute two-client `120` session before marking this item complete.
+  - Final verification: clean uninterrupted two-client `120` session ran for about `10m35s`.
+  - Result: both clients stayed `ready=true`; PCM sender drops `0`; receive queue drops `0`; underruns `0`; sequence gaps/late `0/0`; decode/send/packet errors `0`.
+  - Teardown caveat: server logged forced-close receive errors exactly when the test processes were stopped.
+- [x] Make validated `120` the explicit low-latency default while preserving `240` safe fallback.
+  - Changed: `client.cpp`.
+  - Implementation: default requested buffer is now `120` frames.
+  - Implementation: buffer selector labels `120 Low` and `240 Safe`.
+  - Verification: `cmake --build build --target client`.
+  - Verification: default startup with no `--frames` opened actual `120` frames / `2.500 ms`.
+  - Verification: two-client smoke stayed `ready=true` with sender drops `0`, receive drops `0`, underruns `0`, and sequence gaps/late `0/0`.
+- [x] Test `96` frame PCM as next-lower candidate.
+  - Verification: two visible clients with `--frames 96` through local `server.exe`.
+  - Result: WASAPI accepted actual `96` frames / `2.000 ms`.
+  - Result after about `4` minutes: both clients stayed `ready=true`; PCM sender drops `0`; underruns `0`; sequence gaps/late `0/0`; decode/send/packet errors `0`.
+  - Receive drops: low but nonzero; not continuously exploding in the sampled window.
+  - Status: promising candidate, not default. Needs user listening confirmation and clean 10-minute run before promotion.
+- [x] Run clean 10-minute `96` validation.
+  - User listening result: `96` sounds clear.
+  - Required before promotion: uninterrupted 10-minute two-client run with clean counters.
+  - Verification: two visible clients with `--frames 96` through local `server.exe` ran for about `10m35s`.
+  - Result: actual `96` frames / `2.000 ms`; both clients stayed `ready=true`; PCM sender drops `0`; underruns `0`; sequence gaps/late `0/0`; decode/send/packet errors `0`.
+  - Caveat: receive queue drops accumulated to about `768` and `491`, so `96` is validated as a clear ultra-low candidate on this machine, but `120` remains the safer default.
+- [x] Expose `96` as Ultra while keeping `120` default.
+  - Implementation: buffer selector now labels `96 Ultra`, `120 Low`, and `240 Safe`.
+  - Verification: `cmake --build build --target client`.
+  - Verification: default startup still opens actual `120` frames / `2.500 ms`.
+- [x] Test lower-than-96 failure boundary, starting with `64`.
+  - Verification: two visible clients with `--frames 64` through local `server.exe`.
+  - Result: WASAPI accepted actual `64` frames / `1.333 ms`.
+  - User listening result: audio sounded clear.
+  - Counters: both clients stayed `ready=true`; PCM sender drops `0`; underruns `0`; sequence gaps/late `0/0`; packet age average stayed around `10.0-10.5 ms`.
+  - Caveat: receive queue drops accumulated, and queue depth frequently hit `8`, so the device callback is really `64` but end-to-end playout still has hidden buffering.
+- [x] Test below `64` to prove the lower boundary is real.
+  - Verification: two visible clients with `--frames 32` through local `server.exe`.
+  - Result: WASAPI accepted actual `32` frames / `0.667 ms`.
+  - User listening result: audio became bad, corrupt, and robotic.
+  - Counters: PCM sender drops appeared on both clients, receive queue drops exploded into the tens of thousands, while underruns and sequence gaps still reported `0`.
+  - Finding: underrun counters alone are not enough to detect robotic/corrupt audio. Receive queue drops, send drops, and listening result are required pass/fail signals.
+- [x] Decide next latency move after boundary test.
+  - Current finding: lowering device callback below `64` is not useful with the current receive/sender queue policy.
+  - Candidate next step: reduce hidden playout buffering and make robotic/corrupt audio detectable from counters before promoting `64`.
+  - Decision: stop lowering callback size for now. Next latency move is PCM playout readiness/headroom, guarded by the new health warnings.
+- [x] Reduce hidden queue headroom for `64`-frame PCM only.
+  - Scope: keep `96`/`120` behavior unchanged.
+  - Goal: test whether `64` can reduce packet age below the current `~10 ms` without becoming robotic/corrupt.
+  - Verification: build client, run two visible clients with `--frames 64`, compare packet age, send drops, receive drops, underruns, and user listening result.
+  - Result: failed. User reported robotic/corrupt audio.
+  - Finding: queue cap `4` at `64` caused aggressive queue drops and unstable playout. Reverted to the previous `8`-packet small-frame headroom.
+- [x] Add explicit corrupt-audio health signal.
+  - Current problem: `32` and the tighter `64` run can sound bad while underruns and sequence gaps still show `0`.
+  - Candidate signal: fail when PCM sender drops or receive queue drops exceed a per-second threshold after jitter is ready.
+  - Verification: bad `32`/tight-`64` run should be flagged automatically; stable `96`/`120` should not.
+  - Implementation: audio diagnostics now log per-second PCM send and receive queue drop rates.
+  - Implementation: warnings are emitted when PCM send drops exceed `5/s`, receive queue drops exceed `100/s`, or age drops exceed `5/s`.
+- [x] Verify corrupt-audio health signal.
+  - Bad case: `--frames 32` should emit audio health warnings.
+  - Stable case: default `120` should not emit audio health warnings in a short smoke.
+  - Bad-case result: `--frames 32` emitted warnings with PCM drop rates up to about `23/s` and queue drop rates around `670-700/s`.
+  - Stable-case result: default `120` emitted no audio health warnings; PCM and queue drop rates stayed `0.0/s`.
+- [x] Decide whether `64` should remain experimental or be hidden.
+  - Current finding: original `64` can sound clear with larger headroom, but it still has about `10 ms` packet age and accumulates receive drops.
+  - Current finding: tighter `64` becomes robotic/corrupt.
+  - Recommendation: do not promote `64`; keep `96` as Ultra and `120` as default until a better playout strategy is implemented.
+  - Decision: hide `64` from the normal UI selector.
+  - Implementation: UI buffer options are now `96`, `120`, `128`, `240`, `256`, and `512`.
+  - Experimental access: `client --frames 64` remains available for explicit boundary tests.
+- [x] Verify UI buffer selector after hiding `64`.
+  - Build client.
+  - Start default clients and confirm startup still opens `120`.
+  - Confirm no accidental behavior change to `--frames 64` override.
+  - Verification: `cmake --build build --target client`.
+  - Result: default client opened actual `120` frames / `2.500 ms`.
+  - Result: explicit `client --frames 64` still opened actual `64` frames / `1.333 ms`.
+  - Caveat: this was a startup smoke with mixed frame sizes, not an audio-quality validation.
+- [x] Test lower PCM playout readiness for low-latency PCM.
+  - Scope: PCM only; leave Opus behavior unchanged.
+  - Candidate: low-latency PCM packets (`<=120` frames) start playback after `2` packets instead of `3`.
+  - Goal: reduce hidden packet age without touching device callback size.
+  - Guardrail: health warnings must stay quiet in a `120` smoke before considering `96`.
+  - Implementation: low-latency PCM packets now set participant jitter floor to `2`; Opus and larger packets keep the existing `3`-packet floor.
+  - Implementation: adaptive jitter decrease now respects the participant's codec/frame-specific floor.
+  - Verification: `cmake --build build --target client`.
+  - Verification: two default clients opened actual `120` frames / `2.500 ms` and reached jitter ready at `2` packets.
+  - Result: stable short smoke; no health warnings, no sender drops, no receive drops, no underruns, no sequence gaps.
+  - Finding: steady packet age stayed around `9.8 ms`, because queue depth still settled around `4`; startup readiness alone is not enough.
+- [x] Test tighter steady-state receive cap for `120` PCM.
+  - Scope: test `120` only before touching `96`.
+  - Candidate: cap low-latency PCM receive queue closer to `3` packets.
+  - Goal: reduce packet age below the current `~9.8 ms`.
+  - Guardrail: revert if health warnings, sender drops, receive drops, underruns, or user listening report go bad.
+  - Result: failed. Queue cap `3` produced audio health warnings around `100 queue drops/s`.
+  - Result: packet age stayed around `9.6-9.8 ms`, so the cap did not buy meaningful latency.
+  - Decision: reverted the cap experiment; keep the previous `8`-packet small-frame receive headroom.
+- [x] Investigate why packet age remains around `9-10 ms`.
+  - Current finding: lowering startup readiness and tighter receive cap did not materially reduce age.
+  - Candidate causes: sender queue timing, network-thread scheduling, WASAPI backend buffering, or timestamp placement.
+  - Next verification: add/inspect capture-to-send and receive-to-playout timing so packet age is decomposed instead of treated as one number.
+  - Implementation: PCM send frames now carry a capture timestamp.
+  - Implementation: audio diagnostics now log PCM sender queue age as `sendq_age_ms last/avg/max`.
+  - Clarification: existing participant packet age is receive-enqueue-to-playout, not capture-to-speaker end-to-end.
+  - Verification: two default clients at `120` showed send queue average near `0.00 ms`, max about `0.23-0.51 ms`.
+  - Finding: the `~9.7-9.8 ms` age is receive/playout side, not sender queue backlog.
+- [x] Decide next receive/playout latency strategy.
+  - Current finding: receive cap `3` caused high drop rates without improving age.
+  - Current finding: sender queue is not the bottleneck.
+  - Candidate A: add a real playout scheduler with target delay and controlled skip only when late.
+  - Candidate B: move toward competitor-style backend/device path first: ASIO/WASAPI exclusive/JACK-style low-latency backend before deeper playout complexity.
+  - Recommendation: inspect/implement backend options next because RtAudio reports WASAPI backend latency as unavailable/zero and Windows shared-mode devices can hide large latency outside our counters.
+  - Finding: vendored RtAudio WASAPI initializes shared-mode streams and has TODOs for `RTAUDIO_MINIMIZE_LATENCY` direct-buffer behavior and `RTAUDIO_HOG_DEVICE` exclusive mode.
+  - Decision: backend/device path is the next major latency lever. Playout changes alone are hitting guardrails.
+- [x] Add backend limitation warning to docs/UI.
+  - Current runtime backend: WASAPI.
+  - Current limitation: RtAudio WASAPI path is shared-mode in the vendored source; ASIO is preferred when available.
+  - Goal: make it visible that low callback frames do not guarantee low device/output latency on WASAPI shared mode.
+  - Implementation: the latency panel now shows `Backend latency unknown` when output API is WASAPI and RtAudio reports zero/unavailable backend latency.
+- [x] Verify backend limitation warning builds.
+  - Build client.
+  - Startup smoke is enough; no audio behavior changed.
+  - Verification: `cmake --build build --target client`.
+- [x] Evaluate backend alternatives for true Windows low latency.
+  - Option A: ASIO driver path through current RtAudio build.
+  - Option B: switch Windows backend/library if we need WASAPI exclusive/event low-latency control.
+  - Option C: JACK/PipeWire-style external audio server for platforms where available.
+  - Implementation: added `client --list-audio-devices` / `client --audio-devices` to print visible RtAudio APIs/devices and exit.
+  - Goal: make ASIO verification repeatable after installing an ASIO driver/interface.
+- [x] Verify audio backend inventory command.
+  - Build client.
+  - Run `client --list-audio-devices`.
+  - Expected on current machine: WASAPI visible; ASIO compiled but no visible ASIO devices unless an ASIO driver is installed.
+  - Verification: `cmake --build build --target client`.
+  - Verification: `build/Debug/client.exe --list-audio-devices`.
+  - Result: RtAudio APIs visible: `ASIO` and `WASAPI`.
+  - Result: ASIO default input/output are `0`, and no ASIO devices are listed.
+  - Result: current visible devices are WASAPI only.
+- [x] Decide backend implementation direction.
+  - Current practical path: install/use a real ASIO driver/interface and verify with `client --list-audio-devices`.
+  - If ASIO is not available or not acceptable: integrate a Windows backend with explicit WASAPI exclusive/event control instead of relying on RtAudio WASAPI shared mode.
+  - Recommendation: keep current RtAudio ASIO path, but treat direct WASAPI exclusive as the next code path only if hardware/driver constraints prevent ASIO.
+  - Implementation: added `client --require-api NAME` / `client --api NAME` to force startup onto a specific visible API.
+  - Expected use: `client --require-api ASIO` should fail fast today, and should start with ASIO after a real ASIO driver/interface is visible.
+  - Final decision for current machine: do not build a direct WASAPI-exclusive client backend yet. The probe rejected exclusive initialization on all current endpoints, while ASIO support is already compiled and only needs a visible driver/device.
+- [x] Verify forced audio API startup option.
+  - Build client.
+  - Run `client --require-api ASIO`; current machine should fail clearly because no ASIO input/output devices are visible.
+  - Run `client --require-api WASAPI --frames 120`; current machine should start far enough to open the selected WASAPI devices.
+  - Adjustment: missing required API now fails before constructing the client/network connection.
+  - Verification: `cmake --build build --target client`.
+  - Result: `client --require-api ASIO` exits `2` and prints visible APIs/devices; no ASIO input/output devices are visible.
+  - Result: `client --require-api WASAPI --frames 120` starts and opens actual `120` frames / `2.500 ms`.
+- [x] Document backend decision.
+  - Decision: current code path is ready for ASIO validation, but this machine lacks an ASIO device.
+  - Next code-heavy option would be direct WASAPI exclusive/event implementation or another library that exposes it.
+  - Recommended next practical step before writing a Windows backend: test with a real ASIO driver/interface, because this path is already compiled and selectable.
+- [x] Reject machine-specific backend spike as product direction.
+  - User correction: this is a cross-platform app; do not proceed by adding machine-specific backend code as the main path.
+  - Reverted: removed the Windows-only `wasapi_probe` target and source file.
+  - Decision: backend work must stay behind the cross-platform audio abstraction unless a platform implementation is explicitly selected later.
+- [x] Add cross-platform audio open smoke command.
+  - Goal: validate selected API/device/buffer without opening the GUI.
+  - Use existing `AudioStream` abstraction, not platform-native APIs.
+  - Command shape: `client --audio-open-smoke --require-api ASIO --frames 96`.
+  - Verification: exits `0` only if the stream opens, reports actual buffer/backend latency, and closes cleanly.
+  - Implementation: added `client --audio-open-smoke`.
+  - Implementation: smoke uses `AudioStream` directly and outputs silence through the normal callback contract.
+- [x] Verify cross-platform audio open smoke command.
+  - Build client.
+  - Run `client --audio-open-smoke --require-api WASAPI --frames 120` on current machine.
+  - Run `client --audio-open-smoke --require-api ASIO --frames 96`; current machine should fail before opening because no ASIO devices are visible.
+  - Verification: `cmake --build build --target client`.
+  - Result: `client --audio-open-smoke --require-api WASAPI --frames 120` opened actual `120` frames / `2.500 ms` and exited cleanly.
+  - Result: `client --audio-open-smoke --require-api ASIO --frames 96` exited `2` because no ASIO input/output devices are visible.
+- [x] Next practical latency step.
+  - Keep RtAudio as the cross-platform backend wrapper for now.
+  - Validate real low-latency APIs through `--list-audio-devices`, `--require-api`, and the planned audio-open smoke command.
+  - Do not add native Windows/CoreAudio/JACK backend code unless the cross-platform abstraction fails a concrete requirement.
+- [x] Add automated clock-drift stress to `latency_probe`.
+  - Goal: reproduce sound-card clock mismatch without human listening.
+  - Implementation: add `--playout-ppm` to run receiver playout slightly faster/slower than sender packet production.
+  - Verification: build `latency_probe`; run a short PCM baseline with `--playout-ppm 0` and a drift stress with nonzero ppm.
+  - Verification: `cmake --build build --target latency_probe`.
+  - Result: `latency_probe --codec pcm --frames 120 --jitter 16 --seconds 20 --playout-ppm 0` stayed clean with `0` underruns and average queue `15.49`.
+  - Result: `latency_probe --codec pcm --frames 120 --jitter 16 --seconds 20 --playout-ppm 500` stayed sample-clean but drained average queue to `11.54`, proving the probe can apply receiver clock pressure.
+  - Constraint: run probe cases serially or isolate them by server/port; concurrent probe clients hear each other through the SFU and invalidate receive counts.
+- [x] Add controlled drift correction to client playout.
+  - Goal: keep low jitter buffers stable when capture and playback clocks disagree.
+  - Preferred first implementation: Jamulus-style bounded frame slip/duplicate or tiny resampling adjustment inside the client playout path.
+  - Verification: use `latency_probe --playout-ppm` before and after the correction, then repeat manual `96`/`120` frame listening.
+  - Implementation: add bounded PCM slip by dropping exactly one queued PCM packet after a successful playout when queue depth exceeds `jitter_buffer_min_packets + 3`.
+  - Implementation: keep the bounded PCM hold from the prior step for the opposite empty-queue direction.
+  - Guardrail: this is not continuous resampling; it is a small, visible correction with `PCM drift drop` and `PCM hold` counters.
+  - Verification: `cmake --build build --target client`.
+  - Verification: `client --audio-open-smoke --require-api WASAPI --frames 120`.
+  - Manual result: two-client local `120` frame test sounded clear after bounded PCM hold/drop.
+- [x] Re-test `96` frame real-client path after bounded drift correction.
+  - Goal: check whether the new hold/drop correction keeps Ultra mode clear.
+  - Verification: two local clients at `--frames 96`; listen for robotic/corrupt artifacts and watch `PCM hold`, `PCM drift drop`, queue depth, and health warnings.
+  - Manual result: two-client local `96` frame test sounded clear after bounded PCM hold/drop.
+- [x] Re-test explicit `64` frame experimental path after bounded drift correction.
+  - Goal: determine whether the new bounded hold/drop makes `64` usable or still risky.
+  - Verification: two local clients at `--frames 64`; listen for robotic/corrupt artifacts and watch `PCM hold`, `PCM drift drop`, queue depth, and health warnings.
+  - Manual result: two-client local `64` frame test still sounded robotic/corrupt.
+  - Decision: keep `64` hidden/experimental. Do not promote it without a deeper playout/backend change.
+- [x] Add a documented latency tier decision.
+  - Goal: make the current product decision explicit instead of repeatedly retesting the same boundary.
+  - Current candidate decision: `120` default, `96` Ultra, `64` experimental CLI-only, `32` invalid.
+  - Verification: update audit with the evidence chain and leave UI behavior aligned with this decision.
+  - Decision: current tier map is `120` default, `96` Ultra, `64` CLI-only experimental, `32` invalid/bad.
+  - Evidence: post-correction `120` clear, post-correction `96` clear, post-correction `64` robotic/corrupt.
+- [x] Decide next major latency lever.
+  - Option A: longer stability run at `96` with the new bounded hold/drop counters.
+  - Option B: backend/device work for true lower hardware latency, preferably real ASIO/JACK/CoreAudio validation through the cross-platform abstraction.
+  - Option C: deeper playout algorithm with controlled resampling instead of bounded slip/hold.
+  - Decision: do Option A first. `96` is the best validated latency tier, and it should get an extended run before larger backend/resampler work.
+- [x] Run extended `96` validation after bounded drift correction.
+  - Goal: verify `96` stays stable with the new `PCM hold` and `PCM drift drop` counters.
+  - Verification: two local clients at `--frames 96` for an extended run; inspect logs for health warnings, send drops, queue drops, underruns, and hold/drop counter behavior.
+  - Verification: hidden two-client `96` run with captured logs ran for about `10` minutes.
+  - Result: no audio health warnings, no send/decode/packet errors, no sequence gaps or late packets.
+  - Result: final client A participant stats showed `pcm_hold/drop=196/0`, queue drops `306`, age drops `0`, drop rate `pcm/q=0.0/1.0/s`.
+  - Result: final client B participant stats showed `pcm_hold/drop=59/1`, queue drops `90`, age drops `0`, drop rate `pcm/q=0.0/1.6/s`.
+  - Interpretation: `96` is stable and clear, but not perfectly clean internally; the bounded hold is actively smoothing occasional empty-queue gaps.
+- [x] Decide whether to tune `96` hold pressure or move to backend validation.
+  - Finding: `96` clear audio is now backed by an extended run, but `PCM hold` is nonzero.
+  - Option A: accept occasional bounded hold because it is clear and warning-free.
+  - Option B: add a deeper playout/resampling correction to reduce hold events.
+  - Option C: validate lower-latency backend/device path before adding more playout complexity.
+  - Decision: accept current `96` as Ultra for now and move the next major latency lever to backend/device validation.
+  - Rationale: `96` is clear, warning-free, and now has visible hold/drop rates; a resampler is larger and should follow only if hold becomes audible or backend work cannot reduce hidden latency.
+- [x] Add PCM hold/drift-drop rates to health diagnostics.
+  - Goal: distinguish clear-but-smoothed `96` from truly corrupt lower-buffer runs.
+  - Implementation: participant diagnostics now log `drop_rate pcm/q/hold/drift`.
+  - Implementation: health warnings now include high PCM hold or drift-drop rates.
+  - Verification: `cmake --build build --target client`.
+  - Verification: `client --audio-open-smoke --require-api WASAPI --frames 96`.
+  - Verification: short two-client `96` log run emitted `drop_rate pcm/q/hold/drift=...`.
+- [x] Refresh audio backend inventory after `96` validation.
+  - Verification: `client --list-audio-devices`.
+  - Result: RtAudio APIs visible are `ASIO` and `WASAPI`.
+  - Result: ASIO still has default input/output `0` and no listed ASIO devices.
+  - Result: current usable devices are WASAPI only.
+- [x] Backend/device validation blocker.
+  - Need a real low-latency API/device path visible to RtAudio, such as ASIO on Windows or JACK/CoreAudio equivalents on other platforms.
+  - Current machine cannot validate ASIO because no ASIO devices are visible.
+  - Implementation: added `client --backend-check` / `client --low-latency-check`.
+  - Behavior: default check targets `ASIO` at `96` frames.
+  - Verification: `client --backend-check` fails clearly because ASIO has no input/output devices and prints the backend inventory.
+  - Verification: `client --backend-check --require-api WASAPI --frames 96` opens, reports actual `96` frames / `2.000 ms`, and warns that backend latency is unavailable.
+- Deferred external validation: real low-latency backend.
+  - Need a machine/device where ASIO, JACK, CoreAudio low-latency, or equivalent is actually available.
+  - Expected command: `client --backend-check --require-api ASIO --frames 96`.
+  - Pass condition: command opens the stream and reports real device/backend behavior without falling back to WASAPI.
+- [x] Add bounded PCM empty-queue concealment.
+  - Goal: avoid a hard silent callback when PCM briefly underruns.
+  - Implementation: store the last decoded PCM frame and replay it once at reduced gain when the PCM queue is empty.
+  - Guardrail: the fallback is one callback only; repeated empty callbacks still go silent instead of manufacturing continuous fake audio.
+  - Verification: `cmake --build build --target client`.
+  - Verification: `client --audio-open-smoke --require-api WASAPI --frames 120`.
 
-## Assumptions
+## Archived Initial Draft
 
-- The first implementation step is a backend replacement, not a full audio architecture rewrite.
-- The current SFU server behavior stays unchanged.
-- The current Opus packet format stays unchanged for this step unless RtAudio build integration forces otherwise.
-- Low-latency correctness will not be assumed from green tests; it must eventually be verified with callback timing, device latency, packet age, and real listening tests.
+The original rough phase draft that used to live here has been superseded by the Control Board at the top of this file. It contained stale unchecked items that had already been completed in the historical work log, so it was removed to avoid treating old draft tasks as active work.
 
-## Success Criteria For RtAudio Swap
-
-- Client target configures and builds.
-- PortAudio is no longer linked by the client target.
-- `audio_stream.h` owns RtAudio usage and keeps the rest of the client mostly backend-neutral.
-- Device listing, default input/output selection, start, stop, and hot-swap still compile.
-- Existing Opus/SFU send/receive path remains behaviorally unchanged.
-- New limitations or behavior changes are documented here.
-
-## Phase 1: RtAudio Backend Swap
-
-- [x] Inspect existing PortAudio usage.
-  - Verification: `rg` found PortAudio usage concentrated in `audio_stream.h`, `client.cpp`, and `cmake/client.cmake`.
-  - Finding: `client.cpp` still used PortAudio device IDs and callback signature directly.
-
-- [x] Replace CMake dependency from PortAudio to RtAudio.
-  - Changed: `cmake/client.cmake`.
-  - Verification pending: configure/build.
-
-- [x] Replace `AudioStream` internals with RtAudio.
-  - Changed: `audio_stream.h`.
-  - Current approach: keep `AudioStream` as the client-facing abstraction, add `AudioStream::DeviceIndex`, `AudioStream::NO_DEVICE`, and a backend-neutral callback type.
-  - Verification pending: compile errors will drive API corrections.
-
-- [x] Replace PortAudio-specific types/usages in `client.cpp`.
-  - Replace `#include <portaudio.h>`.
-  - Replace `PaDeviceIndex` with `AudioStream::DeviceIndex`.
-  - Replace `paNoDevice` with `AudioStream::NO_DEVICE`.
-  - Replace PortAudio callback parameters with the new `AudioStream::AudioCallback` shape.
-  - Replace direct `Pa_GetHostApiInfo(...)` device metadata access with `AudioStream::DeviceInfo` fields.
-  - Verification: `rg -n "Pa_|PortAudio|portaudio|paNoDevice|paContinue|PaDeviceIndex" client.cpp audio_stream.h cmake/client.cmake` returns no matches.
-
-- [x] Configure and build the client.
-  - Command: `cmake --build build --target client`
-  - Verification: build succeeded and produced `build/Debug/client.exe`.
-  - Finding: RtAudio configured with WASAPI support in this build. ASIO is not enabled yet.
-  - Finding: first build failed because RtAudio 6.0.1 does not use the older exception/probed API shown in some examples. Fixed wrapper to use return codes/device IDs.
-
-- [x] Update audit with RtAudio findings.
-  - Add actual build/link limitations.
-  - Add any RtAudio API constraints encountered.
-
-## Phase 2: Measurement Before Architecture Changes
-
-- [ ] Add callback duration metrics.
-  - Track max callback time, average callback time, and over-deadline count.
-  - Deadline is `frame_count / sample_rate`.
-  - Verification: UI/log shows callback timing under current behavior.
-
-- [ ] Add packet age and queue metrics.
-  - Track enqueue timestamp, dequeue timestamp, packet age at playback, queue depth, underruns, PLC count.
-  - Verification: logs/UI can explain audible latency.
-
-- [ ] Add actual device latency reporting.
-  - RtAudio exposes stream latency in frames; document whether it is combined latency or can be separated by backend.
-  - Verification: log reports requested buffer, actual buffer, stream latency frames/ms.
-
-## Phase 3: Real-Time-Safe Callback
-
-- [ ] Move Opus encode and UDP send out of the audio callback.
-  - Target design: callback pushes mic PCM to an SPSC queue; sender thread encodes/builds/sends.
-  - Verification: callback contains no packet allocation and no socket send.
-
-- [ ] Remove heap allocation from callback.
-  - Eliminate `std::vector` creation in callback path.
-  - Replace packet construction with fixed/preallocated buffers.
-  - Verification: code review by searching callback body for vectors/shared_ptr allocations.
-
-- [ ] Remove mutex contention from callback.
-  - Replace `ParticipantManager::for_each()` callback path with lock-free or snapshot/RCU style access.
-  - Verification: callback does not take `ParticipantManager` mutex.
-
-## Phase 4: Packet/Jitter Foundation
-
-- [ ] Add sequence numbers to audio packets.
-  - Required for loss/reorder/late detection.
-  - Verification: receiver logs sequence gaps and reorder events.
-
-- [ ] Add codec/frame metadata to audio packets.
-  - Required before raw PCM and variable frame sizes.
-  - Verification: receiver can route packet by codec and expected frame count.
-
-- [ ] Replace queue-only jitter behavior with sequence-aware playout.
-  - Use target playout delay in packets/ms.
-  - Verification: bounded latency and observable packet discard policy.
-
-## Phase 5: Raw PCM Low-Latency Mode
-
-- [ ] Add raw PCM packet mode.
-  - First candidate: float32 mono to match current callback buffers.
-  - Later candidate: int16 PCM to reduce bandwidth.
-  - Verification: one local client can send/receive raw packets through existing server.
-
-- [ ] Add latency presets.
-  - Studio: raw PCM, 64 or 128 frames, minimal jitter.
-  - Balanced: Opus, 128 or 240 frames, low jitter.
-  - Safe: Opus, larger buffer, more jitter tolerance.
-  - Verification: presets map to explicit config fields.
-
-## Phase 6: Clock Drift Handling
-
-- [ ] Track jitter buffer fill trend per participant.
-- [ ] Add adaptive resampling or frame slip/stretch strategy.
-- [ ] Verify long-running sessions do not slowly underrun or grow latency.
-
-## Open Decisions
-
-- [ ] Should the RtAudio swap include ASIO-first selection on Windows immediately, or only expose APIs/devices and let the user choose?
-  - Recommended answer: expose devices first, then add ASIO preference after build is stable.
-
-- [ ] Should raw PCM use float32 first or int16 first?
-  - Recommended answer: float32 first for simpler integration; int16 later for bandwidth.
-
-- [ ] Should we copy JackTrip/Jamulus code directly or copy architecture first?
-  - Recommended answer: direct-copy only when adopting the surrounding contract too. Avoid isolated transplanting.
-
-## Completed Findings
-
-- UDP/SFU is likely not the primary bottleneck.
-- Current callback architecture is not safe for smaller buffers.
-- Competitors rely on tiny configurable buffers, preallocation, jitter control, and often raw PCM or carefully tuned Opus.
+Active work must now be added only to the Control Board. Detailed commands, measurements, and findings belong in `LOW_LATENCY_AUDIO_AUDIT.md`.
