@@ -591,6 +591,18 @@ private:
         uint32_t sample_rate = 48000;
     };
 
+    static uint16_t opus_send_frame_size(uint32_t sample_rate, int requested_frames) {
+        if (OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
+                                                    requested_frames)) {
+            return static_cast<uint16_t>(requested_frames);
+        }
+        if (sample_rate == 48000) {
+            return 120;
+        }
+        const int fallback = sample_rate / 400;  // 2.5 ms
+        return static_cast<uint16_t>(fallback > 0 ? fallback : requested_frames);
+    }
+
     void start_pcm_sender_thread() {
         if (pcm_sender_running_.exchange(true, std::memory_order_acq_rel)) {
             return;
@@ -613,6 +625,7 @@ private:
         OpusSendFrame discarded_opus;
         while (opus_send_queue_.try_dequeue(discarded_opus)) {
         }
+        opus_accumulated_samples_ = 0;
     }
 
     void pcm_sender_loop() {
@@ -682,6 +695,12 @@ private:
     void enqueue_opus_send_frame(const float* samples, uint16_t frame_count, uint32_t sample_rate) {
         if (!OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate), frame_count)) {
             opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            uint64_t illegal_count =
+                illegal_opus_frame_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (illegal_count == 1 || illegal_count % 100 == 0) {
+                Log::warn("Dropping illegal Opus frame size: {} samples at {} Hz ({} drops)",
+                          frame_count, sample_rate, illegal_count);
+            }
             return;
         }
 
@@ -700,6 +719,35 @@ private:
         frame.sample_rate = sample_rate;
         opus_send_queue_.enqueue(frame);
         wake_pcm_sender_thread();
+    }
+
+    void enqueue_opus_samples(const float* samples, uint16_t sample_count, uint32_t sample_rate) {
+        const uint16_t target_frame_count =
+            opus_send_frame_size(sample_rate, audio_config_.frames_per_buffer);
+        if (!OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
+                                                    target_frame_count) ||
+            target_frame_count == 0 || target_frame_count > opus_send_accumulator_.size()) {
+            opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        size_t source_index = 0;
+        while (source_index < sample_count) {
+            const size_t available = static_cast<size_t>(sample_count) - source_index;
+            const size_t needed =
+                static_cast<size_t>(target_frame_count) - opus_accumulated_samples_;
+            const size_t to_copy = std::min(available, needed);
+            std::copy_n(samples + source_index, to_copy,
+                        opus_send_accumulator_.begin() + opus_accumulated_samples_);
+            opus_accumulated_samples_ += to_copy;
+            source_index += to_copy;
+
+            if (opus_accumulated_samples_ == target_frame_count) {
+                enqueue_opus_send_frame(opus_send_accumulator_.data(), target_frame_count,
+                                        sample_rate);
+                opus_accumulated_samples_ = 0;
+            }
+        }
     }
 
     void wake_pcm_sender_thread() {
@@ -1525,9 +1573,8 @@ private:
 
             float rms = audio_analysis::calculate_rms(opus_input.data(), frame_count);
             client->own_audio_level_.store(rms);
-            client->enqueue_opus_send_frame(
-                opus_input.data(), static_cast<uint16_t>(frame_count),
-                static_cast<uint32_t>(client->audio_config_.sample_rate));
+            client->enqueue_opus_samples(opus_input.data(), static_cast<uint16_t>(frame_count),
+                                         static_cast<uint32_t>(client->audio_config_.sample_rate));
         }
 
         return 0;
@@ -1553,8 +1600,11 @@ private:
     std::condition_variable                   pcm_sender_cv_;
     std::mutex                                pcm_sender_wait_mutex_;
     std::atomic<bool>                         pcm_sender_wake_{false};
+    std::array<float, 960>                    opus_send_accumulator_{};
+    size_t                                    opus_accumulated_samples_ = 0;
     std::atomic<uint64_t>                     pcm_send_drops_{0};
     std::atomic<uint64_t>                     opus_send_drops_{0};
+    std::atomic<uint64_t>                     illegal_opus_frame_drops_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_last_ns_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_avg_ns_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_max_ns_{0};
