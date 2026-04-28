@@ -58,13 +58,22 @@
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
-static int normalize_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
+static int normalized_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
 #ifdef __APPLE__
     if (codec == AudioCodec::Opus && frames_per_buffer != 128 && frames_per_buffer != 240) {
         return 128;
     }
 #endif
     return frames_per_buffer;
+}
+
+static int normalize_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
+    const int normalized = normalized_buffer_frames_for_codec(codec, frames_per_buffer);
+    if (normalized != frames_per_buffer) {
+        Log::info("Normalizing buffer from {} to {} frames for macOS Opus/CoreAudio pacing",
+                  frames_per_buffer, normalized);
+    }
+    return normalized;
 }
 
 class Client {
@@ -2354,7 +2363,7 @@ static void draw_bottom_bar(Client& client) {
     std::snprintf(buffer_preview, sizeof(buffer_preview), "%d", pending_buffer_frames);
     if (ImGui::BeginCombo("##BufferFrames", buffer_preview)) {
         for (int frames: buffer_options) {
-            if (normalize_buffer_frames_for_codec(client.get_audio_codec(), frames) != frames) {
+            if (normalized_buffer_frames_for_codec(client.get_audio_codec(), frames) != frames) {
                 continue;
             }
             char label[48];
