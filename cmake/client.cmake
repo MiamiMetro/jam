@@ -27,7 +27,9 @@ FetchContent_Declare(
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(RTAUDIO_API_ASIO ON CACHE BOOL "Build RtAudio ASIO backend" FORCE)
+if(WIN32)
+    set(RTAUDIO_API_ASIO ON CACHE BOOL "Build RtAudio ASIO backend" FORCE)
+endif()
 find_package(OpenGL REQUIRED)
 
 FetchContent_MakeAvailable(rtaudio imgui glfw)
