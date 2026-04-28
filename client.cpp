@@ -58,6 +58,15 @@
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
+static int normalize_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
+#ifdef __APPLE__
+    if (codec == AudioCodec::Opus && frames_per_buffer != 128 && frames_per_buffer != 240) {
+        return 128;
+    }
+#endif
+    return frames_per_buffer;
+}
+
 class Client {
 public:
     Client(asio::io_context& io_context, const std::string& server_address, short server_port)
@@ -322,7 +331,8 @@ public:
     }
 
     void set_requested_frames_per_buffer(int frames_per_buffer) {
-        audio_config_.frames_per_buffer = frames_per_buffer;
+        audio_config_.frames_per_buffer =
+            normalize_buffer_frames_for_codec(get_audio_codec(), frames_per_buffer);
     }
 
     CallbackTimingInfo get_callback_timing_info() const {
@@ -342,6 +352,8 @@ public:
 
     void set_audio_codec(AudioCodec codec) {
         audio_codec_.store(codec, std::memory_order_release);
+        audio_config_.frames_per_buffer =
+            normalize_buffer_frames_for_codec(codec, audio_config_.frames_per_buffer);
     }
 
     // WAV file playback methods
@@ -702,9 +714,82 @@ private:
         wake_pcm_sender_thread();
     }
 
+    static uint16_t preferred_opus_tx_frame_count(uint32_t sample_rate,
+                                                  uint16_t requested_frame_count) {
+        if (OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
+                                                    requested_frame_count)) {
+            return requested_frame_count;
+        }
+
+        const int low_latency_frame_count = static_cast<int>(sample_rate) / 400;
+        if (OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
+                                                    low_latency_frame_count)) {
+            return static_cast<uint16_t>(low_latency_frame_count);
+        }
+
+        return 0;
+    }
+
+    void enqueue_opus_send_samples(const float* samples, unsigned long frame_count,
+                                   uint32_t sample_rate) {
+        if (frame_count == 0 || samples == nullptr) {
+            return;
+        }
+
+        if (frame_count <= opus_tx_accumulator_.size() &&
+            OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
+                                                    static_cast<int>(frame_count)) &&
+            opus_tx_accumulated_frames_ == 0) {
+            enqueue_opus_send_frame(samples, static_cast<uint16_t>(frame_count), sample_rate);
+            return;
+        }
+
+        const uint16_t target_frame_count = preferred_opus_tx_frame_count(
+            sample_rate, static_cast<uint16_t>(audio_config_.frames_per_buffer));
+        if (target_frame_count == 0 || target_frame_count > opus_tx_accumulator_.size()) {
+            opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            opus_tx_accumulated_frames_ = 0;
+            return;
+        }
+
+        size_t offset = 0;
+        while (offset < frame_count) {
+            const size_t room =
+                static_cast<size_t>(target_frame_count) - opus_tx_accumulated_frames_;
+            const size_t samples_to_copy =
+                std::min(room, static_cast<size_t>(frame_count) - offset);
+            auto accumulator_out = opus_tx_accumulator_.begin() +
+                                   static_cast<std::ptrdiff_t>(opus_tx_accumulated_frames_);
+            std::copy_n(samples + offset, samples_to_copy, accumulator_out);
+
+            opus_tx_accumulated_frames_ += samples_to_copy;
+            offset += samples_to_copy;
+
+            if (opus_tx_accumulated_frames_ == target_frame_count) {
+                enqueue_opus_send_frame(opus_tx_accumulator_.data(), target_frame_count,
+                                        sample_rate);
+                opus_tx_accumulated_frames_ = 0;
+            }
+        }
+    }
+
     void wake_pcm_sender_thread() {
         pcm_sender_wake_.store(true, std::memory_order_release);
         pcm_sender_cv_.notify_one();
+    }
+
+    static void consume_opus_pcm_buffer(ParticipantData& participant, size_t frame_count) {
+        if (participant.opus_pcm_buffered_frames <= frame_count) {
+            participant.opus_pcm_buffered_frames = 0;
+            return;
+        }
+
+        const size_t remaining = participant.opus_pcm_buffered_frames - frame_count;
+        std::move(participant.opus_pcm_buffer.begin() + static_cast<std::ptrdiff_t>(frame_count),
+                  participant.opus_pcm_buffer.begin() +
+                      static_cast<std::ptrdiff_t>(participant.opus_pcm_buffered_frames),
+                  participant.opus_pcm_buffer.begin());
+        participant.opus_pcm_buffered_frames = remaining;
     }
 
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
@@ -1185,6 +1270,24 @@ private:
                 }
             }
 
+            if (participant.last_codec == AudioCodec::Opus &&
+                participant.opus_pcm_buffered_frames >= frame_count) {
+                if (out_channels == 1) {
+                    audio_analysis::mix_with_gain(output_buffer,
+                                                  participant.opus_pcm_buffer.data(), frame_count,
+                                                  participant.gain);
+                } else {
+                    audio_analysis::mix_mono_to_stereo(output_buffer,
+                                                       participant.opus_pcm_buffer.data(),
+                                                       frame_count, out_channels,
+                                                       participant.gain);
+                }
+                consume_opus_pcm_buffer(participant, frame_count);
+                active_count++;
+                observe_participant_queue_depth(participant, participant.opus_queue.size_approx());
+                return;
+            }
+
             OpusPacket opus_packet;
 
             if (participant.opus_queue.try_dequeue(opus_packet)) {
@@ -1242,10 +1345,13 @@ private:
                     }
                     decoded_samples = static_cast<int>(frame_count);
                 } else {
+                    const int decode_frame_count =
+                        opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
+                                                    : static_cast<int>(frame_count);
                     // Decode into preallocated buffer (zero allocations)
                     decoded_samples = participant.decoder->decode_into(
                         opus_packet.get_data(), static_cast<int>(opus_packet.get_size()),
-                        participant.pcm_buffer.data(), static_cast<int>(frame_count));
+                        participant.pcm_buffer.data(), decode_frame_count);
                 }
 
                 if (decoded_samples <= 0) {
@@ -1255,6 +1361,87 @@ private:
                         Log::warn("Decode failed for participant {} ({} times)", participant_id,
                                   decode_fail_count);
                     }
+                    return;
+                }
+
+                if (opus_packet.codec == AudioCodec::Opus) {
+                    const size_t decoded_frames = static_cast<size_t>(decoded_samples);
+                    if (participant.opus_pcm_buffered_frames + decoded_frames <=
+                        participant.opus_pcm_buffer.size()) {
+                        std::copy_n(participant.pcm_buffer.begin(), decoded_frames,
+                                    participant.opus_pcm_buffer.begin() +
+                                        static_cast<std::ptrdiff_t>(
+                                            participant.opus_pcm_buffered_frames));
+                        participant.opus_pcm_buffered_frames += decoded_frames;
+                    } else {
+                        participant.opus_pcm_buffered_frames = 0;
+                        participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    while (participant.opus_pcm_buffered_frames < frame_count) {
+                        OpusPacket next_packet;
+                        if (!participant.opus_queue.try_dequeue(next_packet) ||
+                            next_packet.codec != AudioCodec::Opus) {
+                            break;
+                        }
+
+                        const int next_decode_frame_count =
+                            next_packet.frame_count > 0
+                                ? static_cast<int>(next_packet.frame_count)
+                                : static_cast<int>(frame_count);
+                        int next_decoded_samples = participant.decoder->decode_into(
+                            next_packet.get_data(), static_cast<int>(next_packet.get_size()),
+                            participant.pcm_buffer.data(), next_decode_frame_count);
+                        if (next_decoded_samples <= 0) {
+                            break;
+                        }
+
+                        const size_t next_decoded_frames =
+                            static_cast<size_t>(next_decoded_samples);
+                        if (participant.opus_pcm_buffered_frames + next_decoded_frames >
+                            participant.opus_pcm_buffer.size()) {
+                            participant.opus_pcm_buffered_frames = 0;
+                            participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
+
+                        std::copy_n(participant.pcm_buffer.begin(), next_decoded_frames,
+                                    participant.opus_pcm_buffer.begin() +
+                                        static_cast<std::ptrdiff_t>(
+                                            participant.opus_pcm_buffered_frames));
+                        participant.opus_pcm_buffered_frames += next_decoded_frames;
+                    }
+
+                    float rms = audio_analysis::calculate_rms(participant.pcm_buffer.data(),
+                                                              decoded_samples);
+                    participant.current_level = rms;
+
+                    bool was_speaking       = participant.is_speaking;
+                    participant.is_speaking = audio_analysis::detect_voice_activity(rms);
+
+                    if (participant.opus_pcm_buffered_frames >= frame_count) {
+                        if (out_channels == 1) {
+                            audio_analysis::mix_with_gain(output_buffer,
+                                                          participant.opus_pcm_buffer.data(),
+                                                          frame_count, participant.gain);
+                        } else {
+                            audio_analysis::mix_mono_to_stereo(
+                                output_buffer, participant.opus_pcm_buffer.data(), frame_count,
+                                out_channels, participant.gain);
+                        }
+                        consume_opus_pcm_buffer(participant, frame_count);
+                        active_count++;
+                    }
+
+                    if (participant.is_speaking && !was_speaking) {
+                        Log::debug("Participant {} started speaking (level: {:.4f})",
+                                   participant_id, rms);
+                    } else if (!participant.is_speaking && was_speaking) {
+                        Log::debug("Participant {} stopped speaking", participant_id);
+                    }
+
+                    observe_participant_queue_depth(participant,
+                                                    participant.opus_queue.size_approx());
                     return;
                 }
 
@@ -1461,6 +1648,8 @@ private:
         // Mix WAV with microphone input before encoding
         if (client->audio_.is_stream_active()) {
             if (client->audio_codec_.load(std::memory_order_acquire) == AudioCodec::PcmInt16) {
+                client->opus_tx_accumulated_frames_ = 0;
+
                 std::array<float, 960> pcm_input{};
                 if (wav_active && wav_frames_read > 0) {
                     float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
@@ -1525,8 +1714,8 @@ private:
 
             float rms = audio_analysis::calculate_rms(opus_input.data(), frame_count);
             client->own_audio_level_.store(rms);
-            client->enqueue_opus_send_frame(
-                opus_input.data(), static_cast<uint16_t>(frame_count),
+            client->enqueue_opus_send_samples(
+                opus_input.data(), frame_count,
                 static_cast<uint32_t>(client->audio_config_.sample_rate));
         }
 
@@ -1548,6 +1737,8 @@ private:
     std::atomic<uint32_t>    audio_tx_sequence_{0};
     moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
+    std::array<float, 960>                     opus_tx_accumulator_{};
+    size_t                                     opus_tx_accumulated_frames_ = 0;
     std::atomic<bool>                         pcm_sender_running_{false};
     std::thread                               pcm_sender_thread_;
     std::condition_variable                   pcm_sender_cv_;
@@ -1710,7 +1901,13 @@ static void draw_master_strip(Client& client, float available_height) {
         }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         if (ImGui::RadioButton("Opus##codec", codec_choice == 1)) {
+            const int previous_buffer_frames = client.get_audio_config().frames_per_buffer;
             client.set_audio_codec(AudioCodec::Opus);
+            if (client.is_audio_stream_active() &&
+                client.get_audio_config().frames_per_buffer != previous_buffer_frames) {
+                client.swap_audio_devices(client.get_selected_input_device(),
+                                          client.get_selected_output_device());
+            }
         }
 
         ImGui::Spacing();
@@ -2013,6 +2210,8 @@ static void draw_bottom_bar(Client& client) {
         pending_buffer_frames = client.get_audio_config().frames_per_buffer;
         devices_initialized   = true;
     }
+    pending_buffer_frames =
+        normalize_buffer_frames_for_codec(client.get_audio_codec(), pending_buffer_frames);
 
     if (refresh_counter++ % 60 == 0) {
         input_devices  = AudioStream::get_input_devices();
@@ -2155,6 +2354,9 @@ static void draw_bottom_bar(Client& client) {
     std::snprintf(buffer_preview, sizeof(buffer_preview), "%d", pending_buffer_frames);
     if (ImGui::BeginCombo("##BufferFrames", buffer_preview)) {
         for (int frames: buffer_options) {
+            if (normalize_buffer_frames_for_codec(client.get_audio_codec(), frames) != frames) {
+                continue;
+            }
             char label[48];
             if (frames == 96) {
                 std::snprintf(label, sizeof(label), "%d Ultra##buffer_%d", frames, frames);
