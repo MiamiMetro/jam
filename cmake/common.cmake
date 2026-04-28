@@ -26,24 +26,32 @@ FetchContent_Declare(
     asio_src
     GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
     GIT_TAG        asio-1-36-0
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
 )
 
 FetchContent_Declare(
     opus
     GIT_REPOSITORY https://github.com/xiph/opus.git
     GIT_TAG        v1.5.2
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
 )
 
 FetchContent_Declare(
     concurrentqueue_src
     GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
     GIT_TAG        v1.0.4
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
 )
 
 FetchContent_Declare(
     spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG        v1.16.0
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
 )
 
 FetchContent_MakeAvailable(asio_src opus concurrentqueue_src spdlog)
