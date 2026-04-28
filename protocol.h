@@ -42,8 +42,22 @@ struct CtrlHdr : MsgHdr {
         LEAVE             = 2,
         ALIVE             = 3,
         PARTICIPANT_LEAVE = 4,  // Server broadcasts when participant leaves
+        PARTICIPANT_INFO  = 6,  // Server broadcasts room-local participant metadata
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
+};
+
+struct JoinHdr : CtrlHdr {
+    Bytes<64>  room_id;
+    Bytes<64>  room_handle;
+    Bytes<64>  profile_id;
+    Bytes<64>  display_name;
+    Bytes<512> join_token;
+};
+
+struct ParticipantInfoHdr : CtrlHdr {
+    Bytes<64> profile_id;
+    Bytes<64> display_name;
 };
 
 struct AudioHdr : MsgHdr {

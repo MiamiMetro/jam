@@ -12,7 +12,9 @@ This section is the plan to follow. Older detailed notes below are history/evide
 
 ### Current Phase
 
-Roadmap realignment after reviewing old notes. Decide the next production audio phase before writing more audio code.
+Native Jam Engine Phase 1 is now tracked in `plans/native-jam-engine-phase-1.md`.
+
+This file remains the historical latency work log and evidence base. Active standalone native engine planning now lives in `specs/native-jam-engine.md` and `plans/native-jam-engine-phase-1.md`.
 
 ### Phase Status
 
@@ -97,7 +99,9 @@ Only these tasks are allowed before the next implementation phase starts:
 
 ### Next Step
 
-Finish the Phase 3 production-audio plan. Next grill-me decision: define required mixed-preset support for Phase 3.
+Follow `plans/native-jam-engine-phase-1.md` for the current executable checklist.
+
+Do not start native room/auth, Electron/Convex integration, or listener/HLS work until the Phase 1 native performer-jamming baseline is closed or explicitly paused with blockers documented.
 
 ### Phase 3 Decision: Production Opus Target
 

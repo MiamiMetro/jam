@@ -54,7 +54,15 @@ FetchContent_Declare(
     GIT_PROGRESS   TRUE
 )
 
-FetchContent_MakeAvailable(asio_src opus concurrentqueue_src spdlog)
+FetchContent_Declare(
+    picosha2
+    GIT_REPOSITORY https://github.com/okdshin/PicoSHA2.git
+    GIT_TAG        v1.0.1
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
+)
+
+FetchContent_MakeAvailable(asio_src opus concurrentqueue_src spdlog picosha2)
 
 target_compile_definitions(spdlog PUBLIC SPDLOG_USE_STD_FORMAT)
 
@@ -67,4 +75,9 @@ target_include_directories(asio INTERFACE
     ${asio_src_SOURCE_DIR}/asio/include
 )
 target_link_libraries(asio INTERFACE asio_config)
+
+add_library(token_crypto INTERFACE)
+target_include_directories(token_crypto INTERFACE
+    ${picosha2_SOURCE_DIR}
+)
 

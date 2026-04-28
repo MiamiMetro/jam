@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -19,14 +20,19 @@ public:
 
     ClientManager() : next_client_id_(1) {}
 
-    // Register a new client (returns assigned client ID)
-    uint32_t register_client(const endpoint& ep, time_point now) {
+    uint32_t register_performer_client(const endpoint& ep, time_point now, std::string room_id,
+                                    std::string profile_id, std::string display_name) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto&                       client = clients_[ep];
         if (client.client_id == 0) {
             client.client_id = next_client_id_++;
+            client.joined_at = now;
         }
-        client.last_alive = now;
+        client.last_alive   = now;
+        client.room_id      = std::move(room_id);
+        client.profile_id   = std::move(profile_id);
+        client.display_name = std::move(display_name);
+        client.joined_with_metadata = true;
         return client.client_id;
     }
 
@@ -98,6 +104,43 @@ public:
             }
         }
         return endpoints;
+    }
+
+    std::vector<endpoint> get_room_endpoints_except(const endpoint& exclude) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<endpoint>       endpoints;
+        auto                        sender_it = clients_.find(exclude);
+        if (sender_it == clients_.end()) {
+            return endpoints;
+        }
+
+        const std::string& room_id = sender_it->second.room_id;
+        endpoints.reserve(clients_.size());
+        for (const auto& [ep, info]: clients_) {
+            if (ep != exclude && info.room_id == room_id) {
+                endpoints.push_back(ep);
+            }
+        }
+        return endpoints;
+    }
+
+    std::vector<std::pair<endpoint, ClientInfo>> get_room_clients_except(
+        const endpoint& exclude) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::pair<endpoint, ClientInfo>> clients;
+        auto sender_it = clients_.find(exclude);
+        if (sender_it == clients_.end()) {
+            return clients;
+        }
+
+        const std::string& room_id = sender_it->second.room_id;
+        clients.reserve(clients_.size());
+        for (const auto& [ep, info]: clients_) {
+            if (ep != exclude && info.room_id == room_id) {
+                clients.emplace_back(ep, info);
+            }
+        }
+        return clients;
     }
 
     // Remove timed out clients (returns list of timed out client IDs)

@@ -11,4 +11,4 @@ include(cmake/common.cmake)
 # ============================================================
 
 add_executable(server server.cpp)
-target_link_libraries(server PRIVATE asio concurrentqueue spdlog::spdlog opus)
+target_link_libraries(server PRIVATE asio concurrentqueue spdlog::spdlog opus token_crypto)

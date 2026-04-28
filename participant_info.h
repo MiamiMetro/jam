@@ -6,6 +6,7 @@
 #include <concurrentqueue.h>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 #include "opus_decoder.h"
 #include "protocol.h"  // For AUDIO_BUF_SIZE
@@ -45,6 +46,8 @@ struct ParticipantData {
     std::atomic<uint64_t>                   pcm_drift_drops{0};
 
     // Participant state
+    std::string                           profile_id;
+    std::string                           display_name;
     bool                                  is_muted = false;
     float                                 gain     = 1.0F;
     float                                 pan      = 0.5F;  // 0.0 = full left, 0.5 = center, 1.0 = full right
@@ -79,6 +82,8 @@ struct ParticipantData {
 // Lightweight view for UI (snapshot of ParticipantData)
 struct ParticipantInfo {
     uint32_t id;
+    std::string profile_id;
+    std::string display_name;
     bool     is_speaking;
     bool     is_muted;
     float    audio_level;

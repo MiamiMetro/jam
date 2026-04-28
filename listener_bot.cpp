@@ -73,12 +73,15 @@ public:
 
         Log::info("Connected and receiving!");
 
-        // Send JOIN message
-        CtrlHdr chdr{};
-        chdr.magic = CTRL_MAGIC;
-        chdr.type  = CtrlHdr::Cmd::JOIN;
-        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+        JoinHdr join{};
+        join.magic = CTRL_MAGIC;
+        join.type  = CtrlHdr::Cmd::JOIN;
+        packet_builder::write_fixed(join.room_id, "listener-bot");
+        packet_builder::write_fixed(join.room_handle, "listener-bot");
+        packet_builder::write_fixed(join.profile_id, "listener-bot");
+        packet_builder::write_fixed(join.display_name, "Listener Bot");
+        std::memcpy(ctrl_tx_buf_.data(), &join, sizeof(JoinHdr));
+        send(ctrl_tx_buf_.data(), sizeof(JoinHdr));
     }
 
     void stop_connection() {
@@ -648,7 +651,7 @@ private:
 
     std::array<char, 1024>         recv_buf_;
     std::array<unsigned char, 128> sync_tx_buf_;
-    std::array<unsigned char, 128> ctrl_tx_buf_;
+    std::array<unsigned char, 1024> ctrl_tx_buf_;
 
     AudioConfig audio_config_;  // Store config for decoder initialization
 

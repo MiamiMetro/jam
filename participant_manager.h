@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "logger.h"
@@ -37,10 +38,28 @@ public:
 
         new_participant->pcm_buffer.fill(0.0F);  // Initialize preallocated buffer
         new_participant->last_packet_time = std::chrono::steady_clock::now();
+        auto pending = pending_metadata_.find(id);
+        if (pending != pending_metadata_.end()) {
+            new_participant->profile_id   = pending->second.profile_id;
+            new_participant->display_name = pending->second.display_name;
+            pending_metadata_.erase(pending);
+        }
         participants_[id]                 = std::move(new_participant);
 
         Log::info("New participant {} joined (decoder: {}Hz, {}ch)", id, sample_rate, channels);
         return true;
+    }
+
+    void set_participant_metadata(uint32_t id, const std::string& profile_id,
+                                  const std::string& display_name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = participants_.find(id);
+        if (it != participants_.end()) {
+            it->second->profile_id   = profile_id;
+            it->second->display_name = display_name;
+        } else {
+            pending_metadata_[id] = {profile_id, display_name};
+        }
     }
 
     // Remove a participant
@@ -80,6 +99,8 @@ public:
         for (const auto& [id, data]: participants_) {
             ParticipantInfo info;
             info.id             = id;
+            info.profile_id     = data->profile_id;
+            info.display_name   = data->display_name;
             info.is_speaking    = data->is_speaking;
             info.is_muted       = data->is_muted;
             info.audio_level    = data->current_level;
@@ -172,6 +193,12 @@ public:
     }
 
 private:
+    struct ParticipantMetadata {
+        std::string profile_id;
+        std::string display_name;
+    };
+
     mutable std::mutex                                             mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<ParticipantData>> participants_;
+    std::unordered_map<uint32_t, ParticipantMetadata>               pending_metadata_;
 };

@@ -62,6 +62,9 @@ struct ProbeConfig {
 struct Args {
     std::string host = "127.0.0.1";
     unsigned short port = 9999;
+    std::string room = "latency-probe";
+    std::string sender_user = "latency-probe-sender";
+    std::string receiver_user = "latency-probe-receiver";
     bool sweep = false;
     int duration_seconds = 0;
     double playout_ppm = 0.0;
@@ -103,15 +106,17 @@ struct ProbeResult {
 
 class ProbeReceiver {
 public:
-    ProbeReceiver(asio::io_context& io_context, const udp::endpoint& server_endpoint)
-        : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint) {}
+    ProbeReceiver(asio::io_context& io_context, const udp::endpoint& server_endpoint,
+                  const std::string& room, const std::string& user)
+        : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
+          room_(room), user_(user) {}
 
     void start() {
         do_receive();
     }
 
     void send_join() {
-        send_ctrl(CtrlHdr::Cmd::JOIN);
+        send_join_packet(room_, user_);
     }
 
     void send_alive() {
@@ -146,6 +151,17 @@ private:
         CtrlHdr hdr{};
         hdr.magic = CTRL_MAGIC;
         hdr.type = cmd;
+        socket_.send_to(asio::buffer(&hdr, sizeof(hdr)), server_endpoint_);
+    }
+
+    void send_join_packet(const std::string& room, const std::string& user) {
+        JoinHdr hdr{};
+        hdr.magic = CTRL_MAGIC;
+        hdr.type = CtrlHdr::Cmd::JOIN;
+        packet_builder::write_fixed(hdr.room_id, room);
+        packet_builder::write_fixed(hdr.room_handle, room);
+        packet_builder::write_fixed(hdr.profile_id, user);
+        packet_builder::write_fixed(hdr.display_name, user);
         socket_.send_to(asio::buffer(&hdr, sizeof(hdr)), server_endpoint_);
     }
 
@@ -196,6 +212,8 @@ private:
     udp::socket socket_;
     udp::endpoint server_endpoint_;
     udp::endpoint remote_endpoint_;
+    std::string room_;
+    std::string user_;
     std::array<char, 1024> recv_buf_{};
     mutable std::mutex mutex_;
     std::deque<ReceivedPacket> queue_;
@@ -204,11 +222,13 @@ private:
 
 class ProbeSender {
 public:
-    ProbeSender(asio::io_context& io_context, const udp::endpoint& server_endpoint)
-        : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint) {}
+    ProbeSender(asio::io_context& io_context, const udp::endpoint& server_endpoint,
+                const std::string& room, const std::string& user)
+        : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
+          room_(room), user_(user) {}
 
     void send_join() {
-        send_ctrl(CtrlHdr::Cmd::JOIN);
+        send_join_packet(room_, user_);
     }
 
     void send_alive() {
@@ -243,8 +263,21 @@ private:
         socket_.send_to(asio::buffer(&hdr, sizeof(hdr)), server_endpoint_);
     }
 
+    void send_join_packet(const std::string& room, const std::string& user) {
+        JoinHdr hdr{};
+        hdr.magic = CTRL_MAGIC;
+        hdr.type = CtrlHdr::Cmd::JOIN;
+        packet_builder::write_fixed(hdr.room_id, room);
+        packet_builder::write_fixed(hdr.room_handle, room);
+        packet_builder::write_fixed(hdr.profile_id, user);
+        packet_builder::write_fixed(hdr.display_name, user);
+        socket_.send_to(asio::buffer(&hdr, sizeof(hdr)), server_endpoint_);
+    }
+
     udp::socket socket_;
     udp::endpoint server_endpoint_;
+    std::string room_;
+    std::string user_;
 };
 
 void fill_probe_frame(int packet_index, const ProbeConfig& config, std::vector<float>& frame) {
@@ -461,8 +494,8 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     udp::endpoint server_endpoint =
         *resolver.resolve(udp::v4(), args.host, std::to_string(args.port)).begin();
 
-    ProbeReceiver receiver(io_context, server_endpoint);
-    ProbeSender sender(io_context, server_endpoint);
+    ProbeReceiver receiver(io_context, server_endpoint, args.room, args.receiver_user);
+    ProbeSender sender(io_context, server_endpoint, args.room, args.sender_user);
 
     receiver.start();
     std::thread io_thread([&io_context]() { io_context.run(); });
@@ -598,6 +631,12 @@ Args parse_args(int argc, char** argv) {
             args.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             args.port = static_cast<unsigned short>(std::stoi(argv[++i]));
+        } else if (arg == "--room" && i + 1 < argc) {
+            args.room = argv[++i];
+        } else if (arg == "--sender-user" && i + 1 < argc) {
+            args.sender_user = argv[++i];
+        } else if (arg == "--receiver-user" && i + 1 < argc) {
+            args.receiver_user = argv[++i];
         } else if (arg == "--frames" && i + 1 < argc) {
             args.config.frame_size = std::stoi(argv[++i]);
         } else if (arg == "--jitter" && i + 1 < argc) {

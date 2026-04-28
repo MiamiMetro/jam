@@ -16,6 +16,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -76,11 +77,21 @@ static int normalize_buffer_frames_for_codec(AudioCodec codec, int frames_per_bu
     return normalized;
 }
 
+struct PerformerJoinOptions {
+    std::string room_id;
+    std::string room_handle;
+    std::string user_id;
+    std::string display_name;
+    std::string join_token;
+};
+
 class Client {
 public:
-    Client(asio::io_context& io_context, const std::string& server_address, short server_port)
+    Client(asio::io_context& io_context, const std::string& server_address, short server_port,
+           PerformerJoinOptions performer_join_options = {})
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
+          performer_join_options_(std::move(performer_join_options)),
           selected_input_device_(AudioStream::NO_DEVICE),
           selected_output_device_(AudioStream::NO_DEVICE),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
@@ -139,12 +150,24 @@ public:
 
         Log::info("Connected and receiving!");
 
-        // Send JOIN message
-        CtrlHdr chdr{};
-        chdr.magic = CTRL_MAGIC;
-        chdr.type  = CtrlHdr::Cmd::JOIN;
-        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+        send_join();
+    }
+
+    void send_join() {
+        JoinHdr join{};
+        join.magic = CTRL_MAGIC;
+        join.type  = CtrlHdr::Cmd::JOIN;
+        write_fixed(join.room_id, performer_join_options_.room_id);
+        write_fixed(join.room_handle, performer_join_options_.room_handle);
+        write_fixed(join.profile_id, performer_join_options_.user_id);
+        write_fixed(join.display_name, performer_join_options_.display_name);
+        write_fixed(join.join_token, performer_join_options_.join_token);
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinHdr));
+        std::memcpy(buf->data(), &join, sizeof(JoinHdr));
+        send(buf->data(), buf->size(), buf);
+        Log::info("Sent JOIN for room '{}' user '{}' token {}", performer_join_options_.room_id,
+                  performer_join_options_.user_id,
+                  performer_join_options_.join_token.empty() ? "missing" : "present");
     }
 
     // Stop connection (stops sending/receiving UDP packets)
@@ -155,8 +178,9 @@ public:
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type  = CtrlHdr::Cmd::LEAVE;
-        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
+        std::memcpy(buf->data(), &chdr, sizeof(CtrlHdr));
+        send(buf->data(), buf->size(), buf);
 
         // Cancel pending async operations
         socket_.cancel();
@@ -598,6 +622,19 @@ public:
     }
 
 private:
+    template <size_t N>
+    static void write_fixed(Bytes<N>& target, const std::string& value) {
+        const size_t copy_bytes = std::min(value.size(), target.size() - 1);
+        std::copy_n(value.data(), copy_bytes, target.data());
+        target[copy_bytes] = '\0';
+    }
+
+    template <size_t N>
+    static std::string fixed_string(const Bytes<N>& bytes) {
+        const auto end = std::find(bytes.begin(), bytes.end(), '\0');
+        return std::string(bytes.begin(), end);
+    }
+
     struct PcmSendFrame {
         std::array<unsigned char, AUDIO_BUF_SIZE> payload{};
         uint16_t payload_bytes = 0;
@@ -889,8 +926,9 @@ private:
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type  = CtrlHdr::Cmd::ALIVE;
-        std::memcpy(ctrl_tx_buf_.data(), &chdr, sizeof(CtrlHdr));
-        send(ctrl_tx_buf_.data(), sizeof(CtrlHdr));
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
+        std::memcpy(buf->data(), &chdr, sizeof(CtrlHdr));
+        send(buf->data(), buf->size(), buf);
         log_audio_diagnostics();
     }
 
@@ -1007,6 +1045,20 @@ private:
                 uint32_t participant_id = chdr.participant_id;
                 remove_participant(participant_id);
                 Log::info("Participant {} left (server notification)", participant_id);
+                break;
+            }
+            case CtrlHdr::Cmd::PARTICIPANT_INFO: {
+                if (bytes < sizeof(ParticipantInfoHdr)) {
+                    break;
+                }
+                ParticipantInfoHdr info{};
+                std::memcpy(&info, recv_buf_.data(), sizeof(ParticipantInfoHdr));
+                const auto profile_id = fixed_string(info.profile_id);
+                const auto display_name = fixed_string(info.display_name);
+                participant_manager_.set_participant_metadata(info.participant_id, profile_id,
+                                                              display_name);
+                Log::info("Participant {} metadata: user='{}' display='{}'", info.participant_id,
+                          profile_id, display_name);
                 break;
             }
             default:
@@ -1734,10 +1786,10 @@ private:
     asio::io_context& io_context_;
     udp::socket       socket_;
     udp::endpoint     server_endpoint_;
+    PerformerJoinOptions performer_join_options_;
 
     std::array<char, 1024>         recv_buf_;
     std::array<unsigned char, 128> sync_tx_buf_;
-    std::array<unsigned char, 128> ctrl_tx_buf_;
 
     AudioStream              audio_;
     OpusEncoderWrapper       audio_encoder_;
@@ -2063,9 +2115,11 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, track_color_active);
 
         // Participant name button (title)
-        char name_buf[32];
-        std::snprintf(name_buf, sizeof(name_buf), "User #%u", p.id);
-        ImGui::Button(name_buf, ImVec2(width, 0));
+        char fallback_name_buf[32];
+        std::snprintf(fallback_name_buf, sizeof(fallback_name_buf), "User #%u", p.id);
+        const std::string participant_name =
+            p.display_name.empty() ? std::string(fallback_name_buf) : p.display_name;
+        ImGui::Button(participant_name.c_str(), ImVec2(width, 0));
         ImGui::PopStyleColor(3);
 
         ImGui::Spacing();
@@ -2573,12 +2627,15 @@ void draw_client_ui(Client& client) {
 }
 
 struct ClientStartupOptions {
+    std::string server_address = "127.0.0.1";
+    short server_port = 9999;
     int requested_frames = 0;
     bool list_audio_devices = false;
     bool audio_open_smoke = false;
     bool low_latency_check = false;
     std::optional<AudioCodec> startup_codec;
     std::string required_audio_api;
+    PerformerJoinOptions performer_join;
 };
 
 int run_audio_open_smoke(const ClientStartupOptions& startup_options);
@@ -2587,7 +2644,21 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
     ClientStartupOptions options;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "--frames" || arg == "--buffer-frames") && i + 1 < argc) {
+        if (arg == "--server" && i + 1 < argc) {
+            options.server_address = argv[++i];
+        } else if (arg == "--port" && i + 1 < argc) {
+            options.server_port = static_cast<short>(std::stoi(argv[++i]));
+        } else if (arg == "--room" && i + 1 < argc) {
+            options.performer_join.room_id = argv[++i];
+        } else if (arg == "--room-handle" && i + 1 < argc) {
+            options.performer_join.room_handle = argv[++i];
+        } else if (arg == "--user-id" && i + 1 < argc) {
+            options.performer_join.user_id = argv[++i];
+        } else if (arg == "--display-name" && i + 1 < argc) {
+            options.performer_join.display_name = argv[++i];
+        } else if (arg == "--join-token" && i + 1 < argc) {
+            options.performer_join.join_token = argv[++i];
+        } else if ((arg == "--frames" || arg == "--buffer-frames") && i + 1 < argc) {
             options.requested_frames = std::stoi(argv[++i]);
         } else if (arg == "--list-audio-devices" || arg == "--audio-devices") {
             options.list_audio_devices = true;
@@ -2726,7 +2797,8 @@ int main(int argc, char** argv) {
 
         asio::io_context io_context;
 
-        Client client_instance(io_context, "127.0.0.1", 9999);
+        Client client_instance(io_context, startup_options.server_address,
+                               startup_options.server_port, startup_options.performer_join);
         if (!startup_options.required_audio_api.empty()) {
             const auto input_dev =
                 find_device_for_api(startup_options.required_audio_api, true);
