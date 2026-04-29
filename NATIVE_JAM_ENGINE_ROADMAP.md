@@ -1,5 +1,11 @@
 # Native Jam Engine Roadmap
 
+## Status
+
+The MVP phase roadmap is complete through Phase 5.
+
+This file now serves as the historical MVP roadmap. Production-readiness work continues in `PRODUCTION_READINESS_ROADMAP.md`.
+
 ## Direction
 
 We are building a standalone native jam engine first.
@@ -159,6 +165,12 @@ Later hardening also includes:
 - safer token delivery than long-lived visible command-line arguments if needed
 - audit logs for denied joins without exposing token secrets
 
+Phase 4 may pass the short-lived performer join token through the Electron renderer and main process as a pragmatic MVP bridge.
+
+That is not the strongest end-state token delivery model. Later hardening should consider moving token request/launch orchestration out of the renderer, reducing command-line token exposure, or combining token delivery with native session-key binding.
+
+The current Phase 4 product bridge explicitly trusts the Electron renderer to request the token and pass launch context to Electron main. This is acceptable only for MVP testing. The detailed limitation list lives in `specs/product-server-integration.md` and `plans/native-jam-engine-phase-4.md` so it can be tackled deliberately later.
+
 ## Acceptance Gate Before Electron Integration
 
 Electron integration should stay paused until the native engine satisfies this gate:
@@ -205,6 +217,18 @@ After the native acceptance gate is met, integrate Electron and Convex.
 
 At that point, Convex mints the already-defined join token, Electron launches the native client with product context, and the native SFU validates the token without needing to understand the full social product.
 
+The first product integration target should support:
+
+- official server using `127.0.0.1` during development
+- backend-only `jam_servers` records with `official` behavior first
+- passive community-compatible fields for later, but no community server behavior yet
+- `jam_sessions` as a temporary routing bridge
+- Opus `120` as the default performer internet mode
+- Electron/native process lifecycle state
+- performer jamming only
+
+Phase 4 should not expose server configuration in room UI, should not return server secrets or routing details to the frontend, and should not implement community server selection yet.
+
 ### Phase 5: Official And Community Server Productization
 
 Add official server assignment, community server registration, server health, capacity policy, moderation policy, and deployment tooling.
@@ -226,6 +250,23 @@ Phase 3 application-level unknown UDP handling is only for development and contr
 - server capacity limits and room capacity enforcement
 - process supervision, crash restart, and deployment health checks
 - region strategy for official and community servers
+
+### End-State Session Presence And Capacity
+
+Phase 4 may use Convex `jam_sessions` plus Electron-side refresh as an MVP bridge for native performer routing.
+
+That is not the final source of truth.
+
+The end-state product should make the SFU authoritative for live performer presence:
+
+- SFU reports room and performer heartbeat to the backend
+- backend keeps a room live while the SFU reports active performers
+- backend marks rooms idle when the SFU reports the room empty or SFU heartbeat expires
+- backend enforces `maxPerformers` using SFU-known performer count
+- backend uses SFU health for stale cleanup, observability, reconnect behavior, and capacity decisions
+- Electron native process state remains local UI state only, not authoritative room presence
+
+This should be done after Phase 4 product integration and before relying on public official/community server behavior at scale.
 
 ## Current Decision
 

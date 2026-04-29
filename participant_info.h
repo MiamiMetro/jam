@@ -39,6 +39,8 @@ struct ParticipantData {
     std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
     std::array<float, 1920>                 opus_pcm_buffer{};
     size_t                                  opus_pcm_buffered_frames = 0;
+    std::array<float, 1920>                 pcm_playout_buffer{};
+    size_t                                  pcm_playout_buffered_frames = 0;
     std::array<float, 960>                  last_pcm_buffer{};
     size_t                                  last_pcm_samples = 0;
     bool                                    last_pcm_valid = false;

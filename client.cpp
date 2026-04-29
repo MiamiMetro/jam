@@ -172,15 +172,21 @@ public:
 
     // Stop connection (stops sending/receiving UDP packets)
     void stop_connection() {
+        if (connection_stopped_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+
         Log::info("Disconnecting from server...");
 
         // Send LEAVE message
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type  = CtrlHdr::Cmd::LEAVE;
-        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
-        std::memcpy(buf->data(), &chdr, sizeof(CtrlHdr));
-        send(buf->data(), buf->size(), buf);
+        std::error_code leave_error;
+        socket_.send_to(asio::buffer(&chdr, sizeof(CtrlHdr)), server_endpoint_, 0, leave_error);
+        if (leave_error) {
+            Log::warn("LEAVE send failed: {}", leave_error.message());
+        }
 
         // Cancel pending async operations
         socket_.cancel();
@@ -838,6 +844,36 @@ private:
         participant.opus_pcm_buffered_frames = remaining;
     }
 
+    static void consume_pcm_playout_buffer(ParticipantData& participant, size_t frame_count) {
+        if (participant.pcm_playout_buffered_frames <= frame_count) {
+            participant.pcm_playout_buffered_frames = 0;
+            return;
+        }
+
+        const size_t remaining = participant.pcm_playout_buffered_frames - frame_count;
+        std::move(participant.pcm_playout_buffer.begin() + static_cast<std::ptrdiff_t>(frame_count),
+                  participant.pcm_playout_buffer.begin() +
+                      static_cast<std::ptrdiff_t>(participant.pcm_playout_buffered_frames),
+                  participant.pcm_playout_buffer.begin());
+        participant.pcm_playout_buffered_frames = remaining;
+    }
+
+    static bool append_pcm_playout_samples(ParticipantData& participant, const float* samples,
+                                           size_t frame_count) {
+        if (participant.pcm_playout_buffered_frames + frame_count >
+            participant.pcm_playout_buffer.size()) {
+            participant.pcm_playout_buffered_frames = 0;
+            participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        std::copy_n(samples, frame_count,
+                    participant.pcm_playout_buffer.begin() +
+                        static_cast<std::ptrdiff_t>(participant.pcm_playout_buffered_frames));
+        participant.pcm_playout_buffered_frames += frame_count;
+        return true;
+    }
+
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
         size_t previous_max = participant.queue_depth_max.load(std::memory_order_relaxed);
         while (depth > previous_max &&
@@ -1349,6 +1385,31 @@ private:
                 return;
             }
 
+            if (participant.last_codec == AudioCodec::PcmInt16 &&
+                participant.pcm_playout_buffered_frames >= frame_count) {
+                if (frame_count <= participant.last_pcm_buffer.size()) {
+                    std::copy_n(participant.pcm_playout_buffer.begin(), frame_count,
+                                participant.last_pcm_buffer.begin());
+                    participant.last_pcm_samples = frame_count;
+                    participant.last_pcm_valid = true;
+                    participant.pcm_concealment_used = false;
+                }
+
+                if (out_channels == 1) {
+                    audio_analysis::mix_with_gain(output_buffer,
+                                                  participant.pcm_playout_buffer.data(),
+                                                  frame_count, participant.gain);
+                } else {
+                    audio_analysis::mix_mono_to_stereo(
+                        output_buffer, participant.pcm_playout_buffer.data(), frame_count,
+                        out_channels, participant.gain);
+                }
+                consume_pcm_playout_buffer(participant, frame_count);
+                active_count++;
+                observe_participant_queue_depth(participant, participant.opus_queue.size_approx());
+                return;
+            }
+
             OpusPacket opus_packet;
 
             if (participant.opus_queue.try_dequeue(opus_packet)) {
@@ -1389,22 +1450,41 @@ private:
                 participant.last_codec = opus_packet.codec;
                 int decoded_samples = 0;
                 if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    const size_t expected_bytes = frame_count * sizeof(int16_t);
+                    const uint16_t packet_frame_count =
+                        opus_packet.frame_count > 0
+                            ? opus_packet.frame_count
+                            : static_cast<uint16_t>(opus_packet.get_size() / sizeof(int16_t));
+                    const uint8_t packet_channels =
+                        opus_packet.channels > 0 ? opus_packet.channels : 1;
+                    const size_t expected_bytes =
+                        static_cast<size_t>(packet_frame_count) * packet_channels *
+                        sizeof(int16_t);
                     if (opus_packet.get_size() != expected_bytes) {
                         static int pcm_size_mismatch_count = 0;
                         if (++pcm_size_mismatch_count % 100 == 0) {
-                            Log::warn("PCM size mismatch for participant {}: got {}, expected {}",
-                                      participant_id, opus_packet.get_size(), expected_bytes);
+                            Log::warn(
+                                "Malformed PCM packet for participant {}: got {} bytes, "
+                                "expected {} (frames={}, channels={})",
+                                participant_id, opus_packet.get_size(), expected_bytes,
+                                packet_frame_count, packet_channels);
                         }
                         return;
                     }
-                    for (unsigned long i = 0; i < frame_count; ++i) {
+                    if (packet_channels != 1) {
+                        static int pcm_channel_mismatch_count = 0;
+                        if (++pcm_channel_mismatch_count % 100 == 0) {
+                            Log::warn("Unsupported PCM channel count for participant {}: {}",
+                                      participant_id, packet_channels);
+                        }
+                        return;
+                    }
+                    for (uint16_t i = 0; i < packet_frame_count; ++i) {
                         int16_t sample = 0;
                         std::memcpy(&sample, opus_packet.get_data() + i * sizeof(sample),
                                     sizeof(sample));
                         participant.pcm_buffer[i] = static_cast<float>(sample) / 32767.0F;
                     }
-                    decoded_samples = static_cast<int>(frame_count);
+                    decoded_samples = static_cast<int>(packet_frame_count);
                 } else {
                     const int decode_frame_count =
                         opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
@@ -1506,15 +1586,6 @@ private:
                     return;
                 }
 
-                if (opus_packet.codec == AudioCodec::PcmInt16 &&
-                    decoded_samples <= static_cast<int>(participant.last_pcm_buffer.size())) {
-                    std::copy_n(participant.pcm_buffer.begin(), decoded_samples,
-                                participant.last_pcm_buffer.begin());
-                    participant.last_pcm_samples = static_cast<size_t>(decoded_samples);
-                    participant.last_pcm_valid = true;
-                    participant.pcm_concealment_used = false;
-                }
-
                 // Calculate audio level (RMS) for voice activity detection
                 float rms =
                     audio_analysis::calculate_rms(participant.pcm_buffer.data(), decoded_samples);
@@ -1531,24 +1602,62 @@ private:
                     Log::debug("Participant {} stopped speaking", participant_id);
                 }
 
-                // Mix into output with participant's gain
-                size_t expected_samples = frame_count * out_channels;
-                if (static_cast<size_t>(decoded_samples) == expected_samples) {
-                    audio_analysis::mix_with_gain(output_buffer, participant.pcm_buffer.data(),
-                                                  decoded_samples, participant.gain);
-                    active_count++;
-                } else if (static_cast<size_t>(decoded_samples) == frame_count) {
-                    // Mono input, stereo output - duplicate channel
-                    audio_analysis::mix_mono_to_stereo(output_buffer, participant.pcm_buffer.data(),
-                                                       frame_count, out_channels, participant.gain);
-                    active_count++;
-                } else {
-                    // Size mismatch - log warning occasionally
-                    static int mismatch_count = 0;
-                    if (++mismatch_count % 100 == 0) {
-                        Log::warn(
-                            "Audio size mismatch: participant {}, got {} samples, expected {}",
-                            participant_id, decoded_samples, expected_samples);
+                if (opus_packet.codec == AudioCodec::PcmInt16) {
+                    append_pcm_playout_samples(participant, participant.pcm_buffer.data(),
+                                               static_cast<size_t>(decoded_samples));
+
+                    while (participant.pcm_playout_buffered_frames < frame_count) {
+                        OpusPacket next_packet;
+                        if (!participant.opus_queue.try_dequeue(next_packet) ||
+                            next_packet.codec != AudioCodec::PcmInt16) {
+                            break;
+                        }
+
+                        const uint16_t next_frame_count =
+                            next_packet.frame_count > 0
+                                ? next_packet.frame_count
+                                : static_cast<uint16_t>(next_packet.get_size() / sizeof(int16_t));
+                        const uint8_t next_channels =
+                            next_packet.channels > 0 ? next_packet.channels : 1;
+                        const size_t next_expected_bytes =
+                            static_cast<size_t>(next_frame_count) * next_channels *
+                            sizeof(int16_t);
+                        if (next_packet.get_size() != next_expected_bytes ||
+                            next_channels != 1) {
+                            break;
+                        }
+
+                        for (uint16_t i = 0; i < next_frame_count; ++i) {
+                            int16_t sample = 0;
+                            std::memcpy(&sample, next_packet.get_data() + i * sizeof(sample),
+                                        sizeof(sample));
+                            participant.pcm_buffer[i] =
+                                static_cast<float>(sample) / 32767.0F;
+                        }
+                        append_pcm_playout_samples(participant, participant.pcm_buffer.data(),
+                                                   next_frame_count);
+                    }
+
+                    if (participant.pcm_playout_buffered_frames >= frame_count) {
+                        if (frame_count <= participant.last_pcm_buffer.size()) {
+                            std::copy_n(participant.pcm_playout_buffer.begin(), frame_count,
+                                        participant.last_pcm_buffer.begin());
+                            participant.last_pcm_samples = frame_count;
+                            participant.last_pcm_valid = true;
+                            participant.pcm_concealment_used = false;
+                        }
+
+                        if (out_channels == 1) {
+                            audio_analysis::mix_with_gain(
+                                output_buffer, participant.pcm_playout_buffer.data(), frame_count,
+                                participant.gain);
+                        } else {
+                            audio_analysis::mix_mono_to_stereo(
+                                output_buffer, participant.pcm_playout_buffer.data(), frame_count,
+                                out_channels, participant.gain);
+                        }
+                        consume_pcm_playout_buffer(participant, frame_count);
+                        active_count++;
                     }
                 }
 
@@ -1796,6 +1905,7 @@ private:
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
     std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
+    std::atomic<bool>        connection_stopped_{false};
     moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
     std::array<float, 960>                     opus_tx_accumulator_{};
@@ -2843,8 +2953,9 @@ int main(int argc, char** argv) {
             // Clean lambda - just delegates to separate function
             app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });
 
-            app.set_close_callback([&io_context]() {
-                // Stop io_context to exit the application
+            app.set_close_callback([&client_instance, &io_context]() {
+                client_instance.stop_audio_stream();
+                client_instance.stop_connection();
                 io_context.stop();
             });
             app.run();
