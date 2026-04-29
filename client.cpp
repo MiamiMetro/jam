@@ -965,7 +965,16 @@ private:
             participant.pcm_buffer[i] = static_cast<float>(sample) / 32767.0F;
         }
 
-        append_pcm_playout_samples(participant, participant.pcm_buffer.data(), packet_frame_count);
+        if (!participant.pcm_resampler.push(participant.pcm_buffer.data(), packet_frame_count)) {
+            participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_input_frames();
+        participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
+                                                   std::memory_order_relaxed);
+        const auto ratio_ppm =
+            static_cast<int64_t>((participant.pcm_resampler.ratio() - 1.0) * 1000000.0);
+        participant.pcm_resample_ratio_ppm.store(ratio_ppm, std::memory_order_relaxed);
         const float rms =
             audio_analysis::calculate_rms(participant.pcm_buffer.data(), packet_frame_count);
         participant.current_level = rms;
@@ -983,7 +992,7 @@ private:
                                              uint32_t participant_id) {
         const size_t max_frames = pcm_max_buffered_frames(callback_frames);
         size_t drained_packets = 0;
-        while (participant.pcm_playout_buffered_frames < max_frames && drained_packets < 8) {
+        while (participant.pcm_resampler.buffered_input_frames() < max_frames && drained_packets < 8) {
             OpusPacket packet;
             if (!participant.opus_queue.try_dequeue(packet)) {
                 break;
@@ -995,7 +1004,9 @@ private:
             append_pcm_packet_to_playout(participant, packet, participant_id);
             drained_packets++;
         }
-        trim_pcm_playout_buffer(participant, callback_frames);
+        participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_input_frames();
+        participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
+                                                   std::memory_order_relaxed);
     }
 
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
@@ -1489,10 +1500,10 @@ private:
 
             if (!participant.buffer_ready &&
                 participant.last_codec == AudioCodec::PcmInt16 &&
-                participant.pcm_playout_buffered_frames >= pcm_start_frames(frame_count)) {
+                participant.pcm_resampler.buffered_input_frames() >= pcm_start_frames(frame_count)) {
                 participant.buffer_ready = true;
                 Log::info("PCM playout ready for participant {} ({} frames)", participant_id,
-                          participant.pcm_playout_buffered_frames);
+                          participant.pcm_resampler.buffered_input_frames());
             }
 
             if (!participant.buffer_ready) {
@@ -1509,7 +1520,6 @@ private:
 
             if (participant.last_codec == AudioCodec::PcmInt16) {
                 drain_pcm_packets_to_playout(participant, frame_count, participant_id);
-                apply_pcm_drift_correction(participant, frame_count);
             }
 
             if (participant.last_codec == AudioCodec::Opus &&
@@ -1531,7 +1541,8 @@ private:
             }
 
             if (participant.last_codec == AudioCodec::PcmInt16 &&
-                participant.pcm_playout_buffered_frames >= frame_count) {
+                participant.pcm_resampler.read(participant.pcm_playout_buffer.data(), frame_count,
+                                               pcm_target_frames(frame_count))) {
                 if (frame_count <= participant.last_pcm_buffer.size()) {
                     std::copy_n(participant.pcm_playout_buffer.begin(), frame_count,
                                 participant.last_pcm_buffer.begin());
@@ -1549,7 +1560,12 @@ private:
                         output_buffer, participant.pcm_playout_buffer.data(), frame_count,
                         out_channels, participant.gain);
                 }
-                consume_pcm_playout_buffer(participant, frame_count);
+                participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_input_frames();
+                participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
+                                                           std::memory_order_relaxed);
+                const auto ratio_ppm =
+                    static_cast<int64_t>((participant.pcm_resampler.ratio() - 1.0) * 1000000.0);
+                participant.pcm_resample_ratio_ppm.store(ratio_ppm, std::memory_order_relaxed);
                 active_count++;
                 observe_participant_queue_depth(participant, participant.opus_queue.size_approx());
                 return;
@@ -1717,9 +1733,8 @@ private:
                 }
 
                 if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    trim_pcm_playout_buffer(participant, frame_count);
-
-                    while (participant.pcm_playout_buffered_frames < frame_count) {
+                    while (participant.pcm_resampler.buffered_input_frames() <
+                           pcm_start_frames(frame_count)) {
                         OpusPacket next_packet;
                         if (!participant.opus_queue.try_dequeue(next_packet) ||
                             next_packet.codec != AudioCodec::PcmInt16) {
@@ -1730,15 +1745,17 @@ private:
                                                           participant_id)) {
                             break;
                         }
-                        trim_pcm_playout_buffer(participant, frame_count);
                     }
 
                     if (!participant.buffer_ready &&
-                        participant.pcm_playout_buffered_frames >= pcm_start_frames(frame_count)) {
+                        participant.pcm_resampler.buffered_input_frames() >=
+                            pcm_start_frames(frame_count)) {
                         participant.buffer_ready = true;
                     }
 
-                    if (participant.pcm_playout_buffered_frames >= frame_count) {
+                    if (participant.pcm_resampler.read(participant.pcm_playout_buffer.data(),
+                                                       frame_count,
+                                                       pcm_target_frames(frame_count))) {
                         if (frame_count <= participant.last_pcm_buffer.size()) {
                             std::copy_n(participant.pcm_playout_buffer.begin(), frame_count,
                                         participant.last_pcm_buffer.begin());
@@ -1756,7 +1773,14 @@ private:
                                 output_buffer, participant.pcm_playout_buffer.data(), frame_count,
                                 out_channels, participant.gain);
                         }
-                        consume_pcm_playout_buffer(participant, frame_count);
+                        participant.pcm_playout_buffered_frames =
+                            participant.pcm_resampler.buffered_input_frames();
+                        participant.pcm_playout_depth_frames.store(
+                            participant.pcm_playout_buffered_frames, std::memory_order_relaxed);
+                        const auto ratio_ppm = static_cast<int64_t>(
+                            (participant.pcm_resampler.ratio() - 1.0) * 1000000.0);
+                        participant.pcm_resample_ratio_ppm.store(ratio_ppm,
+                                                                 std::memory_order_relaxed);
                         active_count++;
                     }
                 }
@@ -2452,6 +2476,10 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
             if (p.pcm_playout_depth_frames > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::Text("PCM buf: %zu", p.pcm_playout_depth_frames);
+            }
+            if (p.pcm_resample_ratio_ppm != 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("PCM ppm: %lld", static_cast<long long>(p.pcm_resample_ratio_ppm));
             }
             if (p.pcm_drift_drops > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);

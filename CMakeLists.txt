@@ -10,7 +10,6 @@ include(FetchContent)
 
 include(cmake/server.cmake)
 include(cmake/client.cmake)
-include(cmake/listener.cmake)
 
 add_executable(latency_probe latency_probe.cpp)
 target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog opus)

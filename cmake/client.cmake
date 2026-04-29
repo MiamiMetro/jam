@@ -30,16 +30,27 @@ FetchContent_Declare(
     GIT_PROGRESS   TRUE
 )
 
+FetchContent_Declare(
+    libsamplerate
+    GIT_REPOSITORY https://github.com/libsndfile/libsamplerate.git
+    GIT_TAG        0.2.2
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
+)
+
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(RTAUDIO_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(LIBSAMPLERATE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LIBSAMPLERATE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 if(WIN32)
     set(RTAUDIO_API_ASIO ON CACHE BOOL "Build RtAudio ASIO backend" FORCE)
 endif()
 find_package(OpenGL REQUIRED)
 
-FetchContent_MakeAvailable(rtaudio imgui glfw)
+FetchContent_MakeAvailable(rtaudio imgui glfw libsamplerate)
 
 # ============================================================
 # Client Wrappers
@@ -65,5 +76,4 @@ target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 # ============================================================
 
 add_executable(client client.cpp gui.cpp)
-target_link_libraries(client PRIVATE asio concurrentqueue spdlog::spdlog rtaudio opus imgui_lib)
-
+target_link_libraries(client PRIVATE asio concurrentqueue spdlog::spdlog rtaudio opus imgui_lib SampleRate::samplerate)

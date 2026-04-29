@@ -48,6 +48,8 @@ Opus at `120` frames is the production internet default candidate.
 
 PCM remains the reference, LAN, and studio mode. PCM is useful because it proves the native client, backend, jitter, and playout path without codec bandwidth tradeoffs.
 
+PCM is only a real cross-platform LAN/reference mode if it handles independent device clocks across machines. Windows/macOS PCM testing showed that callback-size buffering alone is not enough; cross-machine PCM needs adaptive receiver playout and sample-rate correction. The current finding is tracked in `specs/pcm-cross-platform-clock-sync.md`.
+
 `96` PCM remains an Ultra/reference mode if it stays clear and diagnostics remain acceptable.
 
 `64` frames and lower are not normal product modes. They remain experimental or invalid unless they become clear in both manual listening and automated diagnostics.
@@ -110,4 +112,3 @@ After performer jamming is fully proven, the later order is:
 5. Official and community server productization.
 
 Existing listener/HLS code should not be intentionally broken, but it is not part of the native performer-jamming acceptance gate.
-
