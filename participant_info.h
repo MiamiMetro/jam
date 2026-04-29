@@ -50,7 +50,10 @@ struct ParticipantData {
     std::atomic<uint64_t>                   pcm_drift_drops{0};
     std::atomic<uint64_t>                   pcm_drift_inserts{0};
     std::atomic<size_t>                     pcm_playout_depth_frames{0};
+    std::atomic<size_t>                     pcm_target_buffer_frames{0};
     std::atomic<int64_t>                    pcm_resample_ratio_ppm{0};
+    std::atomic<uint64_t>                   pcm_resampler_underruns{0};
+    std::atomic<uint64_t>                   pcm_resampler_overruns{0};
 
     // Participant state
     std::string                           profile_id;
@@ -114,5 +117,8 @@ struct ParticipantInfo {
     uint64_t pcm_drift_drops;
     uint64_t pcm_drift_inserts;
     size_t   pcm_playout_depth_frames;
+    size_t   pcm_target_buffer_frames;
     int64_t  pcm_resample_ratio_ppm;
+    uint64_t pcm_resampler_underruns;
+    uint64_t pcm_resampler_overruns;
 };

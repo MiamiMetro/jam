@@ -879,15 +879,33 @@ private:
     }
 
     static size_t pcm_start_frames(size_t callback_frames) {
-        return callback_frames * 2;
+        return callback_frames * 3;
     }
 
     static size_t pcm_max_buffered_frames(size_t callback_frames) {
-        return callback_frames * 6;
+        return callback_frames * 12;
     }
 
     static size_t pcm_target_frames(size_t callback_frames) {
-        return callback_frames * 3;
+        return callback_frames * 5;
+    }
+
+    static size_t pcm_target_frames_for_participant(ParticipantData& participant,
+                                                    size_t callback_frames) {
+        size_t target = participant.pcm_target_buffer_frames.load(std::memory_order_relaxed);
+        if (target == 0) {
+            target = pcm_target_frames(callback_frames);
+            participant.pcm_target_buffer_frames.store(target, std::memory_order_relaxed);
+        }
+        return std::clamp(target, callback_frames * 3, pcm_max_buffered_frames(callback_frames));
+    }
+
+    static void raise_pcm_target_after_underrun(ParticipantData& participant,
+                                                size_t callback_frames) {
+        const size_t current = pcm_target_frames_for_participant(participant, callback_frames);
+        const size_t next =
+            std::min(current + callback_frames, pcm_max_buffered_frames(callback_frames));
+        participant.pcm_target_buffer_frames.store(next, std::memory_order_relaxed);
     }
 
     static void trim_pcm_playout_buffer(ParticipantData& participant, size_t callback_frames) {
@@ -972,6 +990,8 @@ private:
         participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_frames();
         participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
                                                    std::memory_order_relaxed);
+        participant.pcm_resampler_overruns.store(participant.pcm_resampler.overruns(),
+                                                 std::memory_order_relaxed);
         const auto ratio_ppm =
             static_cast<int64_t>((participant.pcm_resampler.ratio() - 1.0) * 1000000.0);
         participant.pcm_resample_ratio_ppm.store(ratio_ppm, std::memory_order_relaxed);
@@ -1542,7 +1562,8 @@ private:
 
             if (participant.last_codec == AudioCodec::PcmInt16 &&
                 participant.pcm_resampler.read(participant.pcm_playout_buffer.data(), frame_count,
-                                               pcm_target_frames(frame_count))) {
+                                               pcm_target_frames_for_participant(participant,
+                                                                                 frame_count))) {
                 if (frame_count <= participant.last_pcm_buffer.size()) {
                     std::copy_n(participant.pcm_playout_buffer.begin(), frame_count,
                                 participant.last_pcm_buffer.begin());
@@ -1569,6 +1590,10 @@ private:
                 active_count++;
                 observe_participant_queue_depth(participant, participant.opus_queue.size_approx());
                 return;
+            } else if (participant.last_codec == AudioCodec::PcmInt16) {
+                raise_pcm_target_after_underrun(participant, frame_count);
+                participant.pcm_resampler_underruns.store(participant.pcm_resampler.underruns(),
+                                                          std::memory_order_relaxed);
             }
 
             OpusPacket opus_packet;
@@ -1755,7 +1780,8 @@ private:
 
                     if (participant.pcm_resampler.read(participant.pcm_playout_buffer.data(),
                                                        frame_count,
-                                                       pcm_target_frames(frame_count))) {
+                                                       pcm_target_frames_for_participant(
+                                                           participant, frame_count))) {
                         if (frame_count <= participant.last_pcm_buffer.size()) {
                             std::copy_n(participant.pcm_playout_buffer.begin(), frame_count,
                                         participant.last_pcm_buffer.begin());
@@ -1782,6 +1808,10 @@ private:
                         participant.pcm_resample_ratio_ppm.store(ratio_ppm,
                                                                  std::memory_order_relaxed);
                         active_count++;
+                    } else {
+                        raise_pcm_target_after_underrun(participant, frame_count);
+                        participant.pcm_resampler_underruns.store(
+                            participant.pcm_resampler.underruns(), std::memory_order_relaxed);
                     }
                 }
 
@@ -2477,9 +2507,19 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::Text("PCM buf: %zu", p.pcm_playout_depth_frames);
             }
+            if (p.pcm_target_buffer_frames > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("PCM target: %zu", p.pcm_target_buffer_frames);
+            }
             if (p.pcm_resample_ratio_ppm != 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::Text("PCM ppm: %lld", static_cast<long long>(p.pcm_resample_ratio_ppm));
+            }
+            if (p.pcm_resampler_underruns > 0 || p.pcm_resampler_overruns > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("PCM res u/o: %llu/%llu",
+                            static_cast<unsigned long long>(p.pcm_resampler_underruns),
+                            static_cast<unsigned long long>(p.pcm_resampler_overruns));
             }
             if (p.pcm_drift_drops > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);

@@ -53,8 +53,12 @@ This patch exists because same-platform PCM works, but cross-machine Windows/mac
     - `--jitter 5` had `2` underruns in one 5-second run, so it is not enough proof.
     - `--jitter 6` ran clean for 5 seconds with `0` underruns and `0` decode failures.
   - [ ] Windows-to-Windows PCM still works.
-  - [x] Opus still works.
+- [x] Opus still works.
     - `latency_probe --codec opus --frames 120 --seconds 5 --jitter 6` ran with `0` underruns, `0` PLC, and `0` decode failures.
+- [x] Remove insufficient synthetic probes.
+  - Removed `pcm_clock_resampler_probe`.
+  - Removed `pcm_client_playout_probe`.
+  - Reason: they did not exercise the real RtAudio/CoreAudio/WASAPI client path and could create false confidence.
 - [ ] Validate with user cross-machine.
   - [x] Windows to macOS PCM audible and clear after first resampler patch.
   - [ ] macOS to Windows PCM audible and clear.
