@@ -671,6 +671,8 @@ private:
         OpusSendFrame discarded_opus;
         while (opus_send_queue_.try_dequeue(discarded_opus)) {
         }
+        pcm_tx_accumulated_frames_ = 0;
+        opus_tx_accumulated_frames_ = 0;
     }
 
     void pcm_sender_loop() {
@@ -718,6 +720,12 @@ private:
 
     void enqueue_pcm_send_frame(const unsigned char* payload, uint16_t payload_bytes,
                                 uint16_t frame_count, uint32_t sample_rate) {
+        if (payload == nullptr || frame_count == 0 || payload_bytes == 0 ||
+            payload_bytes > AUDIO_BUF_SIZE) {
+            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         const size_t max_queue_frames = max_send_queue_frames(frame_count);
         while (pcm_send_queue_.size_approx() >= max_queue_frames) {
             PcmSendFrame discarded;
@@ -734,7 +742,71 @@ private:
         frame.sample_rate = sample_rate;
         frame.capture_time = std::chrono::steady_clock::now();
         pcm_send_queue_.enqueue(frame);
+        pcm_tx_packet_frame_count_.store(frame_count, std::memory_order_relaxed);
         wake_pcm_sender_thread();
+    }
+
+    static bool is_valid_pcm_tx_frame_count(uint16_t frame_count) {
+        return frame_count > 0 &&
+               static_cast<size_t>(frame_count) * sizeof(int16_t) <= AUDIO_BUF_SIZE;
+    }
+
+    static uint16_t preferred_pcm_tx_frame_count(uint16_t requested_frame_count) {
+        if (is_valid_pcm_tx_frame_count(requested_frame_count)) {
+            return requested_frame_count;
+        }
+        return is_valid_pcm_tx_frame_count(120) ? 120 : 0;
+    }
+
+    void enqueue_pcm_send_samples(const float* samples, unsigned long frame_count,
+                                  uint32_t sample_rate) {
+        if (frame_count == 0 || samples == nullptr) {
+            return;
+        }
+        if (sample_rate != 48000) {
+            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            pcm_tx_accumulated_frames_ = 0;
+            return;
+        }
+
+        const uint16_t target_frame_count = preferred_pcm_tx_frame_count(
+            static_cast<uint16_t>(audio_config_.frames_per_buffer));
+        if (target_frame_count == 0 || target_frame_count > pcm_tx_accumulator_.size()) {
+            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            pcm_tx_accumulated_frames_ = 0;
+            return;
+        }
+
+        size_t offset = 0;
+        while (offset < frame_count) {
+            const size_t room =
+                static_cast<size_t>(target_frame_count) - pcm_tx_accumulated_frames_;
+            const size_t samples_to_copy =
+                std::min(room, static_cast<size_t>(frame_count) - offset);
+            auto accumulator_out = pcm_tx_accumulator_.begin() +
+                                   static_cast<std::ptrdiff_t>(pcm_tx_accumulated_frames_);
+            std::copy_n(samples + offset, samples_to_copy, accumulator_out);
+
+            pcm_tx_accumulated_frames_ += samples_to_copy;
+            offset += samples_to_copy;
+
+            if (pcm_tx_accumulated_frames_ == target_frame_count) {
+                std::array<unsigned char, AUDIO_BUF_SIZE> pcm_payload{};
+                for (size_t i = 0; i < target_frame_count; ++i) {
+                    const float clamped =
+                        std::clamp(pcm_tx_accumulator_[i], -1.0F, 1.0F);
+                    const auto sample =
+                        static_cast<int16_t>(std::lrint(clamped * 32767.0F));
+                    std::memcpy(pcm_payload.data() + i * sizeof(sample), &sample,
+                                sizeof(sample));
+                }
+                enqueue_pcm_send_frame(pcm_payload.data(),
+                                       static_cast<uint16_t>(target_frame_count *
+                                                             sizeof(int16_t)),
+                                       target_frame_count, sample_rate);
+                pcm_tx_accumulated_frames_ = 0;
+            }
+        }
     }
 
     void enqueue_opus_send_frame(const float* samples, uint16_t frame_count, uint32_t sample_rate) {
@@ -1168,9 +1240,11 @@ private:
         };
 
         Log::info(
-            "Audio diag: frames={} tx_packets={} tx_drops pcm/opus={}/{} "
+            "Audio diag: frames cfg/cb/tx={}/{}/{} tx_packets={} tx_drops pcm/opus={}/{} "
             "sendq_age_ms last/avg/max={:.2f}/{:.2f}/{:.2f} rx_bytes={} tx_bytes={}",
                   audio_config_.frames_per_buffer,
+                  audio_callback_frame_count_last_.load(std::memory_order_relaxed),
+                  pcm_tx_packet_frame_count_.load(std::memory_order_relaxed),
                   audio_tx_sequence_.load(std::memory_order_relaxed),
                   pcm_send_drops,
                   opus_send_drops,
@@ -1526,6 +1600,9 @@ private:
                 }
             }
         } timing_scope{client, callback_start, frame_count};
+
+        client->audio_callback_frame_count_last_.store(static_cast<uint32_t>(frame_count),
+                                                       std::memory_order_relaxed);
 
 #ifdef _WIN32
         // Boost thread priority on Windows for minimal audio latency
@@ -1898,22 +1975,13 @@ private:
                 float rms = audio_analysis::calculate_rms(pcm_input.data(), frame_count);
                 client->own_audio_level_.store(rms);
 
-                const size_t payload_bytes = frame_count * sizeof(int16_t);
-                if (payload_bytes <= AUDIO_BUF_SIZE) {
-                    std::array<unsigned char, AUDIO_BUF_SIZE> pcm_payload{};
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        float clamped = std::clamp(pcm_input[i], -1.0F, 1.0F);
-                        auto sample = static_cast<int16_t>(std::lrint(clamped * 32767.0F));
-                        std::memcpy(pcm_payload.data() + i * sizeof(sample), &sample, sizeof(sample));
-                    }
-                    client->enqueue_pcm_send_frame(
-                        pcm_payload.data(), static_cast<uint16_t>(payload_bytes),
-                        static_cast<uint16_t>(frame_count),
-                        static_cast<uint32_t>(client->audio_config_.sample_rate));
-                }
+                client->enqueue_pcm_send_samples(
+                    pcm_input.data(), frame_count,
+                    static_cast<uint32_t>(client->audio_config_.sample_rate));
                 return 0;
             }
 
+            client->pcm_tx_accumulated_frames_ = 0;
             if (!client->audio_encoder_.is_initialized()) {
                 return 0;
             }
@@ -1963,6 +2031,8 @@ private:
     std::atomic<uint32_t>    audio_tx_sequence_{0};
     moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
+    std::array<float, 960>                     pcm_tx_accumulator_{};
+    size_t                                     pcm_tx_accumulated_frames_ = 0;
     std::array<float, 960>                     opus_tx_accumulator_{};
     size_t                                     opus_tx_accumulated_frames_ = 0;
     std::atomic<bool>                         pcm_sender_running_{false};
@@ -1975,6 +2045,8 @@ private:
     std::atomic<int64_t>                      pcm_send_queue_age_last_ns_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_avg_ns_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_max_ns_{0};
+    std::atomic<uint32_t>                     audio_callback_frame_count_last_{0};
+    std::atomic<uint16_t>                     pcm_tx_packet_frame_count_{0};
 
     ParticipantManager participant_manager_;
     WavFilePlayback    wav_playback_;
