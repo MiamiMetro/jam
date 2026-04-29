@@ -838,6 +838,203 @@ private:
         participant.opus_pcm_buffered_frames = remaining;
     }
 
+    static size_t pcm_target_packets_for_frame_count(uint16_t frame_count) {
+        return frame_count <= 128 ? 2 : 3;
+    }
+
+    static size_t pcm_remote_frame_count_or(const ParticipantData& participant,
+                                            size_t fallback_frame_count) {
+        const uint16_t remote_frame_count =
+            participant.pcm_remote_frame_count.load(std::memory_order_relaxed);
+        return remote_frame_count > 0 ? remote_frame_count : fallback_frame_count;
+    }
+
+    static size_t pcm_target_buffer_frames(const ParticipantData& participant,
+                                           size_t fallback_frame_count) {
+        const size_t remote_frame_count =
+            pcm_remote_frame_count_or(participant, fallback_frame_count);
+        return remote_frame_count *
+               pcm_target_packets_for_frame_count(static_cast<uint16_t>(remote_frame_count));
+    }
+
+    static void update_pcm_fifo_depth(ParticipantData& participant) {
+        participant.pcm_fifo_depth.store(participant.pcm_fifo_buffered_frames,
+                                         std::memory_order_relaxed);
+    }
+
+    static void drop_pcm_fifo_frames(ParticipantData& participant, size_t frames_to_drop) {
+        const size_t dropped = std::min(frames_to_drop, participant.pcm_fifo_buffered_frames);
+        participant.pcm_fifo_read_index =
+            (participant.pcm_fifo_read_index + dropped) %
+            ParticipantData::PCM_FIFO_CAPACITY_FRAMES;
+        participant.pcm_fifo_buffered_frames -= dropped;
+        update_pcm_fifo_depth(participant);
+    }
+
+    static void trim_pcm_fifo_to_latency_target(ParticipantData& participant,
+                                                size_t local_frame_count) {
+        const size_t target_frames = pcm_target_buffer_frames(participant, local_frame_count);
+        const size_t remote_frame_count =
+            pcm_remote_frame_count_or(participant, local_frame_count);
+        const size_t high_watermark =
+            target_frames + (std::max(remote_frame_count, local_frame_count) * 2);
+
+        if (participant.pcm_fifo_buffered_frames > high_watermark) {
+            const size_t frames_to_drop = participant.pcm_fifo_buffered_frames - target_frames;
+            drop_pcm_fifo_frames(participant, frames_to_drop);
+            participant.pcm_drift_drops.fetch_add(1, std::memory_order_relaxed);
+            participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    static bool append_pcm_packet_to_fifo(ParticipantData& participant,
+                                          const OpusPacket& packet,
+                                          size_t local_frame_count) {
+        if (packet.sample_rate != 48000 || packet.channels != 1 || packet.frame_count == 0) {
+            participant.pcm_format_drops.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        const size_t packet_frames = packet.frame_count;
+        const size_t expected_bytes = packet_frames * sizeof(int16_t);
+        if (packet.get_size() != expected_bytes) {
+            participant.pcm_size_mismatches.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (packet_frames > ParticipantData::PCM_FIFO_CAPACITY_FRAMES) {
+            participant.pcm_format_drops.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        participant.pcm_remote_frame_count.store(packet.frame_count, std::memory_order_relaxed);
+        if (participant.pcm_fifo_buffered_frames + packet_frames >
+            ParticipantData::PCM_FIFO_CAPACITY_FRAMES) {
+            const size_t overflow =
+                participant.pcm_fifo_buffered_frames + packet_frames -
+                ParticipantData::PCM_FIFO_CAPACITY_FRAMES;
+            drop_pcm_fifo_frames(participant, overflow);
+            participant.pcm_fifo_overflows.fetch_add(1, std::memory_order_relaxed);
+            participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        for (size_t i = 0; i < packet_frames; ++i) {
+            int16_t sample = 0;
+            std::memcpy(&sample, packet.get_data() + i * sizeof(sample), sizeof(sample));
+            const size_t write_index =
+                (participant.pcm_fifo_read_index + participant.pcm_fifo_buffered_frames) %
+                ParticipantData::PCM_FIFO_CAPACITY_FRAMES;
+            participant.pcm_fifo[write_index] = static_cast<float>(sample) / 32767.0F;
+            participant.pcm_fifo_buffered_frames++;
+        }
+
+        update_pcm_fifo_depth(participant);
+        trim_pcm_fifo_to_latency_target(participant, local_frame_count);
+        return true;
+    }
+
+    static size_t read_pcm_fifo(ParticipantData& participant, float* output,
+                                size_t frame_count) {
+        const size_t frames_to_read = std::min(frame_count, participant.pcm_fifo_buffered_frames);
+        for (size_t i = 0; i < frames_to_read; ++i) {
+            output[i] = participant.pcm_fifo[participant.pcm_fifo_read_index];
+            participant.pcm_fifo_read_index =
+                (participant.pcm_fifo_read_index + 1) %
+                ParticipantData::PCM_FIFO_CAPACITY_FRAMES;
+        }
+        participant.pcm_fifo_buffered_frames -= frames_to_read;
+        update_pcm_fifo_depth(participant);
+        return frames_to_read;
+    }
+
+    static void drain_pcm_packets_until(ParticipantData& participant, size_t target_frames,
+                                        size_t local_frame_count) {
+        while (participant.pcm_fifo_buffered_frames < target_frames) {
+            OpusPacket next_packet;
+            if (!participant.opus_queue.try_dequeue(next_packet)) {
+                break;
+            }
+            if (next_packet.codec != AudioCodec::PcmInt16) {
+                participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            append_pcm_packet_to_fifo(participant, next_packet, local_frame_count);
+        }
+    }
+
+    static size_t pcm_drain_target_frames(const ParticipantData& participant,
+                                          size_t local_frame_count) {
+        return std::max(local_frame_count,
+                        pcm_target_buffer_frames(participant, local_frame_count));
+    }
+
+    static bool mix_pcm_fifo_to_output(ParticipantData& participant, float* output_buffer,
+                                       size_t frame_count, size_t out_channels) {
+        if (frame_count == 0 || frame_count > participant.pcm_buffer.size()) {
+            return false;
+        }
+
+        const size_t frames_read =
+            read_pcm_fifo(participant, participant.pcm_buffer.data(), frame_count);
+        const bool had_fallback_source =
+            participant.last_pcm_valid && !participant.pcm_concealment_used &&
+            participant.last_pcm_samples > 0;
+        const bool rendered_any_audio = frames_read > 0 || had_fallback_source;
+        if (frames_read < frame_count) {
+            const float fade_start =
+                frames_read > 0
+                    ? participant.pcm_buffer[frames_read - 1]
+                    : (had_fallback_source
+                           ? participant.last_pcm_buffer[participant.last_pcm_samples - 1]
+                           : 0.0F);
+            constexpr size_t FADE_SAMPLES = 16;
+            for (size_t i = frames_read; i < frame_count; ++i) {
+                const size_t tail_index = i - frames_read;
+                if (tail_index < FADE_SAMPLES) {
+                    const float fade =
+                        1.0F -
+                        (static_cast<float>(tail_index + 1) /
+                         static_cast<float>(FADE_SAMPLES + 1));
+                    participant.pcm_buffer[i] = fade_start * fade;
+                } else {
+                    participant.pcm_buffer[i] = 0.0F;
+                }
+            }
+            participant.pcm_fifo_underflows.fetch_add(1, std::memory_order_relaxed);
+            participant.pcm_concealment_frames.fetch_add(1, std::memory_order_relaxed);
+            participant.underrun_count++;
+            participant.pcm_concealment_used = true;
+        } else {
+            participant.pcm_concealment_used = false;
+        }
+
+        if (!rendered_any_audio) {
+            return false;
+        }
+
+        std::copy_n(participant.pcm_buffer.begin(), frame_count,
+                    participant.last_pcm_buffer.begin());
+        participant.last_pcm_samples = frame_count;
+        participant.last_pcm_valid = true;
+
+        float rms = audio_analysis::calculate_rms(participant.pcm_buffer.data(), frame_count);
+        participant.current_level = rms;
+
+        bool was_speaking       = participant.is_speaking;
+        participant.is_speaking = audio_analysis::detect_voice_activity(rms);
+        (void)was_speaking;
+
+        if (out_channels == 1) {
+            audio_analysis::mix_with_gain(output_buffer, participant.pcm_buffer.data(),
+                                          frame_count, participant.gain);
+        } else {
+            audio_analysis::mix_mono_to_stereo(output_buffer, participant.pcm_buffer.data(),
+                                               frame_count, out_channels, participant.gain);
+        }
+
+        trim_pcm_fifo_to_latency_target(participant, frame_count);
+        return true;
+    }
+
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
         size_t previous_max = participant.queue_depth_max.load(std::memory_order_relaxed);
         while (depth > previous_max &&
@@ -866,17 +1063,13 @@ private:
     }
 
     static size_t jitter_floor_for_packet(const OpusPacket& packet) {
-        if (packet.codec == AudioCodec::PcmInt16 && packet.frame_count <= 120) {
+        if (packet.codec == AudioCodec::PcmInt16 && packet.frame_count <= 128) {
             return 2;
         }
         if (packet.codec == AudioCodec::Opus && packet.frame_count <= 120) {
             return 5;
         }
         return MIN_JITTER_BUFFER_PACKETS;
-    }
-
-    static size_t pcm_drift_drop_threshold(const ParticipantData& participant) {
-        return participant.jitter_buffer_min_packets + 3;
     }
 
     static void update_jitter_floor(ParticipantData& participant, const OpusPacket& packet) {
@@ -940,6 +1133,10 @@ private:
             double jitter_age_per_sec;
             double pcm_hold_per_sec;
             double pcm_drift_drop_per_sec;
+            double pcm_format_drop_per_sec;
+            double pcm_size_mismatch_per_sec;
+            double pcm_fifo_underflow_per_sec;
+            double pcm_fifo_overflow_per_sec;
         };
 
         auto calculate_rate = [](uint64_t current, uint64_t previous, double elapsed_sec) {
@@ -993,38 +1190,58 @@ private:
                 calculate_rate(p.pcm_concealment_frames, previous.pcm_concealment_frames,
                                elapsed_sec),
                 calculate_rate(p.pcm_drift_drops, previous.pcm_drift_drops, elapsed_sec),
+                calculate_rate(p.pcm_format_drops, previous.pcm_format_drops, elapsed_sec),
+                calculate_rate(p.pcm_size_mismatches, previous.pcm_size_mismatches, elapsed_sec),
+                calculate_rate(p.pcm_fifo_underflows, previous.pcm_fifo_underflows, elapsed_sec),
+                calculate_rate(p.pcm_fifo_overflows, previous.pcm_fifo_overflows, elapsed_sec),
             };
             previous.jitter_depth_drops = p.jitter_depth_drops;
             previous.jitter_age_drops = p.jitter_age_drops;
             previous.pcm_concealment_frames = p.pcm_concealment_frames;
             previous.pcm_drift_drops = p.pcm_drift_drops;
+            previous.pcm_format_drops = p.pcm_format_drops;
+            previous.pcm_size_mismatches = p.pcm_size_mismatches;
+            previous.pcm_fifo_underflows = p.pcm_fifo_underflows;
+            previous.pcm_fifo_overflows = p.pcm_fifo_overflows;
 
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
                 "age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
-                "drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
+                "pcm_fifo frame/depth={}/{} bad fmt/size={}/{} fifo under/over={}/{} "
+                "drop_rate pcm/q/hold/drift/bad/under={:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.packet_age_avg_ms, p.underrun_count,
                 p.pcm_concealment_frames, p.pcm_drift_drops,
                 p.jitter_depth_drops, p.jitter_age_drops, p.sequence_gaps,
-                p.sequence_late_or_reordered, drop_rate.pcm_send_per_sec,
+                p.sequence_late_or_reordered, p.pcm_remote_frame_count, p.pcm_fifo_depth,
+                p.pcm_format_drops, p.pcm_size_mismatches, p.pcm_fifo_underflows,
+                p.pcm_fifo_overflows, drop_rate.pcm_send_per_sec,
                 drop_rate.jitter_depth_per_sec, drop_rate.pcm_hold_per_sec,
-                drop_rate.pcm_drift_drop_per_sec);
+                drop_rate.pcm_drift_drop_per_sec,
+                drop_rate.pcm_format_drop_per_sec + drop_rate.pcm_size_mismatch_per_sec,
+                drop_rate.pcm_fifo_underflow_per_sec);
 
             if (elapsed_sec > 0.0 &&
                 (drop_rate.pcm_send_per_sec > 5.0 ||
                  drop_rate.jitter_depth_per_sec > 100.0 ||
                  drop_rate.jitter_age_per_sec > 5.0 ||
                  drop_rate.pcm_hold_per_sec > 5.0 ||
-                 drop_rate.pcm_drift_drop_per_sec > 5.0)) {
+                 drop_rate.pcm_drift_drop_per_sec > 5.0 ||
+                 drop_rate.pcm_format_drop_per_sec > 0.0 ||
+                 drop_rate.pcm_size_mismatch_per_sec > 0.0 ||
+                 drop_rate.pcm_fifo_underflow_per_sec > 5.0 ||
+                 drop_rate.pcm_fifo_overflow_per_sec > 0.0)) {
                 Log::warn(
                     "Audio health warning for participant {}: likely corrupt/robotic risk "
                     "(pcm_drop_rate={:.1f}/s opus_drop_rate={:.1f}/s "
                     "queue_drop_rate={:.1f}/s age_drop_rate={:.1f}/s "
-                    "pcm_hold_rate={:.1f}/s pcm_drift_drop_rate={:.1f}/s)",
+                    "pcm_hold_rate={:.1f}/s pcm_drift_drop_rate={:.1f}/s "
+                    "pcm_bad_rate={:.1f}/s pcm_fifo_under_rate={:.1f}/s)",
                     p.id, drop_rate.pcm_send_per_sec, drop_rate.opus_send_per_sec,
                     drop_rate.jitter_depth_per_sec, drop_rate.jitter_age_per_sec,
-                    drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec);
+                    drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec,
+                    drop_rate.pcm_format_drop_per_sec + drop_rate.pcm_size_mismatch_per_sec,
+                    drop_rate.pcm_fifo_underflow_per_sec);
             }
         }
     }
@@ -1187,8 +1404,25 @@ private:
                     std::memcpy(&audio_hdr, recv_buf_.data(), sizeof(AudioHdrV2) - AUDIO_BUF_SIZE);
                     packet.codec       = audio_hdr.codec;
                     packet.sequence    = audio_hdr.sequence;
+                    packet.sample_rate = audio_hdr.sample_rate;
                     packet.frame_count = audio_hdr.frame_count;
                     packet.channels    = audio_hdr.channels;
+                    if (packet.codec == AudioCodec::PcmInt16) {
+                        const bool valid_format =
+                            packet.sample_rate == 48000 && packet.channels == 1 &&
+                            packet.frame_count > 0;
+                        const size_t expected_pcm_bytes =
+                            static_cast<size_t>(packet.frame_count) * sizeof(int16_t);
+                        if (!valid_format) {
+                            participant.pcm_format_drops.fetch_add(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        if (payload_bytes != expected_pcm_bytes) {
+                            participant.pcm_size_mismatches.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+                            return;
+                        }
+                    }
                     if (!participant.sequence_initialized) {
                         participant.sequence_initialized = true;
                         participant.next_expected_sequence = packet.sequence + 1;
@@ -1205,6 +1439,7 @@ private:
                     }
                 } else {
                     packet.codec       = AudioCodec::Opus;
+                    packet.sample_rate = static_cast<uint32_t>(audio_config_.sample_rate);
                     packet.frame_count = static_cast<uint16_t>(audio_config_.frames_per_buffer);
                     packet.channels    = 1;
                 }
@@ -1349,6 +1584,22 @@ private:
                 return;
             }
 
+            if (participant.last_codec == AudioCodec::PcmInt16) {
+                drain_pcm_packets_until(participant,
+                                        pcm_drain_target_frames(participant, frame_count),
+                                        frame_count);
+                if (participant.pcm_fifo_buffered_frames > 0 ||
+                    (participant.last_pcm_valid && !participant.pcm_concealment_used)) {
+                    if (mix_pcm_fifo_to_output(participant, output_buffer, frame_count,
+                                               out_channels)) {
+                        active_count++;
+                    }
+                    observe_participant_queue_depth(participant,
+                                                    participant.opus_queue.size_approx());
+                    return;
+                }
+            }
+
             OpusPacket opus_packet;
 
             if (participant.opus_queue.try_dequeue(opus_packet)) {
@@ -1389,22 +1640,21 @@ private:
                 participant.last_codec = opus_packet.codec;
                 int decoded_samples = 0;
                 if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    const size_t expected_bytes = frame_count * sizeof(int16_t);
-                    if (opus_packet.get_size() != expected_bytes) {
-                        static int pcm_size_mismatch_count = 0;
-                        if (++pcm_size_mismatch_count % 100 == 0) {
-                            Log::warn("PCM size mismatch for participant {}: got {}, expected {}",
-                                      participant_id, opus_packet.get_size(), expected_bytes);
-                        }
+                    if (!append_pcm_packet_to_fifo(participant, opus_packet, frame_count)) {
+                        observe_participant_queue_depth(participant,
+                                                        participant.opus_queue.size_approx());
                         return;
                     }
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        int16_t sample = 0;
-                        std::memcpy(&sample, opus_packet.get_data() + i * sizeof(sample),
-                                    sizeof(sample));
-                        participant.pcm_buffer[i] = static_cast<float>(sample) / 32767.0F;
+                    drain_pcm_packets_until(participant,
+                                            pcm_drain_target_frames(participant, frame_count),
+                                            frame_count);
+                    if (mix_pcm_fifo_to_output(participant, output_buffer, frame_count,
+                                               out_channels)) {
+                        active_count++;
                     }
-                    decoded_samples = static_cast<int>(frame_count);
+                    observe_participant_queue_depth(participant,
+                                                    participant.opus_queue.size_approx());
+                    return;
                 } else {
                     const int decode_frame_count =
                         opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
@@ -1506,92 +1756,7 @@ private:
                     return;
                 }
 
-                if (opus_packet.codec == AudioCodec::PcmInt16 &&
-                    decoded_samples <= static_cast<int>(participant.last_pcm_buffer.size())) {
-                    std::copy_n(participant.pcm_buffer.begin(), decoded_samples,
-                                participant.last_pcm_buffer.begin());
-                    participant.last_pcm_samples = static_cast<size_t>(decoded_samples);
-                    participant.last_pcm_valid = true;
-                    participant.pcm_concealment_used = false;
-                }
-
-                // Calculate audio level (RMS) for voice activity detection
-                float rms =
-                    audio_analysis::calculate_rms(participant.pcm_buffer.data(), decoded_samples);
-                participant.current_level = rms;
-
-                // Voice Activity Detection (simple threshold-based)
-                bool was_speaking       = participant.is_speaking;
-                participant.is_speaking = audio_analysis::detect_voice_activity(rms);
-
-                if (participant.is_speaking && !was_speaking) {
-                    Log::debug("Participant {} started speaking (level: {:.4f})", participant_id,
-                               rms);
-                } else if (!participant.is_speaking && was_speaking) {
-                    Log::debug("Participant {} stopped speaking", participant_id);
-                }
-
-                // Mix into output with participant's gain
-                size_t expected_samples = frame_count * out_channels;
-                if (static_cast<size_t>(decoded_samples) == expected_samples) {
-                    audio_analysis::mix_with_gain(output_buffer, participant.pcm_buffer.data(),
-                                                  decoded_samples, participant.gain);
-                    active_count++;
-                } else if (static_cast<size_t>(decoded_samples) == frame_count) {
-                    // Mono input, stereo output - duplicate channel
-                    audio_analysis::mix_mono_to_stereo(output_buffer, participant.pcm_buffer.data(),
-                                                       frame_count, out_channels, participant.gain);
-                    active_count++;
-                } else {
-                    // Size mismatch - log warning occasionally
-                    static int mismatch_count = 0;
-                    if (++mismatch_count % 100 == 0) {
-                        Log::warn(
-                            "Audio size mismatch: participant {}, got {} samples, expected {}",
-                            participant_id, decoded_samples, expected_samples);
-                    }
-                }
-
-                // Adaptive jitter buffer: track queue size history and adjust minimum
-                size_t current_queue_size = participant.opus_queue.size_approx();
-                if (opus_packet.codec == AudioCodec::PcmInt16 &&
-                    current_queue_size > pcm_drift_drop_threshold(participant)) {
-                    OpusPacket discarded;
-                    if (participant.opus_queue.try_dequeue(discarded)) {
-                        current_queue_size--;
-                        participant.pcm_drift_drops.fetch_add(1, std::memory_order_relaxed);
-                        participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-                observe_participant_queue_depth(participant, current_queue_size);
-                participant.queue_size_history[participant.history_index] = current_queue_size;
-                participant.history_index =
-                    (participant.history_index + 1) % participant.queue_size_history.size();
-
-                // Calculate average queue size over history window
-                size_t total = 0;
-                for (size_t qs: participant.queue_size_history) {
-                    total += qs;
-                }
-                size_t avg_queue_size = total / participant.queue_size_history.size();
-
-                // Adaptive adjustment: increase buffer if queue is often low (jittery network)
-                // Decrease buffer if queue is consistently high (stable network, reduce latency)
-                constexpr size_t MAX_JITTER_BUFFER_PACKETS = 5;  // Upper limit for adaptation
-                if (avg_queue_size < 2 &&
-                    participant.jitter_buffer_min_packets < MAX_JITTER_BUFFER_PACKETS) {
-                    participant.jitter_buffer_min_packets++;
-                    Log::debug("Participant {} jitter buffer increased to {} (avg queue: {})",
-                               participant_id, participant.jitter_buffer_min_packets,
-                               avg_queue_size);
-                } else if (avg_queue_size > 4 &&
-                           participant.jitter_buffer_min_packets >
-                               participant.jitter_buffer_floor_packets) {
-                    participant.jitter_buffer_min_packets--;
-                    Log::debug("Participant {} jitter buffer decreased to {} (avg queue: {})",
-                               participant_id, participant.jitter_buffer_min_packets,
-                               avg_queue_size);
-                }
+                participant.pcm_format_drops.fetch_add(1, std::memory_order_relaxed);
             } else {
                 // Underrun - use PLC instead of silence for smoother audio
                 size_t current_queue_size = participant.opus_queue.size_approx();
@@ -1847,6 +2012,10 @@ private:
         uint64_t jitter_age_drops   = 0;
         uint64_t pcm_concealment_frames = 0;
         uint64_t pcm_drift_drops = 0;
+        uint64_t pcm_format_drops = 0;
+        uint64_t pcm_size_mismatches = 0;
+        uint64_t pcm_fifo_underflows = 0;
+        uint64_t pcm_fifo_overflows = 0;
     };
     std::chrono::steady_clock::time_point                  last_audio_health_log_time_{};
     uint64_t                                               last_pcm_send_drops_  = 0;
@@ -2242,6 +2411,25 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::Text("PCM drift drop: %llu",
                             static_cast<unsigned long long>(p.pcm_drift_drops));
+            }
+            if (p.pcm_remote_frame_count > 0 || p.pcm_fifo_depth > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("PCM pkt/fifo: %u/%zu", p.pcm_remote_frame_count,
+                            p.pcm_fifo_depth);
+            }
+            if (p.pcm_format_drops > 0 || p.pcm_size_mismatches > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F),
+                                   "PCM bad f/s: %llu/%llu",
+                                   static_cast<unsigned long long>(p.pcm_format_drops),
+                                   static_cast<unsigned long long>(p.pcm_size_mismatches));
+            }
+            if (p.pcm_fifo_underflows > 0 || p.pcm_fifo_overflows > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F),
+                                   "PCM fifo u/o: %llu/%llu",
+                                   static_cast<unsigned long long>(p.pcm_fifo_underflows),
+                                   static_cast<unsigned long long>(p.pcm_fifo_overflows));
             }
             if (!p.buffer_ready) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);

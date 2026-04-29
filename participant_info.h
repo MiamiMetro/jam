@@ -19,6 +19,7 @@ struct OpusPacket {
     std::chrono::steady_clock::time_point timestamp;
     AudioCodec                            codec = AudioCodec::Opus;
     uint32_t                              sequence = 0;
+    uint32_t                              sample_rate = 48000;
     uint16_t                              frame_count = 0;
     uint8_t                               channels = 1;
 
@@ -33,17 +34,28 @@ struct OpusPacket {
 
 // Per-participant audio data and state
 struct ParticipantData {
+    static constexpr size_t PCM_FIFO_CAPACITY_FRAMES = 4096;
+
     // Audio processing - store OPUS packets, decode in audio callback
     moodycamel::ConcurrentQueue<OpusPacket> opus_queue;
     std::unique_ptr<OpusDecoderWrapper>     decoder;
     std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
     std::array<float, 1920>                 opus_pcm_buffer{};
     size_t                                  opus_pcm_buffered_frames = 0;
+    std::array<float, PCM_FIFO_CAPACITY_FRAMES> pcm_fifo{};
+    size_t                                  pcm_fifo_read_index = 0;
+    size_t                                  pcm_fifo_buffered_frames = 0;
     std::array<float, 960>                  last_pcm_buffer{};
     size_t                                  last_pcm_samples = 0;
     bool                                    last_pcm_valid = false;
     bool                                    pcm_concealment_used = false;
     std::atomic<uint64_t>                   pcm_drift_drops{0};
+    std::atomic<size_t>                     pcm_fifo_depth{0};
+    std::atomic<uint16_t>                   pcm_remote_frame_count{0};
+    std::atomic<uint64_t>                   pcm_format_drops{0};
+    std::atomic<uint64_t>                   pcm_size_mismatches{0};
+    std::atomic<uint64_t>                   pcm_fifo_underflows{0};
+    std::atomic<uint64_t>                   pcm_fifo_overflows{0};
 
     // Participant state
     std::string                           profile_id;
@@ -105,4 +117,10 @@ struct ParticipantInfo {
     uint64_t jitter_age_drops;
     uint64_t pcm_concealment_frames;
     uint64_t pcm_drift_drops;
+    size_t   pcm_fifo_depth;
+    uint16_t pcm_remote_frame_count;
+    uint64_t pcm_format_drops;
+    uint64_t pcm_size_mismatches;
+    uint64_t pcm_fifo_underflows;
+    uint64_t pcm_fifo_overflows;
 };

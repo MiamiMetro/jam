@@ -128,6 +128,16 @@ public:
             info.pcm_concealment_frames =
                 data->pcm_concealment_frames.load(std::memory_order_relaxed);
             info.pcm_drift_drops = data->pcm_drift_drops.load(std::memory_order_relaxed);
+            info.pcm_fifo_depth = data->pcm_fifo_depth.load(std::memory_order_relaxed);
+            info.pcm_remote_frame_count =
+                data->pcm_remote_frame_count.load(std::memory_order_relaxed);
+            info.pcm_format_drops = data->pcm_format_drops.load(std::memory_order_relaxed);
+            info.pcm_size_mismatches =
+                data->pcm_size_mismatches.load(std::memory_order_relaxed);
+            info.pcm_fifo_underflows =
+                data->pcm_fifo_underflows.load(std::memory_order_relaxed);
+            info.pcm_fifo_overflows =
+                data->pcm_fifo_overflows.load(std::memory_order_relaxed);
             result.push_back(info);
         }
 

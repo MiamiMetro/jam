@@ -44,8 +44,6 @@ constexpr int   CLICK_SAMPLES = 32;
 constexpr float CLICK_AMPLITUDE = 0.8F;
 constexpr float DETECTION_THRESHOLD = 0.05F;
 constexpr int   MAX_FRAME_SAMPLES = 960;
-constexpr uint8_t PROBE_CODEC_OPUS = 0;
-constexpr uint8_t PROBE_CODEC_PCM_INT16 = 1;
 
 enum class ProbeCodec {
     Opus,
@@ -53,7 +51,8 @@ enum class ProbeCodec {
 };
 
 struct ProbeConfig {
-    int frame_size = 240;
+    int send_frame_size = 240;
+    int playout_frame_size = 240;
     int jitter_min_packets = 3;
     int total_packets = TOTAL_PACKETS;
     ProbeCodec codec = ProbeCodec::Opus;
@@ -73,7 +72,11 @@ struct Args {
 
 struct ReceivedPacket {
     std::array<unsigned char, AUDIO_BUF_SIZE> data{};
-    uint16_t encoded_bytes = 0;
+    uint16_t payload_bytes = 0;
+    AudioCodec codec = AudioCodec::Opus;
+    uint32_t sample_rate = SAMPLE_RATE;
+    uint16_t frame_count = 0;
+    uint8_t channels = CHANNELS;
 };
 
 struct ProbeMetrics {
@@ -93,6 +96,9 @@ struct ProbeMetrics {
     int min_queue_depth_after_ready = std::numeric_limits<int>::max();
     int max_queue_depth = 0;
     int final_queue_depth = 0;
+    int max_pcm_fifo_frames = 0;
+    int final_pcm_fifo_frames = 0;
+    int pcm_drift_corrections = 0;
     float max_discontinuity = 0.0F;
     int detected_output_sample = -1;
 };
@@ -176,31 +182,58 @@ private:
     }
 
     void handle_receive(std::size_t bytes) {
-        if (!message_validator::is_valid_audio_packet(
-                bytes, sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t))) {
+        if (!message_validator::is_valid_audio_packet(bytes, sizeof(MsgHdr))) {
             return;
         }
 
         MsgHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(hdr));
-        if (hdr.magic != AUDIO_MAGIC) {
+        if (hdr.magic != AUDIO_MAGIC && hdr.magic != AUDIO_V2_MAGIC) {
             return;
         }
 
         const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
-        uint16_t encoded_bytes = packet_builder::extract_encoded_bytes(packet_data);
-        size_t expected_size = sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) + encoded_bytes;
+        const bool is_v2 = hdr.magic == AUDIO_V2_MAGIC;
+        const size_t header_size =
+            is_v2 ? sizeof(AudioHdrV2) - AUDIO_BUF_SIZE
+                  : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+        if (!message_validator::is_valid_audio_packet(bytes, header_size)) {
+            return;
+        }
+
+        uint16_t payload_bytes =
+            is_v2 ? packet_builder::extract_v2_payload_bytes(packet_data)
+                  : packet_builder::extract_encoded_bytes(packet_data);
+        size_t expected_size = header_size + payload_bytes;
         if (!message_validator::has_complete_payload(bytes, expected_size) ||
-            !message_validator::is_encoded_bytes_valid(encoded_bytes, AUDIO_BUF_SIZE)) {
+            !message_validator::is_encoded_bytes_valid(payload_bytes, AUDIO_BUF_SIZE)) {
             return;
         }
 
         const unsigned char* audio_data =
-            packet_data + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+            is_v2 ? packet_builder::audio_v2_payload(packet_data)
+                  : packet_builder::audio_v1_payload(packet_data);
 
         ReceivedPacket packet;
-        std::memcpy(packet.data.data(), audio_data, encoded_bytes);
-        packet.encoded_bytes = encoded_bytes;
+        std::memcpy(packet.data.data(), audio_data, payload_bytes);
+        packet.payload_bytes = payload_bytes;
+        if (is_v2) {
+            AudioHdrV2 audio_hdr{};
+            std::memcpy(&audio_hdr, recv_buf_.data(), sizeof(AudioHdrV2) - AUDIO_BUF_SIZE);
+            packet.codec = audio_hdr.codec;
+            packet.sample_rate = audio_hdr.sample_rate;
+            packet.frame_count = audio_hdr.frame_count;
+            packet.channels = audio_hdr.channels;
+        } else if (payload_bytes > 0 && packet.data[0] == 0) {
+            packet.codec = AudioCodec::Opus;
+            packet.payload_bytes = payload_bytes - 1;
+            std::memmove(packet.data.data(), packet.data.data() + 1, packet.payload_bytes);
+        } else if (payload_bytes > 0 && packet.data[0] == 1) {
+            packet.codec = AudioCodec::PcmInt16;
+            packet.payload_bytes = payload_bytes - 1;
+            packet.frame_count = static_cast<uint16_t>(packet.payload_bytes / sizeof(int16_t));
+            std::memmove(packet.data.data(), packet.data.data() + 1, packet.payload_bytes);
+        }
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -239,17 +272,15 @@ public:
         send_ctrl(CtrlHdr::Cmd::LEAVE);
     }
 
-    bool send_audio_packet(uint8_t codec, const unsigned char* payload, size_t payload_bytes) {
-        if (payload_bytes + 1 > AUDIO_BUF_SIZE) {
+    bool send_audio_packet(AudioCodec codec, uint32_t sequence, uint16_t frame_count,
+                           const unsigned char* payload, size_t payload_bytes) {
+        if (payload_bytes > AUDIO_BUF_SIZE) {
             return false;
         }
 
-        std::vector<unsigned char> probe_payload;
-        probe_payload.reserve(payload_bytes + 1);
-        probe_payload.push_back(codec);
-        probe_payload.insert(probe_payload.end(), payload, payload + payload_bytes);
-
-        auto packet = audio_packet::create_audio_packet(probe_payload);
+        auto packet = audio_packet::create_audio_packet_v2(
+            codec, sequence, SAMPLE_RATE, frame_count, CHANNELS, payload,
+            static_cast<uint16_t>(payload_bytes));
         std::error_code ec;
         socket_.send_to(asio::buffer(packet->data(), packet->size()), server_endpoint_, 0, ec);
         return !ec;
@@ -283,7 +314,7 @@ private:
 void fill_probe_frame(int packet_index, const ProbeConfig& config, std::vector<float>& frame) {
     std::fill(frame.begin(), frame.end(), 0.0F);
     if (packet_index == IMPULSE_PACKET) {
-        int samples = std::min(CLICK_SAMPLES, config.frame_size);
+        int samples = std::min(CLICK_SAMPLES, config.send_frame_size);
         for (int i = 0; i < samples; ++i) {
             frame[static_cast<size_t>(i)] = CLICK_AMPLITUDE;
         }
@@ -302,18 +333,19 @@ const char* codec_name(ProbeCodec codec) {
 
 bool decode_pcm_int16_packet(const ReceivedPacket& packet, const ProbeConfig& config,
                              std::array<float, MAX_FRAME_SAMPLES>& pcm) {
-    if (packet.encoded_bytes < 1 || packet.data[0] != PROBE_CODEC_PCM_INT16) {
+    (void)config;
+    if (packet.codec != AudioCodec::PcmInt16 || packet.sample_rate != SAMPLE_RATE ||
+        packet.channels != CHANNELS || packet.frame_count <= 0) {
         return false;
     }
 
-    size_t payload_bytes = static_cast<size_t>(packet.encoded_bytes - 1);
-    size_t expected_bytes = static_cast<size_t>(config.frame_size) * sizeof(int16_t);
-    if (payload_bytes != expected_bytes) {
+    size_t expected_bytes = static_cast<size_t>(packet.frame_count) * sizeof(int16_t);
+    if (packet.payload_bytes != expected_bytes || packet.frame_count > MAX_FRAME_SAMPLES) {
         return false;
     }
 
-    const unsigned char* payload = packet.data.data() + 1;
-    for (int i = 0; i < config.frame_size; ++i) {
+    const unsigned char* payload = packet.data.data();
+    for (int i = 0; i < packet.frame_count; ++i) {
         int16_t sample = 0;
         std::memcpy(&sample, payload + static_cast<size_t>(i) * sizeof(sample), sizeof(sample));
         pcm[static_cast<size_t>(i)] = static_cast<float>(sample) / 32767.0F;
@@ -321,10 +353,35 @@ bool decode_pcm_int16_packet(const ReceivedPacket& packet, const ProbeConfig& co
     return true;
 }
 
+int pcm_target_packets_for_frame_count(int frame_count) {
+    return frame_count <= 128 ? 2 : 3;
+}
+
+int pcm_target_fifo_frames(const ProbeConfig& config) {
+    return config.send_frame_size * pcm_target_packets_for_frame_count(config.send_frame_size);
+}
+
+void trim_pcm_probe_fifo(std::deque<float>& pcm_fifo, const ProbeConfig& config,
+                         ProbeMetrics& metrics) {
+    const int target_frames = pcm_target_fifo_frames(config);
+    const int high_watermark =
+        target_frames + (std::max(config.send_frame_size, config.playout_frame_size) * 2);
+    if (static_cast<int>(pcm_fifo.size()) <= high_watermark) {
+        return;
+    }
+
+    const int frames_to_drop = static_cast<int>(pcm_fifo.size()) - target_frames;
+    for (int i = 0; i < frames_to_drop && !pcm_fifo.empty(); ++i) {
+        pcm_fifo.pop_front();
+    }
+    metrics.pcm_drift_corrections++;
+}
+
 void inspect_samples(const std::array<float, MAX_FRAME_SAMPLES>& pcm, int decoded_samples,
                      int output_base_sample, const ProbeConfig& config, ProbeMetrics& metrics,
                      std::vector<float>& previous_block, bool& have_previous_block) {
-    bool same_as_previous = have_previous_block && decoded_samples == config.frame_size;
+    bool same_as_previous =
+        have_previous_block && decoded_samples == config.playout_frame_size;
 
     for (int i = 0; i < decoded_samples; ++i) {
         float sample = pcm[static_cast<size_t>(i)];
@@ -351,8 +408,9 @@ void inspect_samples(const std::array<float, MAX_FRAME_SAMPLES>& pcm, int decode
         metrics.repeated_blocks++;
     }
 
-    if (decoded_samples == config.frame_size) {
-        std::copy_n(pcm.begin(), static_cast<size_t>(config.frame_size), previous_block.begin());
+    if (decoded_samples == config.playout_frame_size) {
+        std::copy_n(pcm.begin(), static_cast<size_t>(config.playout_frame_size),
+                    previous_block.begin());
         have_previous_block = true;
     }
 }
@@ -366,32 +424,43 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
 
     bool buffer_ready = false;
     std::array<float, MAX_FRAME_SAMPLES> pcm{};
-    std::vector<float> previous_block(static_cast<size_t>(config.frame_size), 0.0F);
+    std::deque<float> pcm_fifo;
+    std::vector<float> previous_block(static_cast<size_t>(config.playout_frame_size), 0.0F);
     bool have_previous_block = false;
     const double playout_rate =
         static_cast<double>(SAMPLE_RATE) * (1.0 + (playout_ppm / 1'000'000.0));
     auto frame_duration = std::chrono::duration_cast<clock_type::duration>(
-        std::chrono::duration<double>(static_cast<double>(config.frame_size) / playout_rate));
+        std::chrono::duration<double>(static_cast<double>(config.playout_frame_size) /
+                                      playout_rate));
+    const int total_playout_ticks =
+        static_cast<int>(
+            (static_cast<int64_t>(config.total_packets) * config.send_frame_size +
+             config.playout_frame_size - 1) /
+            config.playout_frame_size) +
+        80;
 
-    for (int tick = 0; tick < config.total_packets + 80; ++tick) {
+    for (int tick = 0; tick < total_playout_ticks; ++tick) {
         std::this_thread::sleep_until(start_time + frame_duration * tick);
-        if (tick % std::max(1, SAMPLE_RATE / config.frame_size) == 0) {
+        if (tick % std::max(1, SAMPLE_RATE / config.playout_frame_size) == 0) {
             receiver.send_alive();
         }
 
         int current_queue_depth = static_cast<int>(receiver.queue_size());
         metrics.final_queue_depth = current_queue_depth;
         metrics.max_queue_depth = std::max(metrics.max_queue_depth, current_queue_depth);
-        if (!buffer_ready && current_queue_depth >= config.jitter_min_packets) {
+        if (!buffer_ready &&
+            (current_queue_depth >= config.jitter_min_packets ||
+             static_cast<int>(pcm_fifo.size()) >= config.playout_frame_size)) {
             buffer_ready = true;
         }
 
-        int output_base_sample = tick * config.frame_size;
+        int output_base_sample = tick * config.playout_frame_size;
         if (!buffer_ready) {
             continue;
         }
 
-        if (current_queue_depth == 0 && receiver.received_count() >= config.total_packets) {
+        if (current_queue_depth == 0 && pcm_fifo.empty() &&
+            receiver.received_count() >= config.total_packets) {
             break;
         }
 
@@ -401,27 +470,72 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             std::min(metrics.min_queue_depth_after_ready, current_queue_depth);
 
         ReceivedPacket packet;
-        if (receiver.pop_packet(packet)) {
-            int decoded_samples = 0;
-            if (config.codec == ProbeCodec::Opus) {
-                if (packet.encoded_bytes < 1 || packet.data[0] != PROBE_CODEC_OPUS) {
+        if (config.codec == ProbeCodec::PcmInt16) {
+            const int drain_target =
+                std::max(config.playout_frame_size, pcm_target_fifo_frames(config));
+            while (static_cast<int>(pcm_fifo.size()) < drain_target &&
+                   receiver.pop_packet(packet)) {
+                if (!decode_pcm_int16_packet(packet, config, pcm)) {
                     metrics.decode_failures++;
                     continue;
                 }
-                decoded_samples = decoder.decode_into(packet.data.data() + 1, packet.encoded_bytes - 1,
-                                                      pcm.data(), config.frame_size);
+                for (int i = 0; i < packet.frame_count; ++i) {
+                    pcm_fifo.push_back(pcm[static_cast<size_t>(i)]);
+                }
+                metrics.decoded_packets++;
+            }
+            trim_pcm_probe_fifo(pcm_fifo, config, metrics);
+            metrics.max_pcm_fifo_frames =
+                std::max(metrics.max_pcm_fifo_frames, static_cast<int>(pcm_fifo.size()));
+
+            if (static_cast<int>(pcm_fifo.size()) >= config.playout_frame_size) {
+                for (int i = 0; i < config.playout_frame_size; ++i) {
+                    pcm[static_cast<size_t>(i)] = pcm_fifo.front();
+                    pcm_fifo.pop_front();
+                }
+                inspect_samples(pcm, config.playout_frame_size, output_base_sample, config,
+                                metrics, previous_block, have_previous_block);
+            } else if (!pcm_fifo.empty()) {
+                const int available_frames = static_cast<int>(pcm_fifo.size());
+                for (int i = 0; i < available_frames; ++i) {
+                    pcm[static_cast<size_t>(i)] = pcm_fifo.front();
+                    pcm_fifo.pop_front();
+                }
+                std::fill(pcm.begin() + available_frames,
+                          pcm.begin() + config.playout_frame_size, 0.0F);
+                metrics.underruns++;
+                inspect_samples(pcm, config.playout_frame_size, output_base_sample, config,
+                                metrics, previous_block, have_previous_block);
+            } else if (receiver.received_count() < config.total_packets) {
+                metrics.underruns++;
+            } else {
+                break;
+            }
+            metrics.final_pcm_fifo_frames = static_cast<int>(pcm_fifo.size());
+            continue;
+        }
+
+        if (receiver.pop_packet(packet)) {
+            int decoded_samples = 0;
+            if (config.codec == ProbeCodec::Opus) {
+                if (packet.codec != AudioCodec::Opus) {
+                    metrics.decode_failures++;
+                    continue;
+                }
+                const int decode_frame_count =
+                    packet.frame_count > 0 ? packet.frame_count : config.playout_frame_size;
+                decoded_samples = decoder.decode_into(packet.data.data(), packet.payload_bytes,
+                                                      pcm.data(), decode_frame_count);
                 if (decoded_samples <= 0) {
                     metrics.decode_failures++;
                     continue;
                 }
-            } else if (decode_pcm_int16_packet(packet, config, pcm)) {
-                decoded_samples = config.frame_size;
             } else {
                 metrics.decode_failures++;
                 continue;
             }
             metrics.decoded_packets++;
-            if (decoded_samples != config.frame_size) {
+            if (decoded_samples != config.playout_frame_size) {
                 metrics.decoded_size_mismatches++;
             }
             inspect_samples(pcm, decoded_samples, output_base_sample, config, metrics,
@@ -429,7 +543,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
         } else if (receiver.received_count() < config.total_packets) {
             metrics.underruns++;
             if (config.codec == ProbeCodec::Opus) {
-                int plc_samples = decoder.decode_plc(pcm.data(), config.frame_size);
+                int plc_samples = decoder.decode_plc(pcm.data(), config.playout_frame_size);
                 if (plc_samples > 0) {
                     metrics.plc_frames++;
                     inspect_samples(pcm, plc_samples, output_base_sample, config, metrics,
@@ -450,35 +564,40 @@ void run_sender_loop(const ProbeConfig& config, ProbeSender& sender, ProbeMetric
         throw std::runtime_error("failed to create Opus encoder");
     }
 
-    std::vector<float> frame(static_cast<size_t>(config.frame_size), 0.0F);
+    std::vector<float> frame(static_cast<size_t>(config.send_frame_size), 0.0F);
     std::vector<unsigned char> encoded;
-    std::vector<unsigned char> pcm_payload(static_cast<size_t>(config.frame_size) * sizeof(int16_t));
+    std::vector<unsigned char> pcm_payload(static_cast<size_t>(config.send_frame_size) *
+                                           sizeof(int16_t));
     auto frame_duration =
         std::chrono::duration_cast<clock_type::duration>(std::chrono::duration<double>(
-            static_cast<double>(config.frame_size) / static_cast<double>(SAMPLE_RATE)));
+            static_cast<double>(config.send_frame_size) / static_cast<double>(SAMPLE_RATE)));
 
     for (int packet_index = 0; packet_index < config.total_packets; ++packet_index) {
         std::this_thread::sleep_until(start_time + frame_duration * packet_index);
-        if (packet_index % std::max(1, SAMPLE_RATE / config.frame_size) == 0) {
+        if (packet_index % std::max(1, SAMPLE_RATE / config.send_frame_size) == 0) {
             sender.send_alive();
         }
         fill_probe_frame(packet_index, config, frame);
         bool sent = false;
         if (config.codec == ProbeCodec::Opus) {
-            if (!encoder.encode(frame.data(), config.frame_size, encoded)) {
+            if (!encoder.encode(frame.data(), config.send_frame_size, encoded)) {
                 metrics.encode_failures++;
                 continue;
             }
-            sent = sender.send_audio_packet(PROBE_CODEC_OPUS, encoded.data(), encoded.size());
+            sent = sender.send_audio_packet(AudioCodec::Opus, static_cast<uint32_t>(packet_index),
+                                            static_cast<uint16_t>(config.send_frame_size),
+                                            encoded.data(), encoded.size());
         } else {
-            for (int i = 0; i < config.frame_size; ++i) {
+            for (int i = 0; i < config.send_frame_size; ++i) {
                 float clamped = std::clamp(frame[static_cast<size_t>(i)], -1.0F, 1.0F);
                 auto sample = static_cast<int16_t>(std::lrint(clamped * 32767.0F));
                 std::memcpy(pcm_payload.data() + static_cast<size_t>(i) * sizeof(sample), &sample,
                             sizeof(sample));
             }
-            sent = sender.send_audio_packet(PROBE_CODEC_PCM_INT16, pcm_payload.data(),
-                                            pcm_payload.size());
+            sent = sender.send_audio_packet(AudioCodec::PcmInt16,
+                                            static_cast<uint32_t>(packet_index),
+                                            static_cast<uint16_t>(config.send_frame_size),
+                                            pcm_payload.data(), pcm_payload.size());
         }
         if (sent) {
             metrics.sent_packets++;
@@ -530,7 +649,7 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     result.config = config;
     result.metrics = metrics;
 
-    int injected_sample = IMPULSE_PACKET * config.frame_size;
+    int injected_sample = IMPULSE_PACKET * config.send_frame_size;
     result.latency_samples = metrics.detected_output_sample >= 0
                                  ? metrics.detected_output_sample - injected_sample
                                  : -1;
@@ -541,10 +660,19 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
 }
 
 bool has_corruption_indicators(const ProbeResult& result) {
+    const auto& c = result.config;
     const auto& m = result.metrics;
-    return result.latency_samples < 0 || m.encode_failures > 0 || m.plc_frames > 0 ||
-           m.underruns > 0 || m.decode_failures > 0 || m.decoded_size_mismatches > 0 ||
-           m.non_finite_samples > 0 || m.out_of_range_samples > 0;
+    const int total_playout_ticks =
+        static_cast<int>(
+            (static_cast<int64_t>(c.total_packets) * c.send_frame_size +
+             c.playout_frame_size - 1) /
+            c.playout_frame_size);
+    const int sustained_underrun_threshold = std::max(5, total_playout_ticks / 100);
+    return result.latency_samples < 0 || m.encode_failures > 0 ||
+           m.plc_frames > sustained_underrun_threshold ||
+           m.underruns > sustained_underrun_threshold || m.decode_failures > 0 ||
+           m.decoded_size_mismatches > 0 || m.non_finite_samples > 0 ||
+           m.out_of_range_samples > 0;
 }
 
 void print_result(const Args& args, const ProbeResult& result) {
@@ -562,7 +690,8 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "server: " << args.host << ":" << args.port << "\n";
     std::cout << "codec: " << codec_name(c.codec) << "\n";
     std::cout << "sample_rate: " << SAMPLE_RATE << "\n";
-    std::cout << "frames_per_packet: " << c.frame_size << "\n";
+    std::cout << "send_frames_per_packet: " << c.send_frame_size << "\n";
+    std::cout << "playout_frames_per_tick: " << c.playout_frame_size << "\n";
     std::cout << "jitter_min_packets: " << c.jitter_min_packets << "\n";
     std::cout << "playout_ppm: " << args.playout_ppm << "\n";
     std::cout << "total_packets: " << c.total_packets << "\n";
@@ -580,7 +709,16 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "min_queue_depth_after_ready: " << min_queue << "\n";
     std::cout << "max_queue_depth: " << m.max_queue_depth << "\n";
     std::cout << "final_queue_depth: " << m.final_queue_depth << "\n";
+    std::cout << "max_pcm_fifo_frames: " << m.max_pcm_fifo_frames << "\n";
+    std::cout << "final_pcm_fifo_frames: " << m.final_pcm_fifo_frames << "\n";
+    std::cout << "pcm_drift_corrections: " << m.pcm_drift_corrections << "\n";
     std::cout << "underruns: " << m.underruns << "\n";
+    const double duration_sec =
+        static_cast<double>(c.total_packets) * static_cast<double>(c.send_frame_size) /
+        static_cast<double>(SAMPLE_RATE);
+    std::cout << "underrun_rate_per_sec: "
+              << (duration_sec > 0.0 ? static_cast<double>(m.underruns) / duration_sec : 0.0)
+              << "\n";
     std::cout << "plc_frames: " << m.plc_frames << "\n";
     std::cout << "decode_failures: " << m.decode_failures << "\n";
     std::cout << "decoded_size_mismatches: " << m.decoded_size_mismatches << "\n";
@@ -594,8 +732,8 @@ void print_result(const Args& args, const ProbeResult& result) {
 }
 
 void print_sweep_header() {
-    std::cout << "codec,frames,jitter,playout_ppm,latency_ms,latency_samples,sent,received,decoded,max_queue,"
-                 "avg_queue,queue_drift,min_queue,final_queue,encode_failures,underruns,plc,"
+    std::cout << "codec,send_frames,playout_frames,jitter,playout_ppm,latency_ms,latency_samples,sent,received,decoded,max_queue,"
+                 "avg_queue,queue_drift,min_queue,final_queue,max_pcm_fifo,final_pcm_fifo,pcm_drift_corrections,encode_failures,underruns,plc,"
                  "decode_failures,size_mismatch,non_finite,out_of_range,repeated_blocks,"
                  "max_discontinuity,status\n";
 }
@@ -611,11 +749,14 @@ void print_sweep_row(const Args& args, const ProbeResult& result) {
         m.min_queue_depth_after_ready == std::numeric_limits<int>::max()
             ? 0
             : m.min_queue_depth_after_ready;
-    std::cout << codec_name(c.codec) << ',' << c.frame_size << ',' << c.jitter_min_packets << ','
+    std::cout << codec_name(c.codec) << ',' << c.send_frame_size << ','
+              << c.playout_frame_size << ',' << c.jitter_min_packets << ','
               << args.playout_ppm << ',' << result.latency_ms << ',' << result.latency_samples << ',' << m.sent_packets << ','
               << m.received_packets << ',' << m.decoded_packets << ',' << m.max_queue_depth << ','
               << avg_queue << ',' << (avg_queue - static_cast<double>(c.jitter_min_packets)) << ','
-              << min_queue << ',' << m.final_queue_depth << ',' << m.encode_failures << ','
+              << min_queue << ',' << m.final_queue_depth << ',' << m.max_pcm_fifo_frames << ','
+              << m.final_pcm_fifo_frames << ',' << m.pcm_drift_corrections << ','
+              << m.encode_failures << ','
               << m.underruns << ',' << m.plc_frames << ',' << m.decode_failures << ','
               << m.decoded_size_mismatches << ',' << m.non_finite_samples << ','
               << m.out_of_range_samples << ',' << m.repeated_blocks << ','
@@ -638,7 +779,12 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--receiver-user" && i + 1 < argc) {
             args.receiver_user = argv[++i];
         } else if (arg == "--frames" && i + 1 < argc) {
-            args.config.frame_size = std::stoi(argv[++i]);
+            args.config.send_frame_size = std::stoi(argv[++i]);
+            args.config.playout_frame_size = args.config.send_frame_size;
+        } else if (arg == "--send-frames" && i + 1 < argc) {
+            args.config.send_frame_size = std::stoi(argv[++i]);
+        } else if (arg == "--playout-frames" && i + 1 < argc) {
+            args.config.playout_frame_size = std::stoi(argv[++i]);
         } else if (arg == "--jitter" && i + 1 < argc) {
             args.config.jitter_min_packets = std::stoi(argv[++i]);
         } else if (arg == "--packets" && i + 1 < argc) {
@@ -664,7 +810,18 @@ Args parse_args(int argc, char** argv) {
         const int64_t total_samples =
             static_cast<int64_t>(args.duration_seconds) * static_cast<int64_t>(SAMPLE_RATE);
         args.config.total_packets =
-            static_cast<int>((total_samples + args.config.frame_size - 1) / args.config.frame_size);
+            static_cast<int>((total_samples + args.config.send_frame_size - 1) /
+                             args.config.send_frame_size);
+    }
+    if (args.config.send_frame_size <= 0 || args.config.playout_frame_size <= 0 ||
+        args.config.send_frame_size > MAX_FRAME_SAMPLES ||
+        args.config.playout_frame_size > MAX_FRAME_SAMPLES) {
+        throw std::runtime_error("frame sizes must be between 1 and " +
+                                 std::to_string(MAX_FRAME_SAMPLES));
+    }
+    if (args.config.codec == ProbeCodec::PcmInt16 &&
+        static_cast<size_t>(args.config.send_frame_size) * sizeof(int16_t) > AUDIO_BUF_SIZE) {
+        throw std::runtime_error("PCM send frame payload exceeds AudioHdrV2 payload capacity");
     }
     if (args.config.total_packets <= IMPULSE_PACKET) {
         throw std::runtime_error("--packets/--seconds must run past the impulse packet");
@@ -684,7 +841,7 @@ int main(int argc, char** argv) {
             print_sweep_header();
             for (int frames: frame_sizes) {
                 for (int jitter: jitter_values) {
-                    ProbeConfig config{frames, jitter, args.config.total_packets,
+                    ProbeConfig config{frames, frames, jitter, args.config.total_packets,
                                        args.config.codec};
                     ProbeResult result = run_probe(args, config);
                     print_sweep_row(args, result);
