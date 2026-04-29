@@ -206,20 +206,11 @@ The MVP room rules are intentionally small.
 
 The current native engine is good enough for the MVP path, but production needs broader coverage.
 
-Current blocker before starting this gate:
-
-- Cross-machine PCM is not yet correct between Windows and macOS.
-- The likely root cause is independent audio-device clock drift, not UDP routing.
-- The tracked finding is `specs/pcm-cross-platform-clock-sync.md`.
-- Do not treat manual PCM hold/drop/insert heuristics as the final design.
-- Cross-platform PCM should use a real streaming clock-sync/resampling layer if PCM remains a supported LAN/reference mode.
-
 ### Required
 
 - Continue real-device validation on Windows WASAPI.
 - Continue real-device validation on macOS CoreAudio.
 - Validate ASIO with real hardware if it remains supported.
-- Fix cross-machine PCM with adaptive receiver-side playout and resampling, or explicitly demote PCM to same-device/same-platform diagnostic mode.
 - Validate device switching during an active session.
 - Validate device unplug/replug behavior.
 - Add reconnect behavior for network loss.
