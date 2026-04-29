@@ -895,6 +895,76 @@ private:
         participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
     }
 
+    static bool append_pcm_packet_to_playout(ParticipantData& participant,
+                                             const OpusPacket& packet,
+                                             uint32_t participant_id) {
+        const uint16_t packet_frame_count =
+            packet.frame_count > 0
+                ? packet.frame_count
+                : static_cast<uint16_t>(packet.get_size() / sizeof(int16_t));
+        const uint8_t packet_channels = packet.channels > 0 ? packet.channels : 1;
+        const size_t expected_bytes =
+            static_cast<size_t>(packet_frame_count) * packet_channels * sizeof(int16_t);
+
+        if (packet.get_size() != expected_bytes) {
+            static int pcm_size_mismatch_count = 0;
+            if (++pcm_size_mismatch_count % 100 == 0) {
+                Log::warn(
+                    "Malformed PCM packet for participant {}: got {} bytes, expected {} "
+                    "(frames={}, channels={})",
+                    participant_id, packet.get_size(), expected_bytes, packet_frame_count,
+                    packet_channels);
+            }
+            return false;
+        }
+        if (packet_channels != 1) {
+            static int pcm_channel_mismatch_count = 0;
+            if (++pcm_channel_mismatch_count % 100 == 0) {
+                Log::warn("Unsupported PCM channel count for participant {}: {}", participant_id,
+                          packet_channels);
+            }
+            return false;
+        }
+
+        for (uint16_t i = 0; i < packet_frame_count; ++i) {
+            int16_t sample = 0;
+            std::memcpy(&sample, packet.get_data() + i * sizeof(sample), sizeof(sample));
+            participant.pcm_buffer[i] = static_cast<float>(sample) / 32767.0F;
+        }
+
+        append_pcm_playout_samples(participant, participant.pcm_buffer.data(), packet_frame_count);
+        const float rms =
+            audio_analysis::calculate_rms(participant.pcm_buffer.data(), packet_frame_count);
+        participant.current_level = rms;
+        const bool was_speaking = participant.is_speaking;
+        participant.is_speaking = audio_analysis::detect_voice_activity(rms);
+        if (participant.is_speaking && !was_speaking) {
+            Log::debug("Participant {} started speaking (level: {:.4f})", participant_id, rms);
+        } else if (!participant.is_speaking && was_speaking) {
+            Log::debug("Participant {} stopped speaking", participant_id);
+        }
+        return true;
+    }
+
+    static void drain_pcm_packets_to_playout(ParticipantData& participant, size_t callback_frames,
+                                             uint32_t participant_id) {
+        const size_t max_frames = pcm_max_buffered_frames(callback_frames);
+        size_t drained_packets = 0;
+        while (participant.pcm_playout_buffered_frames < max_frames && drained_packets < 8) {
+            OpusPacket packet;
+            if (!participant.opus_queue.try_dequeue(packet)) {
+                break;
+            }
+            if (packet.codec != AudioCodec::PcmInt16) {
+                participant.opus_queue.enqueue(packet);
+                break;
+            }
+            append_pcm_packet_to_playout(participant, packet, participant_id);
+            drained_packets++;
+        }
+        trim_pcm_playout_buffer(participant, callback_frames);
+    }
+
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
         size_t previous_max = participant.queue_depth_max.load(std::memory_order_relaxed);
         while (depth > previous_max &&
@@ -1396,6 +1466,10 @@ private:
                 }
             }
 
+            if (participant.last_codec == AudioCodec::PcmInt16) {
+                drain_pcm_packets_to_playout(participant, frame_count, participant_id);
+            }
+
             if (participant.last_codec == AudioCodec::Opus &&
                 participant.opus_pcm_buffered_frames >= frame_count) {
                 if (out_channels == 1) {
@@ -1479,41 +1553,10 @@ private:
                 participant.last_codec = opus_packet.codec;
                 int decoded_samples = 0;
                 if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    const uint16_t packet_frame_count =
-                        opus_packet.frame_count > 0
-                            ? opus_packet.frame_count
-                            : static_cast<uint16_t>(opus_packet.get_size() / sizeof(int16_t));
-                    const uint8_t packet_channels =
-                        opus_packet.channels > 0 ? opus_packet.channels : 1;
-                    const size_t expected_bytes =
-                        static_cast<size_t>(packet_frame_count) * packet_channels *
-                        sizeof(int16_t);
-                    if (opus_packet.get_size() != expected_bytes) {
-                        static int pcm_size_mismatch_count = 0;
-                        if (++pcm_size_mismatch_count % 100 == 0) {
-                            Log::warn(
-                                "Malformed PCM packet for participant {}: got {} bytes, "
-                                "expected {} (frames={}, channels={})",
-                                participant_id, opus_packet.get_size(), expected_bytes,
-                                packet_frame_count, packet_channels);
-                        }
+                    if (!append_pcm_packet_to_playout(participant, opus_packet, participant_id)) {
                         return;
                     }
-                    if (packet_channels != 1) {
-                        static int pcm_channel_mismatch_count = 0;
-                        if (++pcm_channel_mismatch_count % 100 == 0) {
-                            Log::warn("Unsupported PCM channel count for participant {}: {}",
-                                      participant_id, packet_channels);
-                        }
-                        return;
-                    }
-                    for (uint16_t i = 0; i < packet_frame_count; ++i) {
-                        int16_t sample = 0;
-                        std::memcpy(&sample, opus_packet.get_data() + i * sizeof(sample),
-                                    sizeof(sample));
-                        participant.pcm_buffer[i] = static_cast<float>(sample) / 32767.0F;
-                    }
-                    decoded_samples = static_cast<int>(packet_frame_count);
+                    decoded_samples = static_cast<int>(opus_packet.frame_count);
                 } else {
                     const int decode_frame_count =
                         opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
@@ -1632,8 +1675,6 @@ private:
                 }
 
                 if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    append_pcm_playout_samples(participant, participant.pcm_buffer.data(),
-                                               static_cast<size_t>(decoded_samples));
                     trim_pcm_playout_buffer(participant, frame_count);
 
                     while (participant.pcm_playout_buffered_frames < frame_count) {
@@ -1643,29 +1684,10 @@ private:
                             break;
                         }
 
-                        const uint16_t next_frame_count =
-                            next_packet.frame_count > 0
-                                ? next_packet.frame_count
-                                : static_cast<uint16_t>(next_packet.get_size() / sizeof(int16_t));
-                        const uint8_t next_channels =
-                            next_packet.channels > 0 ? next_packet.channels : 1;
-                        const size_t next_expected_bytes =
-                            static_cast<size_t>(next_frame_count) * next_channels *
-                            sizeof(int16_t);
-                        if (next_packet.get_size() != next_expected_bytes ||
-                            next_channels != 1) {
+                        if (!append_pcm_packet_to_playout(participant, next_packet,
+                                                          participant_id)) {
                             break;
                         }
-
-                        for (uint16_t i = 0; i < next_frame_count; ++i) {
-                            int16_t sample = 0;
-                            std::memcpy(&sample, next_packet.get_data() + i * sizeof(sample),
-                                        sizeof(sample));
-                            participant.pcm_buffer[i] =
-                                static_cast<float>(sample) / 32767.0F;
-                        }
-                        append_pcm_playout_samples(participant, participant.pcm_buffer.data(),
-                                                   next_frame_count);
                         trim_pcm_playout_buffer(participant, frame_count);
                     }
 
