@@ -50,15 +50,15 @@ public:
         return true;
     }
 
-    bool read(float* output, size_t frame_count, size_t target_input_frames) {
+    bool read(float* output, size_t frame_count, size_t target_buffered_frames) {
         if (!valid_ || output == nullptr || frame_count == 0) {
             return false;
         }
 
-        update_ratio(target_input_frames);
+        update_ratio(target_buffered_frames);
 
         while (output_frames_ < frame_count && input_frames_ > 0) {
-            if (!process_once()) {
+            if (!process_once(frame_count - output_frames_)) {
                 break;
             }
         }
@@ -90,6 +90,10 @@ public:
         return output_frames_;
     }
 
+    size_t buffered_frames() const {
+        return input_frames_ + output_frames_;
+    }
+
     double ratio() const {
         return ratio_;
     }
@@ -107,8 +111,9 @@ private:
     static constexpr size_t kOutputCapacityFrames = 4096;
     static constexpr double kMaxCorrection = 0.005;
 
-    bool process_once() {
-        const size_t output_room = output_.size() - output_frames_;
+    bool process_once(size_t requested_output_frames) {
+        const size_t output_room =
+            std::min(output_.size() - output_frames_, requested_output_frames);
         if (output_room == 0) {
             return false;
         }
@@ -137,15 +142,15 @@ private:
         return data.input_frames_used > 0 || data.output_frames_gen > 0;
     }
 
-    void update_ratio(size_t target_input_frames) {
-        if (target_input_frames == 0) {
+    void update_ratio(size_t target_buffered_frames) {
+        if (target_buffered_frames == 0) {
             ratio_ = 1.0;
             return;
         }
 
         const double error =
-            static_cast<double>(input_frames_) - static_cast<double>(target_input_frames);
-        const double normalized = error / static_cast<double>(target_input_frames);
+            static_cast<double>(buffered_frames()) - static_cast<double>(target_buffered_frames);
+        const double normalized = error / static_cast<double>(target_buffered_frames);
         const double correction = std::clamp(normalized * 0.001, -kMaxCorrection, kMaxCorrection);
         ratio_ = std::clamp(1.0 - correction, 1.0 - kMaxCorrection, 1.0 + kMaxCorrection);
     }

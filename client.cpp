@@ -969,7 +969,7 @@ private:
             participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_input_frames();
+        participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_frames();
         participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
                                                    std::memory_order_relaxed);
         const auto ratio_ppm =
@@ -992,7 +992,7 @@ private:
                                              uint32_t participant_id) {
         const size_t max_frames = pcm_max_buffered_frames(callback_frames);
         size_t drained_packets = 0;
-        while (participant.pcm_resampler.buffered_input_frames() < max_frames && drained_packets < 8) {
+        while (participant.pcm_resampler.buffered_frames() < max_frames && drained_packets < 8) {
             OpusPacket packet;
             if (!participant.opus_queue.try_dequeue(packet)) {
                 break;
@@ -1004,7 +1004,7 @@ private:
             append_pcm_packet_to_playout(participant, packet, participant_id);
             drained_packets++;
         }
-        participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_input_frames();
+        participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_frames();
         participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
                                                    std::memory_order_relaxed);
     }
@@ -1500,10 +1500,10 @@ private:
 
             if (!participant.buffer_ready &&
                 participant.last_codec == AudioCodec::PcmInt16 &&
-                participant.pcm_resampler.buffered_input_frames() >= pcm_start_frames(frame_count)) {
+                participant.pcm_resampler.buffered_frames() >= pcm_start_frames(frame_count)) {
                 participant.buffer_ready = true;
                 Log::info("PCM playout ready for participant {} ({} frames)", participant_id,
-                          participant.pcm_resampler.buffered_input_frames());
+                          participant.pcm_resampler.buffered_frames());
             }
 
             if (!participant.buffer_ready) {
@@ -1560,7 +1560,7 @@ private:
                         output_buffer, participant.pcm_playout_buffer.data(), frame_count,
                         out_channels, participant.gain);
                 }
-                participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_input_frames();
+                participant.pcm_playout_buffered_frames = participant.pcm_resampler.buffered_frames();
                 participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
                                                            std::memory_order_relaxed);
                 const auto ratio_ppm =
@@ -1733,7 +1733,7 @@ private:
                 }
 
                 if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    while (participant.pcm_resampler.buffered_input_frames() <
+                    while (participant.pcm_resampler.buffered_frames() <
                            pcm_start_frames(frame_count)) {
                         OpusPacket next_packet;
                         if (!participant.opus_queue.try_dequeue(next_packet) ||
@@ -1748,7 +1748,7 @@ private:
                     }
 
                     if (!participant.buffer_ready &&
-                        participant.pcm_resampler.buffered_input_frames() >=
+                        participant.pcm_resampler.buffered_frames() >=
                             pcm_start_frames(frame_count)) {
                         participant.buffer_ready = true;
                     }
@@ -1774,7 +1774,7 @@ private:
                                 out_channels, participant.gain);
                         }
                         participant.pcm_playout_buffered_frames =
-                            participant.pcm_resampler.buffered_input_frames();
+                            participant.pcm_resampler.buffered_frames();
                         participant.pcm_playout_depth_frames.store(
                             participant.pcm_playout_buffered_frames, std::memory_order_relaxed);
                         const auto ratio_ppm = static_cast<int64_t>(

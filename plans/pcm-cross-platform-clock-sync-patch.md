@@ -56,8 +56,10 @@ This patch exists because same-platform PCM works, but cross-machine Windows/mac
   - [x] Opus still works.
     - `latency_probe --codec opus --frames 120 --seconds 5 --jitter 6` ran with `0` underruns, `0` PLC, and `0` decode failures.
 - [ ] Validate with user cross-machine.
-  - Windows to macOS PCM audible and clear.
-  - macOS to Windows PCM audible and clear.
+  - [x] Windows to macOS PCM audible and clear after first resampler patch.
+  - [ ] macOS to Windows PCM audible and clear.
+    - Result: still robotic after first resampler patch.
+    - Follow-up fix: resampler now generates only the requested callback frames and measures total buffered input+output frames, instead of draining the input side into a large output buffer.
   - macOS to macOS PCM remains low-latency.
 
 ## Acceptance Rule
