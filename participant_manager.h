@@ -128,6 +128,9 @@ public:
             info.pcm_concealment_frames =
                 data->pcm_concealment_frames.load(std::memory_order_relaxed);
             info.pcm_drift_drops = data->pcm_drift_drops.load(std::memory_order_relaxed);
+            info.pcm_drift_inserts = data->pcm_drift_inserts.load(std::memory_order_relaxed);
+            info.pcm_playout_depth_frames =
+                data->pcm_playout_depth_frames.load(std::memory_order_relaxed);
             result.push_back(info);
         }
 

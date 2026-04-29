@@ -46,6 +46,8 @@ struct ParticipantData {
     bool                                    last_pcm_valid = false;
     bool                                    pcm_concealment_used = false;
     std::atomic<uint64_t>                   pcm_drift_drops{0};
+    std::atomic<uint64_t>                   pcm_drift_inserts{0};
+    std::atomic<size_t>                     pcm_playout_depth_frames{0};
 
     // Participant state
     std::string                           profile_id;
@@ -107,4 +109,6 @@ struct ParticipantInfo {
     uint64_t jitter_age_drops;
     uint64_t pcm_concealment_frames;
     uint64_t pcm_drift_drops;
+    uint64_t pcm_drift_inserts;
+    size_t   pcm_playout_depth_frames;
 };

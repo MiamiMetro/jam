@@ -847,6 +847,7 @@ private:
     static void consume_pcm_playout_buffer(ParticipantData& participant, size_t frame_count) {
         if (participant.pcm_playout_buffered_frames <= frame_count) {
             participant.pcm_playout_buffered_frames = 0;
+            participant.pcm_playout_depth_frames.store(0, std::memory_order_relaxed);
             return;
         }
 
@@ -856,6 +857,7 @@ private:
                       static_cast<std::ptrdiff_t>(participant.pcm_playout_buffered_frames),
                   participant.pcm_playout_buffer.begin());
         participant.pcm_playout_buffered_frames = remaining;
+        participant.pcm_playout_depth_frames.store(remaining, std::memory_order_relaxed);
     }
 
     static bool append_pcm_playout_samples(ParticipantData& participant, const float* samples,
@@ -871,6 +873,8 @@ private:
                     participant.pcm_playout_buffer.begin() +
                         static_cast<std::ptrdiff_t>(participant.pcm_playout_buffered_frames));
         participant.pcm_playout_buffered_frames += frame_count;
+        participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
+                                                   std::memory_order_relaxed);
         return true;
     }
 
@@ -880,6 +884,10 @@ private:
 
     static size_t pcm_max_buffered_frames(size_t callback_frames) {
         return callback_frames * 6;
+    }
+
+    static size_t pcm_target_frames(size_t callback_frames) {
+        return callback_frames * 3;
     }
 
     static void trim_pcm_playout_buffer(ParticipantData& participant, size_t callback_frames) {
@@ -893,6 +901,31 @@ private:
         consume_pcm_playout_buffer(participant, drop_frames);
         participant.pcm_drift_drops.fetch_add(1, std::memory_order_relaxed);
         participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    static void apply_pcm_drift_correction(ParticipantData& participant, size_t callback_frames) {
+        const size_t high_water = pcm_target_frames(callback_frames) + callback_frames * 2;
+        const size_t low_water = pcm_target_frames(callback_frames) > callback_frames
+                                     ? pcm_target_frames(callback_frames) - callback_frames
+                                     : callback_frames;
+
+        if (participant.pcm_playout_buffered_frames > high_water) {
+            consume_pcm_playout_buffer(participant, 1);
+            participant.pcm_drift_drops.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        if (participant.pcm_playout_buffered_frames < low_water &&
+            participant.pcm_playout_buffered_frames > 0 &&
+            participant.pcm_playout_buffered_frames < participant.pcm_playout_buffer.size()) {
+            const float last_sample =
+                participant.pcm_playout_buffer[participant.pcm_playout_buffered_frames - 1];
+            participant.pcm_playout_buffer[participant.pcm_playout_buffered_frames] = last_sample;
+            participant.pcm_playout_buffered_frames++;
+            participant.pcm_playout_depth_frames.store(participant.pcm_playout_buffered_frames,
+                                                       std::memory_order_relaxed);
+            participant.pcm_drift_inserts.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     static bool append_pcm_packet_to_playout(ParticipantData& participant,
@@ -1067,6 +1100,7 @@ private:
             double jitter_age_per_sec;
             double pcm_hold_per_sec;
             double pcm_drift_drop_per_sec;
+            double pcm_drift_insert_per_sec;
         };
 
         auto calculate_rate = [](uint64_t current, uint64_t previous, double elapsed_sec) {
@@ -1120,38 +1154,45 @@ private:
                 calculate_rate(p.pcm_concealment_frames, previous.pcm_concealment_frames,
                                elapsed_sec),
                 calculate_rate(p.pcm_drift_drops, previous.pcm_drift_drops, elapsed_sec),
+                calculate_rate(p.pcm_drift_inserts, previous.pcm_drift_inserts, elapsed_sec),
             };
             previous.jitter_depth_drops = p.jitter_depth_drops;
             previous.jitter_age_drops = p.jitter_age_drops;
             previous.pcm_concealment_frames = p.pcm_concealment_frames;
             previous.pcm_drift_drops = p.pcm_drift_drops;
+            previous.pcm_drift_inserts = p.pcm_drift_inserts;
 
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
-                "age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
-                "drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
+                "age_avg_ms={:.1f} underruns={} pcm_buf={} pcm_hold/drop/ins={}/{}/{} "
+                "drops q/age={}/{} seq gap/late={}/{} "
+                "drop_rate pcm/q/hold/drift/ins={:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.packet_age_avg_ms, p.underrun_count,
-                p.pcm_concealment_frames, p.pcm_drift_drops,
+                p.pcm_playout_depth_frames, p.pcm_concealment_frames, p.pcm_drift_drops,
+                p.pcm_drift_inserts,
                 p.jitter_depth_drops, p.jitter_age_drops, p.sequence_gaps,
                 p.sequence_late_or_reordered, drop_rate.pcm_send_per_sec,
                 drop_rate.jitter_depth_per_sec, drop_rate.pcm_hold_per_sec,
-                drop_rate.pcm_drift_drop_per_sec);
+                drop_rate.pcm_drift_drop_per_sec, drop_rate.pcm_drift_insert_per_sec);
 
             if (elapsed_sec > 0.0 &&
                 (drop_rate.pcm_send_per_sec > 5.0 ||
                  drop_rate.jitter_depth_per_sec > 100.0 ||
                  drop_rate.jitter_age_per_sec > 5.0 ||
                  drop_rate.pcm_hold_per_sec > 5.0 ||
-                 drop_rate.pcm_drift_drop_per_sec > 5.0)) {
+                 drop_rate.pcm_drift_drop_per_sec > 5.0 ||
+                 drop_rate.pcm_drift_insert_per_sec > 5.0)) {
                 Log::warn(
                     "Audio health warning for participant {}: likely corrupt/robotic risk "
                     "(pcm_drop_rate={:.1f}/s opus_drop_rate={:.1f}/s "
                     "queue_drop_rate={:.1f}/s age_drop_rate={:.1f}/s "
-                    "pcm_hold_rate={:.1f}/s pcm_drift_drop_rate={:.1f}/s)",
+                    "pcm_hold_rate={:.1f}/s pcm_drift_drop_rate={:.1f}/s "
+                    "pcm_drift_insert_rate={:.1f}/s)",
                     p.id, drop_rate.pcm_send_per_sec, drop_rate.opus_send_per_sec,
                     drop_rate.jitter_depth_per_sec, drop_rate.jitter_age_per_sec,
-                    drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec);
+                    drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec,
+                    drop_rate.pcm_drift_insert_per_sec);
             }
         }
     }
@@ -1468,6 +1509,7 @@ private:
 
             if (participant.last_codec == AudioCodec::PcmInt16) {
                 drain_pcm_packets_to_playout(participant, frame_count, participant_id);
+                apply_pcm_drift_correction(participant, frame_count);
             }
 
             if (participant.last_codec == AudioCodec::Opus &&
@@ -1721,7 +1763,7 @@ private:
 
                 // Adaptive jitter buffer: track queue size history and adjust minimum
                 size_t current_queue_size = participant.opus_queue.size_approx();
-                if (opus_packet.codec == AudioCodec::PcmInt16 &&
+                if (opus_packet.codec != AudioCodec::PcmInt16 &&
                     current_queue_size > pcm_drift_drop_threshold(participant)) {
                     OpusPacket discarded;
                     if (participant.opus_queue.try_dequeue(discarded)) {
@@ -2015,6 +2057,7 @@ private:
         uint64_t jitter_age_drops   = 0;
         uint64_t pcm_concealment_frames = 0;
         uint64_t pcm_drift_drops = 0;
+        uint64_t pcm_drift_inserts = 0;
     };
     std::chrono::steady_clock::time_point                  last_audio_health_log_time_{};
     uint64_t                                               last_pcm_send_drops_  = 0;
@@ -2406,10 +2449,19 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                 ImGui::Text("PCM hold: %llu",
                             static_cast<unsigned long long>(p.pcm_concealment_frames));
             }
+            if (p.pcm_playout_depth_frames > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("PCM buf: %zu", p.pcm_playout_depth_frames);
+            }
             if (p.pcm_drift_drops > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::Text("PCM drift drop: %llu",
                             static_cast<unsigned long long>(p.pcm_drift_drops));
+            }
+            if (p.pcm_drift_inserts > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("PCM drift ins: %llu",
+                            static_cast<unsigned long long>(p.pcm_drift_inserts));
             }
             if (!p.buffer_ready) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
