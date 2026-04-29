@@ -874,6 +874,27 @@ private:
         return true;
     }
 
+    static size_t pcm_start_frames(size_t callback_frames) {
+        return callback_frames * 2;
+    }
+
+    static size_t pcm_max_buffered_frames(size_t callback_frames) {
+        return callback_frames * 6;
+    }
+
+    static void trim_pcm_playout_buffer(ParticipantData& participant, size_t callback_frames) {
+        const size_t max_frames = pcm_max_buffered_frames(callback_frames);
+        if (participant.pcm_playout_buffered_frames <= max_frames) {
+            return;
+        }
+
+        const size_t drop_frames =
+            std::min(participant.pcm_playout_buffered_frames - max_frames, callback_frames);
+        consume_pcm_playout_buffer(participant, drop_frames);
+        participant.pcm_drift_drops.fetch_add(1, std::memory_order_relaxed);
+        participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+    }
+
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
         size_t previous_max = participant.queue_depth_max.load(std::memory_order_relaxed);
         while (depth > previous_max &&
@@ -1355,6 +1376,14 @@ private:
                 return;
             }
 
+            if (!participant.buffer_ready &&
+                participant.last_codec == AudioCodec::PcmInt16 &&
+                participant.pcm_playout_buffered_frames >= pcm_start_frames(frame_count)) {
+                participant.buffer_ready = true;
+                Log::info("PCM playout ready for participant {} ({} frames)", participant_id,
+                          participant.pcm_playout_buffered_frames);
+            }
+
             if (!participant.buffer_ready) {
                 const size_t queue_size = participant.opus_queue.size_approx();
                 observe_participant_queue_depth(participant, queue_size);
@@ -1605,6 +1634,7 @@ private:
                 if (opus_packet.codec == AudioCodec::PcmInt16) {
                     append_pcm_playout_samples(participant, participant.pcm_buffer.data(),
                                                static_cast<size_t>(decoded_samples));
+                    trim_pcm_playout_buffer(participant, frame_count);
 
                     while (participant.pcm_playout_buffered_frames < frame_count) {
                         OpusPacket next_packet;
@@ -1636,6 +1666,12 @@ private:
                         }
                         append_pcm_playout_samples(participant, participant.pcm_buffer.data(),
                                                    next_frame_count);
+                        trim_pcm_playout_buffer(participant, frame_count);
+                    }
+
+                    if (!participant.buffer_ready &&
+                        participant.pcm_playout_buffered_frames >= pcm_start_frames(frame_count)) {
+                        participant.buffer_ready = true;
                     }
 
                     if (participant.pcm_playout_buffered_frames >= frame_count) {
