@@ -73,7 +73,9 @@ Evidence:
 - Jamulus exposes jitter buffer controls for both the local client and the
   remote server.
 - Its manual says jitter buffer size is a quality-versus-delay tradeoff.
-- Its Auto mode is based on network and sound-card timing jitter.
+- Its Auto mode is measurement-driven over the live network jitter buffer
+  (sound-card buffer size affects the latency display; not directly confirmed
+  as an Auto-decision input).
 - Its protocol includes messages for requesting and setting jitter buffer size.
 - Its `CNetBufWithStats` runs multiple simulation buffers with different depths,
   tracks error rates, and chooses an auto setting through filtering and
@@ -168,18 +170,20 @@ addressing.
 
 Tasks:
 
-- [ ] Keep the current manual Opus jitter experiment uncommitted until local
+- [ ] Do not merge the manual Opus jitter experiment to `main` until local
       smoke and at least one cross-machine run are recorded.
 - [ ] Record Opus runs at jitter `0`, `3`, `5`, `8`, and `10`.
-- [ ] For each run, capture subjective result plus:
+- [ ] For each run, capture subjective result plus the counters the client
+      currently exposes or should expose (some are already in the
+      `client.cpp` stats line, others may need to be added or surfaced):
   - RTT range
-  - queue current/average/max
-  - packet age average/max
-  - underruns
-  - PLC count
-  - queue drops
-  - age drops
-  - send queue age
+  - `queue_drift_packets` and queue depth in packets
+  - `packet_age_avg_ms` (and a max if added)
+  - `underrun_count` (covers Opus PLC fills and silence fills today)
+  - `pcm_concealment_frames` when running in PCM mode
+  - `jitter_depth_drops`
+  - `jitter_age_drops`
+  - `sequence_gaps` / late packets
 - [ ] Record whether the network path is Ethernet, Wi-Fi, tunnel, or loopback.
 - [ ] Do not treat local same-device success as proof for LAN/Wi-Fi/tunnel.
 
@@ -189,6 +193,34 @@ Acceptance:
   what latency they add.
 - If results are inconsistent, the next gate is test harness first, not auto
   jitter first.
+
+### Gate 1.5: End-to-End Latency Budget
+
+Goal: know which contributor to latency dominates before tuning any one of
+them. Receiver-side jitter buffer is one term in the budget, not the whole
+budget. SonoBus exposes audio buffer size as a first-class user setting
+because they know capture/playout dominate; we should know the same numbers
+about ourselves before we keep tuning the middle term.
+
+Tasks:
+
+- [ ] First pass: instrument the contributors we can read today (callback
+      sizes, encode time, send-pacing deltas, queue depth, decode time) and
+      log per-second summaries. Do not block Gate 1 testing on this; fill
+      gaps incrementally.
+- [ ] Subsequent passes: add the contributors that need new probes (capture
+      buffer ms, network one-way delay or RTT/2, playout buffer ms) until
+      every term in the budget has a measured value.
+- [ ] Record the same set on macOS/CoreAudio, Windows/WASAPI, and any other
+      supported backend.
+- [ ] Compare measured end-to-end latency against the sum of the contributors.
+      Flag any unexplained gap as its own investigation.
+
+Acceptance:
+
+- Every later "we lowered latency" claim has a named, measured contributor.
+- The dominant contributor is known per platform, so later gates target the
+  real bottleneck instead of the easy knob.
 
 ### Gate 2: Real Network Impairment Harness
 
@@ -249,6 +281,42 @@ Acceptance:
 - Auto does not hide bad audio behind unexplained latency.
 - Auto decisions can be explained from recorded diagnostics.
 
+### Gate 4.5: Receiver Clock / Sample-Rate Drift
+
+Goal: stop confusing soundcard drift with network instability, and stop
+auto-jitter from over-buffering forever to compensate for it.
+
+Evidence this matters:
+
+- AOO `aoo_protocol.rst` lists timing and sample-rate synchronization as
+  first-class concerns. This is the strongest external citation.
+- The SonoBus User Guide notes that participants do not need a matching
+  sample rate because audio is resampled automatically. That covers
+  cross-rate mixing rather than long-session playout drift, but it confirms a
+  resampler exists in their data path.
+- JackTrip `Regulator.cpp` tracks `skew` / `broadcast_skew` and uses PLC. We
+  have not confirmed an explicit drift-correction step from source, so treat
+  this as "relevant timing strategies to investigate," not "they already
+  solve drift."
+
+Tasks:
+
+- [ ] Measure long-session sender vs receiver soundcard drift in ppm on each
+      backend.
+- [ ] Decide a compensation strategy: receiver-side resampling, an
+      asynchronous playout clock, or controlled sample skip/insert.
+- [ ] Make the chosen strategy visible in stats so drift events are
+      distinguishable from network jitter events.
+- [ ] Re-run Gate 4 auto-jitter behavior with drift compensation active to
+      confirm auto no longer grows without bound on stable networks.
+
+Acceptance:
+
+- A 30-minute session does not require auto-jitter to grow without bound on a
+  stable network.
+- Drift events are reported separately from queue/age drops.
+- Gate 4 per-participant auto is no longer biased by drift.
+
 ### Gate 5: Network Quality UX
 
 Goal: make users understand what is wrong.
@@ -297,8 +365,13 @@ Tasks:
 
 - [ ] Use Gate 2 to determine whether audible failures are mostly loss, burst
       loss, jitter, or scheduling.
-- [ ] Evaluate Opus in-band FEC only if it matches the failure mode.
-- [ ] Evaluate lightweight packet redundancy only if packet loss is confirmed.
+- [ ] Decide Opus in-band FEC (LBRR) trigger thresholds from Gate 2 loss
+      curves: at which packet loss rate does FEC turn on, and what is the
+      bitrate cost at that threshold? Implement behind a flag, then evaluate
+      whether it should ship as an adaptive default after measuring its
+      latency, bitrate, and audible-quality cost end-to-end.
+- [ ] Evaluate lightweight packet redundancy only if packet loss is confirmed
+      to be the dominant audible failure even with LBRR active.
 - [ ] Do not add bandwidth-heavy redundancy before measurement.
 
 Acceptance:
