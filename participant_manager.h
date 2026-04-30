@@ -114,6 +114,7 @@ public:
                 data->queue_depth_drift_milli.load(std::memory_order_relaxed) / 1000.0;
             info.jitter_buffer_min_packets = data->jitter_buffer_min_packets;
             info.jitter_buffer_floor_packets = data->jitter_buffer_floor_packets;
+            info.opus_queue_limit_packets = data->opus_queue_limit_packets;
             info.underrun_count = data->underrun_count;
             info.plc_count      = data->plc_count;
             info.packet_age_last_ms =

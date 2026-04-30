@@ -54,6 +54,7 @@ struct ParticipantData {
     std::chrono::steady_clock::time_point last_packet_time;
     size_t                                jitter_buffer_floor_packets = MIN_JITTER_BUFFER_PACKETS;
     size_t                                jitter_buffer_min_packets = MIN_JITTER_BUFFER_PACKETS;
+    size_t                                opus_queue_limit_packets = MAX_OPUS_QUEUE_SIZE;
     bool                                  buffer_ready              = false;
     int                                   underrun_count            = 0;
     float                                 current_level             = 0.0F;  // RMS audio level
@@ -96,6 +97,7 @@ struct ParticipantInfo {
     double   queue_drift_packets;
     size_t   jitter_buffer_min_packets;
     size_t   jitter_buffer_floor_packets;
+    size_t   opus_queue_limit_packets;
     int      underrun_count;
     size_t   plc_count;  // PLC invocations for diagnostics
     double   packet_age_last_ms;

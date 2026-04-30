@@ -370,14 +370,14 @@ public:
             normalize_buffer_frames_for_codec(get_audio_codec(), frames_per_buffer);
     }
 
-    size_t get_opus_jitter_target_packets() const {
-        return opus_jitter_target_packets_.load(std::memory_order_acquire);
+    size_t get_opus_jitter_buffer_packets() const {
+        return opus_jitter_buffer_packets_.load(std::memory_order_acquire);
     }
 
-    void set_opus_jitter_target_packets(size_t packets) {
+    void set_opus_jitter_buffer_packets(size_t packets) {
         const size_t clamped =
             std::clamp(packets, MIN_OPUS_JITTER_PACKETS, MAX_OPUS_JITTER_PACKETS);
-        opus_jitter_target_packets_.store(clamped, std::memory_order_release);
+        opus_jitter_buffer_packets_.store(clamped, std::memory_order_release);
 
         participant_manager_.for_each([clamped](uint32_t, ParticipantData& participant) {
             if (participant.last_codec == AudioCodec::Opus ||
@@ -881,13 +881,13 @@ private:
         participant.queue_depth_drift_milli.store(next_drift, std::memory_order_relaxed);
     }
 
-    static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_jitter_target) {
+    static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_jitter_buffer) {
         size_t base_limit = TARGET_OPUS_QUEUE_SIZE + 1;
         if (packet.frame_count <= 128) {
             base_limit = 8;
         }
         if (packet.codec == AudioCodec::Opus) {
-            base_limit = std::max(base_limit, opus_jitter_target + 3);
+            base_limit = std::max(base_limit, opus_jitter_buffer + OPUS_JITTER_QUEUE_HEADROOM);
         }
         return std::min(base_limit, MAX_OPUS_QUEUE_SIZE);
     }
@@ -897,7 +897,7 @@ private:
             return 2;
         }
         if (packet.codec == AudioCodec::Opus && packet.frame_count <= 120) {
-            return get_opus_jitter_target_packets();
+            return get_opus_jitter_buffer_packets();
         }
         return MIN_JITTER_BUFFER_PACKETS;
     }
@@ -1028,10 +1028,11 @@ private:
 
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
-                "age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
+                "jitter_buffer={} queue_limit={} age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
                 "drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
-                p.queue_drift_packets, p.packet_age_avg_ms, p.underrun_count,
+                p.queue_drift_packets, p.jitter_buffer_min_packets,
+                p.opus_queue_limit_packets, p.packet_age_avg_ms, p.underrun_count,
                 p.pcm_concealment_frames, p.pcm_drift_drops,
                 p.jitter_depth_drops, p.jitter_age_drops, p.sequence_gaps,
                 p.sequence_late_or_reordered, drop_rate.pcm_send_per_sec,
@@ -1246,7 +1247,8 @@ private:
 
             // Bounded jitter management: drop old packets if queue is too large.
             const size_t max_queue_packets =
-                max_receive_queue_packets(packet, get_opus_jitter_target_packets());
+                max_receive_queue_packets(packet, get_opus_jitter_buffer_packets());
+            participant.opus_queue_limit_packets = max_queue_packets;
             while (queue_size + 1 > max_queue_packets) {
                 OpusPacket discarded;
                 if (participant.opus_queue.try_dequeue(discarded)) {
@@ -1257,7 +1259,7 @@ private:
                 }
             }
 
-            if (queue_size < MAX_OPUS_QUEUE_SIZE) {
+            if (queue_size < max_queue_packets) {
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 size_t queue_after_enqueue = queue_size + 1;
                 observe_participant_queue_depth(participant, queue_after_enqueue);
@@ -1799,7 +1801,7 @@ private:
     OpusEncoderWrapper       audio_encoder_;
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
     std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
-    std::atomic<size_t>      opus_jitter_target_packets_{DEFAULT_OPUS_JITTER_PACKETS};
+    std::atomic<size_t>      opus_jitter_buffer_packets_{DEFAULT_OPUS_JITTER_PACKETS};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
     moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
@@ -1978,16 +1980,16 @@ static void draw_master_strip(Client& client, float available_height) {
 
         ImGui::Spacing();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        ImGui::Text("Jitter:");
+        ImGui::Text("Jitter buffer:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        int jitter_packets = static_cast<int>(client.get_opus_jitter_target_packets());
+        int jitter_packets = static_cast<int>(client.get_opus_jitter_buffer_packets());
         const bool jitter_enabled = client.get_audio_codec() == AudioCodec::Opus;
         if (!jitter_enabled) {
             ImGui::BeginDisabled();
         }
         ImGui::PushItemWidth(width - PADDING);
         if (ImGui::InputInt("##OpusJitterPackets", &jitter_packets, 1, 1)) {
-            client.set_opus_jitter_target_packets(static_cast<size_t>(std::max(jitter_packets, 0)));
+            client.set_opus_jitter_buffer_packets(static_cast<size_t>(std::max(jitter_packets, 0)));
         }
         ImGui::PopItemWidth();
         if (!jitter_enabled) {
@@ -1997,7 +1999,8 @@ static void draw_master_strip(Client& client, float available_height) {
             (static_cast<double>(client.get_audio_config().frames_per_buffer) * 1000.0) /
             static_cast<double>(client.get_audio_config().sample_rate);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        ImGui::Text("%.1f ms", client.get_opus_jitter_target_packets() * packet_ms);
+        ImGui::Text("%zu pkt, %.1f ms", client.get_opus_jitter_buffer_packets(),
+                    client.get_opus_jitter_buffer_packets() * packet_ms);
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -2236,7 +2239,9 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Q drift: %.2f", p.queue_drift_packets);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-            ImGui::Text("Jitter: %zu pkt", p.jitter_buffer_min_packets);
+            ImGui::Text("Jitter buffer: %zu pkt", p.jitter_buffer_min_packets);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Queue limit: %zu pkt", p.opus_queue_limit_packets);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Age: %.1f ms", p.packet_age_avg_ms);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
