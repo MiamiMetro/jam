@@ -1035,8 +1035,7 @@ private:
 
     static size_t pcm_drain_target_frames(const ParticipantData& participant,
                                           size_t local_frame_count) {
-        return std::max(local_frame_count,
-                        pcm_target_buffer_frames(participant, local_frame_count));
+        return local_frame_count + pcm_target_buffer_frames(participant, local_frame_count);
     }
 
     static bool mix_pcm_fifo_to_output(ParticipantData& participant, float* output_buffer,
@@ -1127,8 +1126,25 @@ private:
         participant.queue_depth_drift_milli.store(next_drift, std::memory_order_relaxed);
     }
 
-    static size_t max_receive_queue_packets(uint16_t frame_count) {
-        if (frame_count <= 128) {
+    static size_t max_receive_queue_packets(const OpusPacket& packet,
+                                            size_t local_frame_count) {
+        if (packet.codec == AudioCodec::PcmInt16) {
+            const size_t remote_frame_count =
+                packet.frame_count > 0 ? packet.frame_count : local_frame_count;
+            const size_t reserve_frames =
+                remote_frame_count *
+                pcm_target_packets_for_frame_count(
+                    static_cast<uint16_t>(remote_frame_count));
+            const size_t slack_frames =
+                std::max(remote_frame_count, local_frame_count) * 2;
+            const size_t queue_budget_frames =
+                local_frame_count + reserve_frames + slack_frames;
+            const size_t min_packet_budget = remote_frame_count < 64 ? 96 : 8;
+            return std::clamp(
+                (queue_budget_frames + remote_frame_count - 1) / remote_frame_count + 2,
+                min_packet_budget, static_cast<size_t>(128));
+        }
+        if (packet.frame_count <= 128) {
             return 8;
         }
         return TARGET_OPUS_QUEUE_SIZE + 1;
@@ -1527,7 +1543,12 @@ private:
             update_jitter_floor(participant, packet);
 
             // Bounded jitter management: drop old packets if queue is too large.
-            const size_t max_queue_packets = max_receive_queue_packets(packet.frame_count);
+            const size_t recent_callback_frames =
+                audio_callback_frame_count_last_.load(std::memory_order_relaxed);
+            const size_t local_frame_count =
+                recent_callback_frames > 0 ? recent_callback_frames
+                                           : static_cast<size_t>(audio_config_.frames_per_buffer);
+            const size_t max_queue_packets = max_receive_queue_packets(packet, local_frame_count);
             while (queue_size + 1 > max_queue_packets) {
                 OpusPacket discarded;
                 if (participant.opus_queue.try_dequeue(discarded)) {
