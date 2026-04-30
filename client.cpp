@@ -897,8 +897,9 @@ private:
         size_t next_avg = previous_avg == 0 ? depth : ((previous_avg * 31) + depth) / 32;
         participant.queue_depth_avg.store(next_avg, std::memory_order_relaxed);
 
+        const auto target_depth = std::max<size_t>(1, participant.jitter_buffer_min_packets);
         const auto drift_milli =
-            (static_cast<int64_t>(depth) - static_cast<int64_t>(TARGET_OPUS_QUEUE_SIZE)) * 1000;
+            (static_cast<int64_t>(depth) - static_cast<int64_t>(target_depth)) * 1000;
         const auto previous_drift =
             participant.queue_depth_drift_milli.load(std::memory_order_relaxed);
         const auto next_drift =
@@ -909,6 +910,25 @@ private:
     static void observe_opus_pcm_depth(ParticipantData& participant) {
         participant.opus_pcm_buffered_frames_observed.store(
             participant.opus_pcm_buffered_frames, std::memory_order_relaxed);
+    }
+
+    static size_t opus_playout_target_queue_packets(const ParticipantData& participant) {
+        // Target 0 means "no extra prebuffer"; keep one packet available to play now.
+        return std::max<size_t>(1, participant.jitter_buffer_min_packets);
+    }
+
+    static void trim_opus_queue_to_playout_target(ParticipantData& participant,
+                                                  size_t target_packets) {
+        size_t queue_size = participant.opus_queue.size_approx();
+        while (queue_size > target_packets) {
+            OpusPacket discarded;
+            if (!participant.opus_queue.try_dequeue(discarded)) {
+                break;
+            }
+            queue_size--;
+            participant.opus_target_trim_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+        observe_participant_queue_depth(participant, queue_size);
     }
 
     static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_queue_limit) {
@@ -1061,6 +1081,8 @@ private:
             const auto decode_overflow_drop_rate = calculate_rate(
                 p.opus_decode_buffer_overflow_drops,
                 previous.opus_decode_buffer_overflow_drops, elapsed_sec);
+            const auto target_trim_rate = calculate_rate(
+                p.opus_target_trim_drops, previous.opus_target_trim_drops, elapsed_sec);
             previous.jitter_depth_drops = p.jitter_depth_drops;
             previous.jitter_age_drops = p.jitter_age_drops;
             previous.pcm_concealment_frames = p.pcm_concealment_frames;
@@ -1070,11 +1092,12 @@ private:
             previous.opus_age_limit_drops = p.opus_age_limit_drops;
             previous.opus_decode_buffer_overflow_drops =
                 p.opus_decode_buffer_overflow_drops;
+            previous.opus_target_trim_drops = p.opus_target_trim_drops;
 
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
                 "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/late={}/{} "
-                "drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
+                "target_trim={} drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.jitter_buffer_min_packets,
                 p.opus_queue_limit_packets, p.last_packet_frame_count,
@@ -1083,13 +1106,13 @@ private:
                 p.underrun_count, p.pcm_concealment_frames, p.pcm_drift_drops,
                 p.jitter_depth_drops, p.jitter_age_drops, p.opus_queue_limit_drops,
                 p.opus_age_limit_drops, p.opus_decode_buffer_overflow_drops,
-                p.sequence_gaps, p.sequence_late_or_reordered, drop_rate.pcm_send_per_sec,
-                drop_rate.jitter_depth_per_sec, drop_rate.pcm_hold_per_sec,
-                drop_rate.pcm_drift_drop_per_sec);
+                p.sequence_gaps, p.sequence_late_or_reordered, p.opus_target_trim_drops,
+                drop_rate.pcm_send_per_sec, drop_rate.jitter_depth_per_sec,
+                drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec);
             Log::info(
-                "Participant playout rates {}: decoded_packets={:.1f}/s drops limit/age/overflow={:.1f}/{:.1f}/{:.1f}/s",
+                "Participant playout rates {}: decoded_packets={:.1f}/s drops limit/age/overflow/target={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, decoded_packet_rate, queue_limit_drop_rate, age_limit_drop_rate,
-                decode_overflow_drop_rate);
+                decode_overflow_drop_rate, target_trim_rate);
 
             if (elapsed_sec > 0.0 &&
                 (drop_rate.pcm_send_per_sec > 5.0 ||
@@ -1318,6 +1341,11 @@ private:
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 size_t queue_after_enqueue = queue_size + 1;
                 observe_participant_queue_depth(participant, queue_after_enqueue);
+                if (packet.codec == AudioCodec::Opus) {
+                    trim_opus_queue_to_playout_target(
+                        participant, opus_playout_target_queue_packets(participant));
+                    queue_after_enqueue = participant.opus_queue.size_approx();
+                }
                 participant.last_packet_time = packet.timestamp;
 
                 // Mark buffer as ready once we have enough packets
@@ -1929,6 +1957,7 @@ private:
         uint64_t opus_queue_limit_drops = 0;
         uint64_t opus_age_limit_drops = 0;
         uint64_t opus_decode_buffer_overflow_drops = 0;
+        uint64_t opus_target_trim_drops = 0;
     };
     std::chrono::steady_clock::time_point                  last_audio_health_log_time_{};
     uint64_t                                               last_pcm_send_drops_  = 0;
@@ -2387,10 +2416,16 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                                    static_cast<unsigned long long>(p.jitter_age_drops));
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::TextColored(
-                    ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Why: %llu/%llu/%llu",
+                    ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Why: %llu/%llu/%llu/%llu",
                     static_cast<unsigned long long>(p.opus_queue_limit_drops),
                     static_cast<unsigned long long>(p.opus_age_limit_drops),
-                    static_cast<unsigned long long>(p.opus_decode_buffer_overflow_drops));
+                    static_cast<unsigned long long>(p.opus_decode_buffer_overflow_drops),
+                    static_cast<unsigned long long>(p.opus_target_trim_drops));
+            } else if (p.opus_target_trim_drops > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Target trim: %llu",
+                                   static_cast<unsigned long long>(
+                                       p.opus_target_trim_drops));
             }
             if (p.underrun_count > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);

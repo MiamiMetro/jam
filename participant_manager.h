@@ -125,6 +125,8 @@ public:
                 data->opus_age_limit_drops.load(std::memory_order_relaxed);
             info.opus_decode_buffer_overflow_drops =
                 data->opus_decode_buffer_overflow_drops.load(std::memory_order_relaxed);
+            info.opus_target_trim_drops =
+                data->opus_target_trim_drops.load(std::memory_order_relaxed);
             info.last_packet_frame_count =
                 data->last_packet_frame_count.load(std::memory_order_relaxed);
             info.last_callback_frame_count =

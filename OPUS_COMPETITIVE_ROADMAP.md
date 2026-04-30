@@ -237,6 +237,18 @@ Evidence from testing:
   send drops.
 - That points to receiver playout/cap/age/decode interaction before it points
   to packet loss.
+- After exposing queue limit and packet age limit separately, Opus could sound
+  clear with `jitter_buffer=0`, `queue_limit=64`, and `age_limit=100`, but the
+  observed packet age still floated around roughly `60-95 ms`.
+- Changing the manual jitter buffer from `0` to `32` did not materially change
+  the observed packet age in that run.
+- This means the current manual jitter value is not an ongoing playout delay
+  controller. It is mostly a startup/rebuffer readiness threshold. Queue limit
+  and age limit decide whether accumulated packets are thrown away.
+- Competitor evidence points at ongoing receiver regulation instead: Jamulus
+  simulates multiple jitter depths and chooses a measured setting, JackTrip's
+  JitterBuffer/Regulator track read/write distance and tolerance, and AOO says
+  automatic buffering should extend when packets are late and slowly reduce.
 
 Tasks:
 
@@ -250,8 +262,25 @@ Tasks:
 - [ ] Expose packet age limit during testing so age-drop policy can be separated
       from queue-limit policy.
 - [ ] Re-test manual jitter `5`, `8`, `10`, and `13` after instrumentation.
-- [ ] Do not implement auto jitter until the receiver can explain near-full plus
-      underrun behavior.
+- [ ] Replace "jitter buffer means ready threshold" with a steady-state playout
+      target: the receiver should actively keep each participant near the
+      chosen target delay instead of letting queue age float until the age cap.
+- [ ] Keep queue limit as burst capacity and age limit as a safety guard, not as
+      the primary latency control.
+- [ ] Add a dedicated diagnostic for controlled target trims so those drops are
+      not confused with packet loss.
+- [ ] Do not implement auto jitter until manual target delay actually controls
+      steady-state age.
+
+Branch status:
+
+- [x] Added separate queue limit and age limit controls for testing.
+- [x] Added diagnostics for queue-limit, age-limit, decoded-buffer overflow,
+      and target-trim drops.
+- [x] Added first-pass target trimming so Opus receive queues are trimmed toward
+      the manual target instead of only waiting for the queue or age cap.
+- [ ] Re-test cross-machine Opus after target trimming. This is not accepted
+      until observed age follows the target and audio remains clear.
 
 Acceptance:
 
@@ -261,6 +290,8 @@ Acceptance:
   support that.
 - The next fix is chosen from measured receiver behavior, not from a larger
   buffer guess.
+- Manual target changes visibly move steady-state packet age, proving the
+  control affects latency and not only startup readiness.
 
 ### Gate 2: Real Network Impairment Harness
 
@@ -455,14 +486,17 @@ These are not decided yet:
 
 Do not implement auto jitter yet.
 
-First, use the manual Opus jitter experiment to gather evidence across:
+Current code step on `experiment/opus-jitter-buffer-control`: first-pass
+steady-state Opus target trimming has been added for the current single global
+manual target.
 
-- local loopback
-- Windows/macOS LAN
-- Wi-Fi
-- tunnel/community-server path
+The manual jitter target should mean target receive/playout delay. Queue limit
+should mean extra burst headroom. Age limit should remain a safety cutoff. If
+the queue grows beyond the target plus a small headroom, the receiver should
+drop/trim the oldest packet(s) in a controlled way and log that as target trim,
+not as packet loss.
 
-Then decide whether the next code step is:
-
-1. per-participant manual jitter, or
-2. network impairment harness first.
+Next validation step: re-test local loopback and Windows/macOS LAN/Wi-Fi with
+target values such as `0`, `3`, `5`, `8`, `13`, and `32`. Gate 1 closes only if
+the target value predictably changes steady-state age and the lowest clear
+setting is known for the tested path.

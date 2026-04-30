@@ -44,6 +44,7 @@ struct ParticipantData {
     std::atomic<uint64_t>                   opus_queue_limit_drops{0};
     std::atomic<uint64_t>                   opus_age_limit_drops{0};
     std::atomic<uint64_t>                   opus_decode_buffer_overflow_drops{0};
+    std::atomic<uint64_t>                   opus_target_trim_drops{0};
     std::atomic<size_t>                     last_packet_frame_count{0};
     std::atomic<size_t>                     last_callback_frame_count{0};
     std::array<float, 960>                  last_pcm_buffer{};
@@ -110,6 +111,7 @@ struct ParticipantInfo {
     uint64_t opus_queue_limit_drops;
     uint64_t opus_age_limit_drops;
     uint64_t opus_decode_buffer_overflow_drops;
+    uint64_t opus_target_trim_drops;
     size_t   last_packet_frame_count;
     size_t   last_callback_frame_count;
     int      underrun_count;
