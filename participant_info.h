@@ -71,6 +71,7 @@ struct ParticipantData {
     size_t                                jitter_buffer_min_packets = MIN_JITTER_BUFFER_PACKETS;
     bool                                  buffer_ready              = false;
     int                                   underrun_count            = 0;
+    size_t                                consecutive_empty_callbacks = 0;
     float                                 current_level             = 0.0F;  // RMS audio level
     bool                                  is_speaking = false;  // Voice activity detection
 
@@ -91,6 +92,8 @@ struct ParticipantData {
     std::atomic<uint64_t>   sequence_late_or_reordered{0};
     std::atomic<uint64_t>   jitter_depth_drops{0};
     std::atomic<uint64_t>   jitter_age_drops{0};
+    std::atomic<uint64_t>   jitter_rebuffers{0};
+    std::atomic<uint64_t>   queue_empty_callbacks{0};
     std::atomic<uint64_t>   pcm_concealment_frames{0};
 };
 
@@ -118,6 +121,8 @@ struct ParticipantInfo {
     uint64_t sequence_late_or_reordered;
     uint64_t jitter_depth_drops;
     uint64_t jitter_age_drops;
+    uint64_t jitter_rebuffers;
+    uint64_t queue_empty_callbacks;
     uint64_t pcm_concealment_frames;
     uint64_t pcm_drift_drops;
     uint16_t pcm_adaptive_extra_packets;

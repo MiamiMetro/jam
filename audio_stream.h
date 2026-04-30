@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <vector>
@@ -336,6 +337,8 @@ public:
         int actual_buffer_frames = 0;
         double buffer_duration_ms = 0.0;
         bool backend_latency_available = false;
+        uint64_t input_overflows = 0;
+        uint64_t output_underflows = 0;
     };
 
     void print_latency_info() {
@@ -370,6 +373,8 @@ public:
             info.output_latency_ms = total_latency_ms * 0.5;
             info.backend_latency_available = latency_frames > 0;
         }
+        info.input_overflows = input_overflows_.load(std::memory_order_relaxed);
+        info.output_underflows = output_underflows_.load(std::memory_order_relaxed);
         return info;
     }
 
@@ -443,11 +448,17 @@ private:
     }
 
     static int rt_audio_callback(void* output_buffer, void* input_buffer, unsigned int n_frames,
-                                 double /*stream_time*/, RtAudioStreamStatus /*status*/,
+                                 double /*stream_time*/, RtAudioStreamStatus status,
                                  void* user_data) {
         auto* self = static_cast<AudioStream*>(user_data);
         if (self == nullptr || self->callback_ == nullptr) {
             return 0;
+        }
+        if ((status & RTAUDIO_INPUT_OVERFLOW) != 0) {
+            self->input_overflows_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((status & RTAUDIO_OUTPUT_UNDERFLOW) != 0) {
+            self->output_underflows_.fetch_add(1, std::memory_order_relaxed);
         }
         return self->callback_(input_buffer, output_buffer, n_frames, self->callback_user_data_);
     }
@@ -458,6 +469,8 @@ private:
     AudioCallback     callback_ = nullptr;
     void*             callback_user_data_ = nullptr;
     unsigned int      actual_buffer_frames_ = 0;
+    std::atomic<uint64_t> input_overflows_{0};
+    std::atomic<uint64_t> output_underflows_{0};
 
     int input_channel_count_;
     int output_channel_count_;

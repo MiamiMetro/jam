@@ -990,6 +990,17 @@ private:
         }
     }
 
+    static size_t opus_rebuffer_after_empty_callbacks(size_t frame_count) {
+        if (frame_count == 0) {
+            return 4;
+        }
+
+        constexpr size_t OPUS_REBUFFER_GRACE_MS = 12;
+        const size_t grace_frames = (48000 * OPUS_REBUFFER_GRACE_MS) / 1000;
+        const size_t callbacks = (grace_frames + frame_count - 1) / frame_count;
+        return std::clamp(callbacks, static_cast<size_t>(2), static_cast<size_t>(6));
+    }
+
     static void update_pcm_fifo_depth(ParticipantData& participant) {
         participant.pcm_fifo_depth.store(participant.pcm_fifo_buffered_frames,
                                          std::memory_order_relaxed);
@@ -1274,6 +1285,9 @@ private:
             double opus_send_per_sec;
             double jitter_depth_per_sec;
             double jitter_age_per_sec;
+            double jitter_rebuffer_per_sec;
+            double queue_empty_per_sec;
+            double plc_per_sec;
             double pcm_hold_per_sec;
             double pcm_drift_drop_per_sec;
             double pcm_format_drop_per_sec;
@@ -1309,10 +1323,14 @@ private:
         const auto ns_to_ms = [](int64_t ns) {
             return static_cast<double>(ns) / 1'000'000.0;
         };
+        const auto latency = audio_.get_latency_info();
+        const CallbackTimingInfo callback_timing = get_callback_timing_info();
 
         Log::info(
             "Audio diag: frames cfg/cb/tx={}/{}/{} tx_packets={} tx_drops pcm/opus={}/{} "
-            "sendq_age_ms last/avg/max={:.2f}/{:.2f}/{:.2f} rx_bytes={} tx_bytes={}",
+            "sendq_age_ms last/avg/max={:.2f}/{:.2f}/{:.2f} "
+            "cb_ms avg/max/deadline={:.2f}/{:.2f}/{:.2f} cb_late={} rt_in/out={}/{} "
+            "rx_bytes={} tx_bytes={}",
                   audio_config_.frames_per_buffer,
                   audio_callback_frame_count_last_.load(std::memory_order_relaxed),
                   pcm_tx_packet_frame_count_.load(std::memory_order_relaxed),
@@ -1322,6 +1340,12 @@ private:
                   ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
                   ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
                   ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
+                  callback_timing.avg_ms,
+                  callback_timing.max_ms,
+                  callback_timing.deadline_ms,
+                  callback_timing.over_deadline_count,
+                  latency.input_overflows,
+                  latency.output_underflows,
                   total_bytes_rx_.load(std::memory_order_relaxed),
                   total_bytes_tx_.load(std::memory_order_relaxed));
 
@@ -1332,6 +1356,10 @@ private:
                 opus_send_drop_rate,
                 calculate_rate(p.jitter_depth_drops, previous.jitter_depth_drops, elapsed_sec),
                 calculate_rate(p.jitter_age_drops, previous.jitter_age_drops, elapsed_sec),
+                calculate_rate(p.jitter_rebuffers, previous.jitter_rebuffers, elapsed_sec),
+                calculate_rate(p.queue_empty_callbacks, previous.queue_empty_callbacks,
+                               elapsed_sec),
+                calculate_rate(p.plc_count, previous.plc_count, elapsed_sec),
                 calculate_rate(p.pcm_concealment_frames, previous.pcm_concealment_frames,
                                elapsed_sec),
                 calculate_rate(p.pcm_drift_drops, previous.pcm_drift_drops, elapsed_sec),
@@ -1342,6 +1370,9 @@ private:
             };
             previous.jitter_depth_drops = p.jitter_depth_drops;
             previous.jitter_age_drops = p.jitter_age_drops;
+            previous.jitter_rebuffers = p.jitter_rebuffers;
+            previous.queue_empty_callbacks = p.queue_empty_callbacks;
+            previous.plc_count = p.plc_count;
             previous.pcm_concealment_frames = p.pcm_concealment_frames;
             previous.pcm_drift_drops = p.pcm_drift_drops;
             previous.pcm_format_drops = p.pcm_format_drops;
@@ -1351,18 +1382,22 @@ private:
 
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
-                "age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
+                "age_avg_ms={:.1f} underruns={} plc/rebuf/empty={}/{}/{} "
+                "pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
                 "pcm_fifo frame/depth/target/extra={}/{}/{}/{} bad fmt/size={}/{} fifo under/over={}/{} "
-                "drop_rate pcm/q/hold/drift/bad/under={:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
+                "drop_rate pcm/q/plc/rebuf/empty/hold/drift/bad/under={:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.packet_age_avg_ms, p.underrun_count,
+                p.plc_count, p.jitter_rebuffers, p.queue_empty_callbacks,
                 p.pcm_concealment_frames, p.pcm_drift_drops,
                 p.jitter_depth_drops, p.jitter_age_drops, p.sequence_gaps,
                 p.sequence_late_or_reordered, p.pcm_remote_frame_count, p.pcm_fifo_depth,
                 p.pcm_target_packets_current, p.pcm_adaptive_extra_packets,
                 p.pcm_format_drops, p.pcm_size_mismatches, p.pcm_fifo_underflows,
                 p.pcm_fifo_overflows, drop_rate.pcm_send_per_sec,
-                drop_rate.jitter_depth_per_sec, drop_rate.pcm_hold_per_sec,
+                drop_rate.jitter_depth_per_sec, drop_rate.plc_per_sec,
+                drop_rate.jitter_rebuffer_per_sec, drop_rate.queue_empty_per_sec,
+                drop_rate.pcm_hold_per_sec,
                 drop_rate.pcm_drift_drop_per_sec,
                 drop_rate.pcm_format_drop_per_sec + drop_rate.pcm_size_mismatch_per_sec,
                 drop_rate.pcm_fifo_underflow_per_sec);
@@ -1371,6 +1406,8 @@ private:
                 (drop_rate.pcm_send_per_sec > 5.0 ||
                  drop_rate.jitter_depth_per_sec > 100.0 ||
                  drop_rate.jitter_age_per_sec > 5.0 ||
+                 drop_rate.jitter_rebuffer_per_sec > 0.0 ||
+                 drop_rate.queue_empty_per_sec > 20.0 ||
                  drop_rate.pcm_hold_per_sec > 5.0 ||
                  drop_rate.pcm_drift_drop_per_sec > 5.0 ||
                  drop_rate.pcm_format_drop_per_sec > 0.0 ||
@@ -1381,10 +1418,12 @@ private:
                     "Audio health warning for participant {}: likely corrupt/robotic risk "
                     "(pcm_drop_rate={:.1f}/s opus_drop_rate={:.1f}/s "
                     "queue_drop_rate={:.1f}/s age_drop_rate={:.1f}/s "
+                    "rebuffer_rate={:.1f}/s empty_rate={:.1f}/s "
                     "pcm_hold_rate={:.1f}/s pcm_drift_drop_rate={:.1f}/s "
                     "pcm_bad_rate={:.1f}/s pcm_fifo_under_rate={:.1f}/s)",
                     p.id, drop_rate.pcm_send_per_sec, drop_rate.opus_send_per_sec,
                     drop_rate.jitter_depth_per_sec, drop_rate.jitter_age_per_sec,
+                    drop_rate.jitter_rebuffer_per_sec, drop_rate.queue_empty_per_sec,
                     drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec,
                     drop_rate.pcm_format_drop_per_sec + drop_rate.pcm_size_mismatch_per_sec,
                     drop_rate.pcm_fifo_underflow_per_sec);
@@ -1728,6 +1767,7 @@ private:
                                                        participant.gain);
                 }
                 consume_opus_pcm_buffer(participant, frame_count);
+                participant.consecutive_empty_callbacks = 0;
                 active_count++;
                 observe_participant_queue_depth(participant, participant.opus_queue.size_approx());
                 return;
@@ -1752,6 +1792,7 @@ private:
             OpusPacket opus_packet;
 
             if (participant.opus_queue.try_dequeue(opus_packet)) {
+                participant.consecutive_empty_callbacks = 0;
                 auto now = std::chrono::steady_clock::now();
                 auto packet_age = now - opus_packet.timestamp;
                 auto packet_age_ns =
@@ -1890,6 +1931,7 @@ private:
                                 out_channels, participant.gain);
                         }
                         consume_opus_pcm_buffer(participant, frame_count);
+                        participant.consecutive_empty_callbacks = 0;
                         active_count++;
                     }
 
@@ -1910,6 +1952,7 @@ private:
                 // Underrun - use PLC instead of silence for smoother audio
                 size_t current_queue_size = participant.opus_queue.size_approx();
                 observe_participant_queue_depth(participant, current_queue_size);
+                participant.queue_empty_callbacks.fetch_add(1, std::memory_order_relaxed);
 
                 int plc_samples = 0;
                 if (participant.last_codec == AudioCodec::Opus) {
@@ -1930,6 +1973,7 @@ private:
                             participant.gain);
                     }
                     participant.plc_count++;
+                    active_count++;
                 }
 
                 // PCM has no PLC fallback. A transient empty queue should produce one silent
@@ -1957,9 +2001,17 @@ private:
                 }
 
                 // Handle Opus rebuffering state (PLC handles short gaps above)
-                if (current_queue_size == 0 && participant.buffer_ready) {
+                if (participant.last_codec == AudioCodec::Opus && participant.buffer_ready) {
+                    participant.consecutive_empty_callbacks++;
+                }
+                if (participant.last_codec == AudioCodec::Opus && current_queue_size == 0 &&
+                    participant.buffer_ready &&
+                    participant.consecutive_empty_callbacks >=
+                        opus_rebuffer_after_empty_callbacks(frame_count)) {
                     participant.buffer_ready = false;
+                    participant.consecutive_empty_callbacks = 0;
                     participant.underrun_count++;
+                    participant.jitter_rebuffers.fetch_add(1, std::memory_order_relaxed);
                     // Only log first rebuffer or every 10th to reduce noise
                     if (participant.underrun_count == 1 || participant.underrun_count % 10 == 0) {
                         Log::info("Participant {} rebuffering (underruns: {}, PLC: {})",
@@ -2154,6 +2206,9 @@ private:
     struct ParticipantDropSnapshot {
         uint64_t jitter_depth_drops = 0;
         uint64_t jitter_age_drops   = 0;
+        uint64_t jitter_rebuffers = 0;
+        uint64_t queue_empty_callbacks = 0;
+        uint64_t plc_count = 0;
         uint64_t pcm_concealment_frames = 0;
         uint64_t pcm_drift_drops = 0;
         uint64_t pcm_format_drops = 0;
@@ -2318,6 +2373,12 @@ static void draw_master_strip(Client& client, float available_height) {
             ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Late: %llu",
                                static_cast<unsigned long long>(
                                    callback_timing.over_deadline_count));
+        }
+        if (latency.input_overflows > 0 || latency.output_underflows > 0) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Rt I/O: %llu/%llu",
+                               static_cast<unsigned long long>(latency.input_overflows),
+                               static_cast<unsigned long long>(latency.output_underflows));
         }
 
         ImGui::Spacing();
@@ -2545,6 +2606,13 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
             if (p.plc_count > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::Text("PLC: %zu", p.plc_count);
+            }
+            if (p.jitter_rebuffers > 0 || p.queue_empty_callbacks > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F),
+                                   "Rebuf/empty: %llu/%llu",
+                                   static_cast<unsigned long long>(p.jitter_rebuffers),
+                                   static_cast<unsigned long long>(p.queue_empty_callbacks));
             }
             if (p.pcm_concealment_frames > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
