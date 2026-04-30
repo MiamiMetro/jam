@@ -66,7 +66,6 @@ struct Args {
     std::string receiver_user = "latency-probe-receiver";
     bool sweep = false;
     int duration_seconds = 0;
-    int rx_queue_limit_packets = 0;
     double playout_ppm = 0.0;
     ProbeConfig config;
 };
@@ -84,7 +83,6 @@ struct ProbeMetrics {
     int sent_packets = 0;
     int encode_failures = 0;
     int received_packets = 0;
-    int rx_queue_drops = 0;
     int decoded_packets = 0;
     int plc_frames = 0;
     int underruns = 0;
@@ -115,10 +113,9 @@ struct ProbeResult {
 class ProbeReceiver {
 public:
     ProbeReceiver(asio::io_context& io_context, const udp::endpoint& server_endpoint,
-                  const std::string& room, const std::string& user,
-                  int queue_limit_packets)
+                  const std::string& room, const std::string& user)
         : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
-          room_(room), user_(user), queue_limit_packets_(queue_limit_packets) {}
+          room_(room), user_(user) {}
 
     void start() {
         do_receive();
@@ -153,10 +150,6 @@ public:
 
     int received_count() const {
         return received_count_.load(std::memory_order_relaxed);
-    }
-
-    int queue_drops() const {
-        return queue_drops_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -244,11 +237,6 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            while (queue_limit_packets_ > 0 &&
-                   static_cast<int>(queue_.size()) >= queue_limit_packets_) {
-                queue_.pop_front();
-                queue_drops_.fetch_add(1, std::memory_order_relaxed);
-            }
             queue_.push_back(packet);
         }
         received_count_.fetch_add(1, std::memory_order_relaxed);
@@ -263,8 +251,6 @@ private:
     mutable std::mutex mutex_;
     std::deque<ReceivedPacket> queue_;
     std::atomic<int> received_count_{0};
-    std::atomic<int> queue_drops_{0};
-    int queue_limit_packets_ = 0;
 };
 
 class ProbeSender {
@@ -485,7 +471,8 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
 
         ReceivedPacket packet;
         if (config.codec == ProbeCodec::PcmInt16) {
-            const int drain_target = config.playout_frame_size + pcm_target_fifo_frames(config);
+            const int drain_target =
+                std::max(config.playout_frame_size, pcm_target_fifo_frames(config));
             while (static_cast<int>(pcm_fifo.size()) < drain_target &&
                    receiver.pop_packet(packet)) {
                 if (!decode_pcm_int16_packet(packet, config, pcm)) {
@@ -626,8 +613,7 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     udp::endpoint server_endpoint =
         *resolver.resolve(udp::v4(), args.host, std::to_string(args.port)).begin();
 
-    ProbeReceiver receiver(io_context, server_endpoint, args.room, args.receiver_user,
-                           args.rx_queue_limit_packets);
+    ProbeReceiver receiver(io_context, server_endpoint, args.room, args.receiver_user);
     ProbeSender sender(io_context, server_endpoint, args.room, args.sender_user);
 
     receiver.start();
@@ -658,7 +644,6 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     }
 
     metrics.received_packets = receiver.received_count();
-    metrics.rx_queue_drops = receiver.queue_drops();
 
     ProbeResult result;
     result.config = config;
@@ -684,7 +669,6 @@ bool has_corruption_indicators(const ProbeResult& result) {
             c.playout_frame_size);
     const int sustained_underrun_threshold = std::max(5, total_playout_ticks / 100);
     return result.latency_samples < 0 || m.encode_failures > 0 ||
-           m.rx_queue_drops > 0 ||
            m.plc_frames > sustained_underrun_threshold ||
            m.underruns > sustained_underrun_threshold || m.decode_failures > 0 ||
            m.decoded_size_mismatches > 0 || m.non_finite_samples > 0 ||
@@ -715,8 +699,6 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "sent_packets: " << m.sent_packets << "\n";
     std::cout << "encode_failures: " << m.encode_failures << "\n";
     std::cout << "received_packets: " << m.received_packets << "\n";
-    std::cout << "rx_queue_limit_packets: " << args.rx_queue_limit_packets << "\n";
-    std::cout << "rx_queue_drops: " << m.rx_queue_drops << "\n";
     std::cout << "decoded_packets: " << m.decoded_packets << "\n";
     std::cout << "detected_output_sample: " << m.detected_output_sample << "\n";
     std::cout << "latency_samples: " << result.latency_samples << "\n";
@@ -750,7 +732,7 @@ void print_result(const Args& args, const ProbeResult& result) {
 }
 
 void print_sweep_header() {
-    std::cout << "codec,send_frames,playout_frames,jitter,playout_ppm,latency_ms,latency_samples,sent,received,rx_queue_drops,decoded,max_queue,"
+    std::cout << "codec,send_frames,playout_frames,jitter,playout_ppm,latency_ms,latency_samples,sent,received,decoded,max_queue,"
                  "avg_queue,queue_drift,min_queue,final_queue,max_pcm_fifo,final_pcm_fifo,pcm_drift_corrections,encode_failures,underruns,plc,"
                  "decode_failures,size_mismatch,non_finite,out_of_range,repeated_blocks,"
                  "max_discontinuity,status\n";
@@ -770,8 +752,7 @@ void print_sweep_row(const Args& args, const ProbeResult& result) {
     std::cout << codec_name(c.codec) << ',' << c.send_frame_size << ','
               << c.playout_frame_size << ',' << c.jitter_min_packets << ','
               << args.playout_ppm << ',' << result.latency_ms << ',' << result.latency_samples << ',' << m.sent_packets << ','
-              << m.received_packets << ',' << m.rx_queue_drops << ','
-              << m.decoded_packets << ',' << m.max_queue_depth << ','
+              << m.received_packets << ',' << m.decoded_packets << ',' << m.max_queue_depth << ','
               << avg_queue << ',' << (avg_queue - static_cast<double>(c.jitter_min_packets)) << ','
               << min_queue << ',' << m.final_queue_depth << ',' << m.max_pcm_fifo_frames << ','
               << m.final_pcm_fifo_frames << ',' << m.pcm_drift_corrections << ','
@@ -812,8 +793,6 @@ Args parse_args(int argc, char** argv) {
             args.duration_seconds = std::stoi(argv[++i]);
         } else if (arg == "--playout-ppm" && i + 1 < argc) {
             args.playout_ppm = std::stod(argv[++i]);
-        } else if (arg == "--rx-queue-limit" && i + 1 < argc) {
-            args.rx_queue_limit_packets = std::stoi(argv[++i]);
         } else if (arg == "--codec" && i + 1 < argc) {
             std::string codec = argv[++i];
             if (codec == "opus") {
