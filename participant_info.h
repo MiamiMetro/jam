@@ -94,6 +94,8 @@ struct ParticipantInfo {
     size_t   queue_size_avg;
     size_t   queue_size_max;
     double   queue_drift_packets;
+    size_t   jitter_buffer_min_packets;
+    size_t   jitter_buffer_floor_packets;
     int      underrun_count;
     size_t   plc_count;  // PLC invocations for diagnostics
     double   packet_age_last_ms;
