@@ -1128,10 +1128,18 @@ private:
     }
 
     static size_t max_receive_queue_packets(uint16_t frame_count) {
-        if (frame_count <= 128) {
-            return 8;
+        if (frame_count == 0) {
+            return TARGET_OPUS_QUEUE_SIZE + 1;
         }
-        return TARGET_OPUS_QUEUE_SIZE + 1;
+
+        constexpr size_t MAX_QUEUE_BUDGET_MS = 36;
+        const size_t frames_per_packet = frame_count;
+        const size_t queue_budget_frames = (48000 * MAX_QUEUE_BUDGET_MS) / 1000;
+        const size_t packets_for_budget =
+            (queue_budget_frames + frames_per_packet - 1) / frames_per_packet;
+        const size_t burst_slack_packets = 2;
+        return std::clamp(packets_for_budget + burst_slack_packets,
+                          static_cast<size_t>(8), static_cast<size_t>(128));
     }
 
     static size_t jitter_floor_for_packet(const OpusPacket& packet) {
