@@ -910,8 +910,36 @@ private:
         participant.opus_pcm_buffered_frames = remaining;
     }
 
-    static size_t pcm_target_packets_for_frame_count(uint16_t frame_count) {
+    static constexpr size_t PCM_ADAPTIVE_RELEASE_CALLBACKS = 800;
+
+    static size_t pcm_base_target_packets_for_frame_count(uint16_t frame_count) {
         return frame_count <= 128 ? 2 : 3;
+    }
+
+    static uint16_t pcm_adaptive_extra_limit(uint16_t frame_count) {
+        if (frame_count <= 128) {
+            return 2;
+        }
+        if (frame_count <= 240) {
+            return 1;
+        }
+        return 0;
+    }
+
+    static size_t pcm_target_packets_for_participant(ParticipantData& participant,
+                                                     uint16_t frame_count) {
+        const uint16_t max_extra = pcm_adaptive_extra_limit(frame_count);
+        uint16_t extra =
+            participant.pcm_adaptive_extra_packets.load(std::memory_order_relaxed);
+        if (extra > max_extra) {
+            extra = max_extra;
+            participant.pcm_adaptive_extra_packets.store(extra, std::memory_order_relaxed);
+        }
+        const size_t target_packets =
+            pcm_base_target_packets_for_frame_count(frame_count) + extra;
+        participant.pcm_target_packets_current.store(
+            static_cast<uint16_t>(target_packets), std::memory_order_relaxed);
+        return target_packets;
     }
 
     static size_t pcm_remote_frame_count_or(const ParticipantData& participant,
@@ -921,12 +949,45 @@ private:
         return remote_frame_count > 0 ? remote_frame_count : fallback_frame_count;
     }
 
-    static size_t pcm_target_buffer_frames(const ParticipantData& participant,
+    static size_t pcm_target_buffer_frames(ParticipantData& participant,
                                            size_t fallback_frame_count) {
         const size_t remote_frame_count =
             pcm_remote_frame_count_or(participant, fallback_frame_count);
-        return remote_frame_count *
-               pcm_target_packets_for_frame_count(static_cast<uint16_t>(remote_frame_count));
+        const size_t target_frames =
+            remote_frame_count *
+            pcm_target_packets_for_participant(
+                participant, static_cast<uint16_t>(remote_frame_count));
+        return std::min(target_frames, ParticipantData::PCM_FIFO_CAPACITY_FRAMES);
+    }
+
+    static void raise_pcm_adaptive_target(ParticipantData& participant,
+                                          size_t fallback_frame_count) {
+        participant.pcm_stable_callbacks = 0;
+        const uint16_t remote_frame_count = static_cast<uint16_t>(
+            pcm_remote_frame_count_or(participant, fallback_frame_count));
+        const uint16_t max_extra = pcm_adaptive_extra_limit(remote_frame_count);
+        const uint16_t current =
+            participant.pcm_adaptive_extra_packets.load(std::memory_order_relaxed);
+        if (current < max_extra) {
+            participant.pcm_adaptive_extra_packets.store(
+                static_cast<uint16_t>(current + 1), std::memory_order_relaxed);
+        }
+    }
+
+    static void observe_pcm_render_success(ParticipantData& participant) {
+        const uint16_t current =
+            participant.pcm_adaptive_extra_packets.load(std::memory_order_relaxed);
+        if (current == 0) {
+            participant.pcm_stable_callbacks = 0;
+            return;
+        }
+
+        participant.pcm_stable_callbacks++;
+        if (participant.pcm_stable_callbacks >= PCM_ADAPTIVE_RELEASE_CALLBACKS) {
+            participant.pcm_stable_callbacks = 0;
+            participant.pcm_adaptive_extra_packets.store(
+                static_cast<uint16_t>(current - 1), std::memory_order_relaxed);
+        }
     }
 
     static void update_pcm_fifo_depth(ParticipantData& participant) {
@@ -1033,7 +1094,7 @@ private:
         }
     }
 
-    static size_t pcm_drain_target_frames(const ParticipantData& participant,
+    static size_t pcm_drain_target_frames(ParticipantData& participant,
                                           size_t local_frame_count) {
         return std::max(local_frame_count,
                         pcm_target_buffer_frames(participant, local_frame_count));
@@ -1075,8 +1136,10 @@ private:
             participant.pcm_concealment_frames.fetch_add(1, std::memory_order_relaxed);
             participant.underrun_count++;
             participant.pcm_concealment_used = true;
+            raise_pcm_adaptive_target(participant, frame_count);
         } else {
             participant.pcm_concealment_used = false;
+            observe_pcm_render_success(participant);
         }
 
         if (!rendered_any_audio) {
@@ -1289,13 +1352,14 @@ private:
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
                 "age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
-                "pcm_fifo frame/depth={}/{} bad fmt/size={}/{} fifo under/over={}/{} "
+                "pcm_fifo frame/depth/target/extra={}/{}/{}/{} bad fmt/size={}/{} fifo under/over={}/{} "
                 "drop_rate pcm/q/hold/drift/bad/under={:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.packet_age_avg_ms, p.underrun_count,
                 p.pcm_concealment_frames, p.pcm_drift_drops,
                 p.jitter_depth_drops, p.jitter_age_drops, p.sequence_gaps,
                 p.sequence_late_or_reordered, p.pcm_remote_frame_count, p.pcm_fifo_depth,
+                p.pcm_target_packets_current, p.pcm_adaptive_extra_packets,
                 p.pcm_format_drops, p.pcm_size_mismatches, p.pcm_fifo_underflows,
                 p.pcm_fifo_overflows, drop_rate.pcm_send_per_sec,
                 drop_rate.jitter_depth_per_sec, drop_rate.pcm_hold_per_sec,
@@ -2494,8 +2558,10 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
             }
             if (p.pcm_remote_frame_count > 0 || p.pcm_fifo_depth > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-                ImGui::Text("PCM pkt/fifo: %u/%zu", p.pcm_remote_frame_count,
-                            p.pcm_fifo_depth);
+                ImGui::Text("PCM pkt/fifo/tgt+x: %u/%zu/%u+%u",
+                            p.pcm_remote_frame_count, p.pcm_fifo_depth,
+                            p.pcm_target_packets_current,
+                            p.pcm_adaptive_extra_packets);
             }
             if (p.pcm_format_drops > 0 || p.pcm_size_mismatches > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);

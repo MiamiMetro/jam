@@ -49,6 +49,9 @@ struct ParticipantData {
     size_t                                  last_pcm_samples = 0;
     bool                                    last_pcm_valid = false;
     bool                                    pcm_concealment_used = false;
+    size_t                                  pcm_stable_callbacks = 0;
+    std::atomic<uint16_t>                   pcm_adaptive_extra_packets{0};
+    std::atomic<uint16_t>                   pcm_target_packets_current{0};
     std::atomic<uint64_t>                   pcm_drift_drops{0};
     std::atomic<size_t>                     pcm_fifo_depth{0};
     std::atomic<uint16_t>                   pcm_remote_frame_count{0};
@@ -117,6 +120,8 @@ struct ParticipantInfo {
     uint64_t jitter_age_drops;
     uint64_t pcm_concealment_frames;
     uint64_t pcm_drift_drops;
+    uint16_t pcm_adaptive_extra_packets;
+    uint16_t pcm_target_packets_current;
     size_t   pcm_fifo_depth;
     uint16_t pcm_remote_frame_count;
     uint64_t pcm_format_drops;

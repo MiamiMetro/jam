@@ -128,6 +128,10 @@ public:
             info.pcm_concealment_frames =
                 data->pcm_concealment_frames.load(std::memory_order_relaxed);
             info.pcm_drift_drops = data->pcm_drift_drops.load(std::memory_order_relaxed);
+            info.pcm_adaptive_extra_packets =
+                data->pcm_adaptive_extra_packets.load(std::memory_order_relaxed);
+            info.pcm_target_packets_current =
+                data->pcm_target_packets_current.load(std::memory_order_relaxed);
             info.pcm_fifo_depth = data->pcm_fifo_depth.load(std::memory_order_relaxed);
             info.pcm_remote_frame_count =
                 data->pcm_remote_frame_count.load(std::memory_order_relaxed);
