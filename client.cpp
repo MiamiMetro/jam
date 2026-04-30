@@ -881,6 +881,11 @@ private:
         participant.queue_depth_drift_milli.store(next_drift, std::memory_order_relaxed);
     }
 
+    static void observe_opus_pcm_depth(ParticipantData& participant) {
+        participant.opus_pcm_buffered_frames_observed.store(
+            participant.opus_pcm_buffered_frames, std::memory_order_relaxed);
+    }
+
     static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_jitter_buffer) {
         size_t base_limit = TARGET_OPUS_QUEUE_SIZE + 1;
         if (packet.frame_count <= 128) {
@@ -1021,23 +1026,45 @@ private:
                                elapsed_sec),
                 calculate_rate(p.pcm_drift_drops, previous.pcm_drift_drops, elapsed_sec),
             };
+            const auto decoded_packet_rate = calculate_rate(
+                p.opus_packets_decoded_in_callback,
+                previous.opus_packets_decoded_in_callback, elapsed_sec);
+            const auto queue_limit_drop_rate = calculate_rate(
+                p.opus_queue_limit_drops, previous.opus_queue_limit_drops, elapsed_sec);
+            const auto age_limit_drop_rate = calculate_rate(
+                p.opus_age_limit_drops, previous.opus_age_limit_drops, elapsed_sec);
+            const auto decode_overflow_drop_rate = calculate_rate(
+                p.opus_decode_buffer_overflow_drops,
+                previous.opus_decode_buffer_overflow_drops, elapsed_sec);
             previous.jitter_depth_drops = p.jitter_depth_drops;
             previous.jitter_age_drops = p.jitter_age_drops;
             previous.pcm_concealment_frames = p.pcm_concealment_frames;
             previous.pcm_drift_drops = p.pcm_drift_drops;
+            previous.opus_packets_decoded_in_callback = p.opus_packets_decoded_in_callback;
+            previous.opus_queue_limit_drops = p.opus_queue_limit_drops;
+            previous.opus_age_limit_drops = p.opus_age_limit_drops;
+            previous.opus_decode_buffer_overflow_drops =
+                p.opus_decode_buffer_overflow_drops;
 
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
-                "jitter_buffer={} queue_limit={} age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} seq gap/late={}/{} "
+                "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/late={}/{} "
                 "drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.jitter_buffer_min_packets,
-                p.opus_queue_limit_packets, p.packet_age_avg_ms, p.underrun_count,
-                p.pcm_concealment_frames, p.pcm_drift_drops,
-                p.jitter_depth_drops, p.jitter_age_drops, p.sequence_gaps,
-                p.sequence_late_or_reordered, drop_rate.pcm_send_per_sec,
+                p.opus_queue_limit_packets, p.last_packet_frame_count,
+                p.last_callback_frame_count, p.opus_pcm_buffered_frames,
+                p.opus_packets_decoded_in_callback, p.packet_age_avg_ms,
+                p.underrun_count, p.pcm_concealment_frames, p.pcm_drift_drops,
+                p.jitter_depth_drops, p.jitter_age_drops, p.opus_queue_limit_drops,
+                p.opus_age_limit_drops, p.opus_decode_buffer_overflow_drops,
+                p.sequence_gaps, p.sequence_late_or_reordered, drop_rate.pcm_send_per_sec,
                 drop_rate.jitter_depth_per_sec, drop_rate.pcm_hold_per_sec,
                 drop_rate.pcm_drift_drop_per_sec);
+            Log::info(
+                "Participant playout rates {}: decoded_packets={:.1f}/s drops limit/age/overflow={:.1f}/{:.1f}/{:.1f}/s",
+                p.id, decoded_packet_rate, queue_limit_drop_rate, age_limit_drop_rate,
+                decode_overflow_drop_rate);
 
             if (elapsed_sec > 0.0 &&
                 (drop_rate.pcm_send_per_sec > 5.0 ||
@@ -1244,6 +1271,8 @@ private:
             size_t queue_size = participant.opus_queue.size_approx();
             observe_participant_queue_depth(participant, queue_size);
             update_jitter_floor(participant, packet);
+            participant.last_packet_frame_count.store(packet.frame_count,
+                                                      std::memory_order_relaxed);
 
             // Bounded jitter management: drop old packets if queue is too large.
             const size_t max_queue_packets =
@@ -1254,6 +1283,7 @@ private:
                 if (participant.opus_queue.try_dequeue(discarded)) {
                     queue_size--;
                     participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+                    participant.opus_queue_limit_drops.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     break;
                 }
@@ -1345,6 +1375,8 @@ private:
         int active_count = 0;
         client->participant_manager_.for_each([&](uint32_t         participant_id,
                                                   ParticipantData& participant) {
+            observe_opus_pcm_depth(participant);
+            participant.last_callback_frame_count.store(frame_count, std::memory_order_relaxed);
             if (participant.is_muted) {
                 return;
             }
@@ -1374,6 +1406,7 @@ private:
                                                        participant.gain);
                 }
                 consume_opus_pcm_buffer(participant, frame_count);
+                observe_opus_pcm_depth(participant);
                 active_count++;
                 observe_participant_queue_depth(participant, participant.opus_queue.size_approx());
                 return;
@@ -1393,6 +1426,7 @@ private:
 
                 while (packet_age_ns > max_packet_age_ns) {
                     participant.jitter_age_drops.fetch_add(1, std::memory_order_relaxed);
+                    participant.opus_age_limit_drops.fetch_add(1, std::memory_order_relaxed);
                     if (!participant.opus_queue.try_dequeue(opus_packet)) {
                         participant.underrun_count++;
                         return;
@@ -1464,9 +1498,13 @@ private:
                                         static_cast<std::ptrdiff_t>(
                                             participant.opus_pcm_buffered_frames));
                         participant.opus_pcm_buffered_frames += decoded_frames;
+                        participant.opus_packets_decoded_in_callback.fetch_add(
+                            1, std::memory_order_relaxed);
                     } else {
                         participant.opus_pcm_buffered_frames = 0;
                         participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+                        participant.opus_decode_buffer_overflow_drops.fetch_add(
+                            1, std::memory_order_relaxed);
                     }
 
                     while (participant.opus_pcm_buffered_frames < frame_count) {
@@ -1493,6 +1531,8 @@ private:
                             participant.opus_pcm_buffer.size()) {
                             participant.opus_pcm_buffered_frames = 0;
                             participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
+                            participant.opus_decode_buffer_overflow_drops.fetch_add(
+                                1, std::memory_order_relaxed);
                             break;
                         }
 
@@ -1501,6 +1541,8 @@ private:
                                         static_cast<std::ptrdiff_t>(
                                             participant.opus_pcm_buffered_frames));
                         participant.opus_pcm_buffered_frames += next_decoded_frames;
+                        participant.opus_packets_decoded_in_callback.fetch_add(
+                            1, std::memory_order_relaxed);
                     }
 
                     float rms = audio_analysis::calculate_rms(participant.pcm_buffer.data(),
@@ -1521,6 +1563,7 @@ private:
                                 out_channels, participant.gain);
                         }
                         consume_opus_pcm_buffer(participant, frame_count);
+                        observe_opus_pcm_depth(participant);
                         active_count++;
                     }
 
@@ -1533,6 +1576,7 @@ private:
 
                     observe_participant_queue_depth(participant,
                                                     participant.opus_queue.size_approx());
+                    observe_opus_pcm_depth(participant);
                     return;
                 }
 
@@ -1854,6 +1898,10 @@ private:
         uint64_t jitter_age_drops   = 0;
         uint64_t pcm_concealment_frames = 0;
         uint64_t pcm_drift_drops = 0;
+        uint64_t opus_packets_decoded_in_callback = 0;
+        uint64_t opus_queue_limit_drops = 0;
+        uint64_t opus_age_limit_drops = 0;
+        uint64_t opus_decode_buffer_overflow_drops = 0;
     };
     std::chrono::steady_clock::time_point                  last_audio_health_log_time_{};
     uint64_t                                               last_pcm_send_drops_  = 0;
@@ -2243,6 +2291,15 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Queue limit: %zu pkt", p.opus_queue_limit_packets);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Frames pkt/cb: %zu/%zu", p.last_packet_frame_count,
+                        p.last_callback_frame_count);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Decoded: %zu frames", p.opus_pcm_buffered_frames);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::Text("Dec pkts: %llu",
+                        static_cast<unsigned long long>(
+                            p.opus_packets_decoded_in_callback));
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Age: %.1f ms", p.packet_age_avg_ms);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Max age: %.1f ms", p.packet_age_max_ms);
@@ -2258,6 +2315,12 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                 ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Drop q/age: %llu/%llu",
                                    static_cast<unsigned long long>(p.jitter_depth_drops),
                                    static_cast<unsigned long long>(p.jitter_age_drops));
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::TextColored(
+                    ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Why: %llu/%llu/%llu",
+                    static_cast<unsigned long long>(p.opus_queue_limit_drops),
+                    static_cast<unsigned long long>(p.opus_age_limit_drops),
+                    static_cast<unsigned long long>(p.opus_decode_buffer_overflow_drops));
             }
             if (p.underrun_count > 0) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);

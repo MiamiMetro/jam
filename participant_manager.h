@@ -115,6 +115,20 @@ public:
             info.jitter_buffer_min_packets = data->jitter_buffer_min_packets;
             info.jitter_buffer_floor_packets = data->jitter_buffer_floor_packets;
             info.opus_queue_limit_packets = data->opus_queue_limit_packets;
+            info.opus_pcm_buffered_frames =
+                data->opus_pcm_buffered_frames_observed.load(std::memory_order_relaxed);
+            info.opus_packets_decoded_in_callback =
+                data->opus_packets_decoded_in_callback.load(std::memory_order_relaxed);
+            info.opus_queue_limit_drops =
+                data->opus_queue_limit_drops.load(std::memory_order_relaxed);
+            info.opus_age_limit_drops =
+                data->opus_age_limit_drops.load(std::memory_order_relaxed);
+            info.opus_decode_buffer_overflow_drops =
+                data->opus_decode_buffer_overflow_drops.load(std::memory_order_relaxed);
+            info.last_packet_frame_count =
+                data->last_packet_frame_count.load(std::memory_order_relaxed);
+            info.last_callback_frame_count =
+                data->last_callback_frame_count.load(std::memory_order_relaxed);
             info.underrun_count = data->underrun_count;
             info.plc_count      = data->plc_count;
             info.packet_age_last_ms =

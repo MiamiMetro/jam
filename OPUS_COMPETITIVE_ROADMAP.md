@@ -222,6 +222,42 @@ Acceptance:
 - The dominant contributor is known per platform, so later gates target the
   real bottleneck instead of the easy knob.
 
+### Gate 1.6: Receiver Playout Correctness
+
+Goal: explain and fix cases where the receiver is both near-full and
+underrunning. A larger manual jitter buffer is not meaningful until packet
+queue depth, decoded PCM depth, callback consumption, and drop policy all agree.
+
+Evidence from testing:
+
+- Opus `120` with manual jitter buffer `13` still flickered.
+- Logs showed queue depth near the queue limit (`q=13-15`, `q_max=16`) while
+  underruns and PLC still increased.
+- Logs also showed high queue drops but no sequence gaps/late packets and no
+  send drops.
+- That points to receiver playout/cap/age/decode interaction before it points
+  to packet loss.
+
+Tasks:
+
+- [ ] Add diagnostics for decoded Opus PCM buffered frames.
+- [ ] Add diagnostics for how many Opus packets are decoded per audio callback.
+- [ ] Add diagnostics for why a packet is dropped: queue limit, age limit,
+      decoded-buffer overflow, or codec mismatch.
+- [ ] Add diagnostics for callback frame count versus packet frame count.
+- [ ] Re-test manual jitter `5`, `8`, `10`, and `13` after instrumentation.
+- [ ] Do not implement auto jitter until the receiver can explain near-full plus
+      underrun behavior.
+
+Acceptance:
+
+- When audio flickers, logs identify whether the receiver ran out of packet
+  queue, decoded PCM frames, or dropped usable packets due to policy.
+- Queue drops are not treated as network loss unless sequence/loss counters
+  support that.
+- The next fix is chosen from measured receiver behavior, not from a larger
+  buffer guess.
+
 ### Gate 2: Real Network Impairment Harness
 
 Goal: reproduce robotic/flicker/dropout behavior without relying only on human

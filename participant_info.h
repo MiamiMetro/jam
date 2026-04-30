@@ -39,6 +39,13 @@ struct ParticipantData {
     std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
     std::array<float, 1920>                 opus_pcm_buffer{};
     size_t                                  opus_pcm_buffered_frames = 0;
+    std::atomic<size_t>                     opus_pcm_buffered_frames_observed{0};
+    std::atomic<uint64_t>                   opus_packets_decoded_in_callback{0};
+    std::atomic<uint64_t>                   opus_queue_limit_drops{0};
+    std::atomic<uint64_t>                   opus_age_limit_drops{0};
+    std::atomic<uint64_t>                   opus_decode_buffer_overflow_drops{0};
+    std::atomic<size_t>                     last_packet_frame_count{0};
+    std::atomic<size_t>                     last_callback_frame_count{0};
     std::array<float, 960>                  last_pcm_buffer{};
     size_t                                  last_pcm_samples = 0;
     bool                                    last_pcm_valid = false;
@@ -98,6 +105,13 @@ struct ParticipantInfo {
     size_t   jitter_buffer_min_packets;
     size_t   jitter_buffer_floor_packets;
     size_t   opus_queue_limit_packets;
+    size_t   opus_pcm_buffered_frames;
+    uint64_t opus_packets_decoded_in_callback;
+    uint64_t opus_queue_limit_drops;
+    uint64_t opus_age_limit_drops;
+    uint64_t opus_decode_buffer_overflow_drops;
+    size_t   last_packet_frame_count;
+    size_t   last_callback_frame_count;
     int      underrun_count;
     size_t   plc_count;  // PLC invocations for diagnostics
     double   packet_age_last_ms;
