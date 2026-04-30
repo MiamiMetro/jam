@@ -247,6 +247,8 @@ Tasks:
 - [ ] Add diagnostics for callback frame count versus packet frame count.
 - [ ] Expose manual queue limit separately from manual jitter buffer so burst
       capacity can be tested directly.
+- [ ] Expose packet age limit during testing so age-drop policy can be separated
+      from queue-limit policy.
 - [ ] Re-test manual jitter `5`, `8`, `10`, and `13` after instrumentation.
 - [ ] Do not implement auto jitter until the receiver can explain near-full plus
       underrun behavior.

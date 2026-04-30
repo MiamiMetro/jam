@@ -378,6 +378,10 @@ public:
         return opus_queue_limit_packets_.load(std::memory_order_acquire);
     }
 
+    int get_jitter_packet_age_limit_ms() const {
+        return jitter_packet_age_limit_ms_.load(std::memory_order_acquire);
+    }
+
     void set_opus_jitter_buffer_packets(size_t packets) {
         const size_t clamped =
             std::clamp(packets, MIN_OPUS_JITTER_PACKETS, MAX_OPUS_JITTER_PACKETS);
@@ -404,6 +408,12 @@ public:
         participant_manager_.for_each([clamped](uint32_t, ParticipantData& participant) {
             participant.opus_queue_limit_packets = clamped;
         });
+    }
+
+    void set_jitter_packet_age_limit_ms(int age_ms) {
+        jitter_packet_age_limit_ms_.store(
+            std::clamp(age_ms, MIN_JITTER_PACKET_AGE_MS, MAX_JITTER_PACKET_AGE_MS),
+            std::memory_order_release);
     }
 
     CallbackTimingInfo get_callback_timing_info() const {
@@ -1436,7 +1446,7 @@ private:
                     std::chrono::duration_cast<std::chrono::nanoseconds>(packet_age).count();
                 const auto max_packet_age_ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::milliseconds(MAX_JITTER_PACKET_AGE_MS))
+                        std::chrono::milliseconds(client->get_jitter_packet_age_limit_ms()))
                         .count();
 
                 while (packet_age_ns > max_packet_age_ns) {
@@ -1862,6 +1872,7 @@ private:
     std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
     std::atomic<size_t>      opus_jitter_buffer_packets_{DEFAULT_OPUS_JITTER_PACKETS};
     std::atomic<size_t>      opus_queue_limit_packets_{DEFAULT_OPUS_QUEUE_LIMIT_PACKETS};
+    std::atomic<int>         jitter_packet_age_limit_ms_{DEFAULT_JITTER_PACKET_AGE_MS};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
     moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
@@ -2089,6 +2100,25 @@ static void draw_master_strip(Client& client, float available_height) {
         }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%zu pkt max", client.get_opus_queue_limit_packets());
+
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Age limit:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        int age_limit_ms = client.get_jitter_packet_age_limit_ms();
+        if (!jitter_enabled) {
+            ImGui::BeginDisabled();
+        }
+        ImGui::PushItemWidth(width - PADDING);
+        if (ImGui::InputInt("##JitterPacketAgeLimitMs", &age_limit_ms, 5, 20)) {
+            client.set_jitter_packet_age_limit_ms(age_limit_ms);
+        }
+        ImGui::PopItemWidth();
+        if (!jitter_enabled) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("%d ms max", client.get_jitter_packet_age_limit_ms());
 
         ImGui::Spacing();
         ImGui::Separator();
