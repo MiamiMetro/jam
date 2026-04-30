@@ -178,9 +178,11 @@ public:
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type  = CtrlHdr::Cmd::LEAVE;
-        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
-        std::memcpy(buf->data(), &chdr, sizeof(CtrlHdr));
-        send(buf->data(), buf->size(), buf);
+        std::error_code leave_error;
+        socket_.send_to(asio::buffer(&chdr, sizeof(CtrlHdr)), server_endpoint_, 0, leave_error);
+        if (leave_error) {
+            Log::warn("LEAVE send failed: {}", leave_error.message());
+        }
 
         // Cancel pending async operations
         socket_.cancel();
