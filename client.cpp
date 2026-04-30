@@ -374,6 +374,10 @@ public:
         return opus_jitter_buffer_packets_.load(std::memory_order_acquire);
     }
 
+    size_t get_opus_queue_limit_packets() const {
+        return opus_queue_limit_packets_.load(std::memory_order_acquire);
+    }
+
     void set_opus_jitter_buffer_packets(size_t packets) {
         const size_t clamped =
             std::clamp(packets, MIN_OPUS_JITTER_PACKETS, MAX_OPUS_JITTER_PACKETS);
@@ -388,6 +392,17 @@ public:
                     participant.buffer_ready = false;
                 }
             }
+        });
+    }
+
+    void set_opus_queue_limit_packets(size_t packets) {
+        const size_t min_limit =
+            std::max(MIN_OPUS_QUEUE_LIMIT_PACKETS, get_opus_jitter_buffer_packets());
+        const size_t clamped = std::clamp(packets, min_limit, MAX_OPUS_QUEUE_LIMIT_PACKETS);
+        opus_queue_limit_packets_.store(clamped, std::memory_order_release);
+
+        participant_manager_.for_each([clamped](uint32_t, ParticipantData& participant) {
+            participant.opus_queue_limit_packets = clamped;
         });
     }
 
@@ -886,13 +901,13 @@ private:
             participant.opus_pcm_buffered_frames, std::memory_order_relaxed);
     }
 
-    static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_jitter_buffer) {
+    static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_queue_limit) {
         size_t base_limit = TARGET_OPUS_QUEUE_SIZE + 1;
         if (packet.frame_count <= 128) {
             base_limit = 8;
         }
         if (packet.codec == AudioCodec::Opus) {
-            base_limit = std::max(base_limit, opus_jitter_buffer + OPUS_JITTER_QUEUE_HEADROOM);
+            base_limit = std::max(base_limit, opus_queue_limit);
         }
         return std::min(base_limit, MAX_OPUS_QUEUE_SIZE);
     }
@@ -1276,7 +1291,7 @@ private:
 
             // Bounded jitter management: drop old packets if queue is too large.
             const size_t max_queue_packets =
-                max_receive_queue_packets(packet, get_opus_jitter_buffer_packets());
+                max_receive_queue_packets(packet, get_opus_queue_limit_packets());
             participant.opus_queue_limit_packets = max_queue_packets;
             while (queue_size + 1 > max_queue_packets) {
                 OpusPacket discarded;
@@ -1846,6 +1861,7 @@ private:
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
     std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
     std::atomic<size_t>      opus_jitter_buffer_packets_{DEFAULT_OPUS_JITTER_PACKETS};
+    std::atomic<size_t>      opus_queue_limit_packets_{DEFAULT_OPUS_QUEUE_LIMIT_PACKETS};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
     moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
@@ -2038,6 +2054,10 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::PushItemWidth(width - PADDING);
         if (ImGui::InputInt("##OpusJitterPackets", &jitter_packets, 1, 1)) {
             client.set_opus_jitter_buffer_packets(static_cast<size_t>(std::max(jitter_packets, 0)));
+            if (client.get_opus_queue_limit_packets() <
+                client.get_opus_jitter_buffer_packets()) {
+                client.set_opus_queue_limit_packets(client.get_opus_jitter_buffer_packets());
+            }
         }
         ImGui::PopItemWidth();
         if (!jitter_enabled) {
@@ -2049,6 +2069,26 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%zu pkt, %.1f ms", client.get_opus_jitter_buffer_packets(),
                     client.get_opus_jitter_buffer_packets() * packet_ms);
+
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Queue limit:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        int queue_limit_packets = static_cast<int>(client.get_opus_queue_limit_packets());
+        if (!jitter_enabled) {
+            ImGui::BeginDisabled();
+        }
+        ImGui::PushItemWidth(width - PADDING);
+        if (ImGui::InputInt("##OpusQueueLimitPackets", &queue_limit_packets, 1, 4)) {
+            client.set_opus_queue_limit_packets(
+                static_cast<size_t>(std::max(queue_limit_packets, 0)));
+        }
+        ImGui::PopItemWidth();
+        if (!jitter_enabled) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("%zu pkt max", client.get_opus_queue_limit_packets());
 
         ImGui::Spacing();
         ImGui::Separator();

@@ -245,6 +245,8 @@ Tasks:
 - [ ] Add diagnostics for why a packet is dropped: queue limit, age limit,
       decoded-buffer overflow, or codec mismatch.
 - [ ] Add diagnostics for callback frame count versus packet frame count.
+- [ ] Expose manual queue limit separately from manual jitter buffer so burst
+      capacity can be tested directly.
 - [ ] Re-test manual jitter `5`, `8`, `10`, and `13` after instrumentation.
 - [ ] Do not implement auto jitter until the receiver can explain near-full plus
       underrun behavior.
