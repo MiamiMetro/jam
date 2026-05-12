@@ -1157,20 +1157,6 @@ private:
         }
     }
 
-    static void trim_opus_queue_to_playout_target(ParticipantData& participant,
-                                                  size_t target_packets) {
-        size_t queue_size = participant.opus_queue.size_approx();
-        while (queue_size > target_packets) {
-            OpusPacket discarded;
-            if (!participant.opus_queue.try_dequeue(discarded)) {
-                break;
-            }
-            queue_size--;
-            participant.opus_target_trim_drops.fetch_add(1, std::memory_order_relaxed);
-        }
-        observe_participant_queue_depth(participant, queue_size);
-    }
-
     static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_queue_limit) {
         size_t base_limit = TARGET_OPUS_QUEUE_SIZE + 1;
         if (packet.frame_count <= 128) {
@@ -1676,11 +1662,6 @@ private:
                 participant.opus_queue.enqueue(packet);  // OpusPacket is trivially copyable
                 size_t queue_after_enqueue = queue_size + 1;
                 observe_participant_queue_depth(participant, queue_after_enqueue);
-                if (packet.codec == AudioCodec::Opus) {
-                    trim_opus_queue_to_playout_target(
-                        participant, opus_playout_target_queue_packets(participant));
-                    queue_after_enqueue = participant.opus_queue.size_approx();
-                }
                 participant.last_packet_time = packet.timestamp;
 
                 // Mark buffer as ready once we have enough packets
