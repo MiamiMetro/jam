@@ -127,7 +127,7 @@ function logStats(file) {
     sequenceGapMentions: 0,
     latePacketMentions: 0,
     largeDriftMentions: 0,
-    maxAbsDriftPpm: 0,
+    maxAbsSustainedDriftPpm: 0,
     firstTs: 0,
     lastTs: 0,
   };
@@ -187,10 +187,13 @@ function logStats(file) {
 
     const drift = /drift_ppm last\/avg\/max=([-.\d]+)\/([-.\d]+)\/([-.\d]+)/.exec(line);
     if (drift) {
-      const maxAbsDrift = Math.max(Math.abs(Number(drift[1])), Math.abs(Number(drift[2])), Math.abs(Number(drift[3])));
-      if (Number.isFinite(maxAbsDrift)) {
-        stats.maxAbsDriftPpm = Math.max(stats.maxAbsDriftPpm, maxAbsDrift);
-        if (maxAbsDrift > DRIFT_REVIEW_PPM) stats.largeDriftMentions += 1;
+      const sustainedAbsDrift = Math.abs(Number(drift[2]));
+      if (Number.isFinite(sustainedAbsDrift)) {
+        stats.maxAbsSustainedDriftPpm = Math.max(
+          stats.maxAbsSustainedDriftPpm,
+          sustainedAbsDrift,
+        );
+        if (sustainedAbsDrift > DRIFT_REVIEW_PPM) stats.largeDriftMentions += 1;
       }
     }
   }
@@ -708,7 +711,7 @@ function validateManifest(manifestPath) {
         stats.latePacketMentions ||
         stats.largeDriftMentions
       ) {
-        const detail = `${logPath}: warnings=${stats.warnings}, errors=${stats.errors}, health=${stats.healthWarnings}, underrunLines=${stats.underrunMentions}, seqGapLines=${stats.sequenceGapMentions}, lateLines=${stats.latePacketMentions}, largeDriftLines=${stats.largeDriftMentions}, maxAbsDriftPpm=${stats.maxAbsDriftPpm}`;
+        const detail = `${logPath}: warnings=${stats.warnings}, errors=${stats.errors}, health=${stats.healthWarnings}, underrunLines=${stats.underrunMentions}, seqGapLines=${stats.sequenceGapMentions}, lateLines=${stats.latePacketMentions}, largeDriftLines=${stats.largeDriftMentions}, maxAbsSustainedDriftPpm=${stats.maxAbsSustainedDriftPpm}`;
         if (session.allowWarnings === true && nonEmptyString(session.warningExplanation)) warnings.push(`${session.name}: allowed warning indicators: ${detail}`);
         else errors.push(`${session.name}: warning indicators require explanation or fix: ${detail}`);
       }
@@ -989,7 +992,7 @@ function runSelfTest() {
     longLog,
   ].join("\n");
   const sequenceGapLog = fiveMinuteLog.replace("seq gap/late=0/0", "seq gap/late=1/0");
-  const largeDriftLog = fiveMinuteLog.replace("drift_ppm last/avg/max=0.0/0.0/0.0", "drift_ppm last/avg/max=0.0/0.0/300.0");
+  const largeDriftLog = fiveMinuteLog.replace("drift_ppm last/avg/max=0.0/0.0/0.0", "drift_ppm last/avg/max=0.0/300.0/300.0");
   const shortDiagnosticLog = fiveMinuteLog.replace("20:06:00.000", "20:01:00.000");
   const noDiagnosticLog = [
     "[2026-05-11 20:00:00.000] [info] Connected",

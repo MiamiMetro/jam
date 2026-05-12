@@ -19,8 +19,10 @@ Opus push. Status values are `done`, `in_progress`, `pending`, or `blocked`.
 - Status `in_progress`: drift diagnostics now ignore startup warmup and reject
   implausible arrival-timing outliers. They also use a longer arrival-time
   observation window so ordinary OS/network scheduling jitter does not look
-  like hardware clock drift. Verify with fresh cross-machine logs after this
-  change is committed, pushed, pulled, and rebuilt on macOS.
+  like hardware clock drift, and strict evidence review now warns on sustained
+  average drift rather than one-sample arrival maxima. Verify with fresh
+  cross-machine logs after this change is committed, pushed, pulled, and
+  rebuilt on macOS.
 - Status `pending`: run current-source local verification on Windows with
   `node tools/opus-local-verify.mjs --out build/opus-local-verify/current`.
 - Status `pending`: push the current receiver/diagnostic code and pull it on
@@ -114,8 +116,9 @@ A gate is complete only when:
     warmup observations so startup scheduling does not permanently poison the
     max drift field, implausible arrival-timing outliers are rejected, and the
     observation window is long enough that scheduler jitter does not masquerade
-    as hardware clock drift. Evidence required: refreshed logs must show
-    steady-state drift max instead of the old startup spike.
+    as hardware clock drift. Evidence review keys off sustained average drift
+    rather than one-sample arrival maxima. Evidence required: refreshed logs
+    must show steady-state drift instead of the old startup spike.
   - Strict acceptance without review exceptions: pending. The target 9+ gate is
     to remove `allowWarnings` from the external manifest and still pass
     `node tools/opus-acceptance.mjs --external-manifest validation/opus-external-validation.json`.

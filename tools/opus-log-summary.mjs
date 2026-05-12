@@ -100,7 +100,7 @@ function participantState(id) {
     last: null,
     maxQueue: 0,
     maxAgeMs: 0,
-    maxDriftPpm: 0,
+    maxSustainedDriftPpm: 0,
     maxUnderruns: 0,
     maxQueueDrops: 0,
     maxAgeDrops: 0,
@@ -209,7 +209,10 @@ function parseLog(file) {
       state.last = current;
       state.maxQueue = Math.max(state.maxQueue, current.queueMax);
       state.maxAgeMs = Math.max(state.maxAgeMs, current.ageAvgMs);
-      state.maxDriftPpm = Math.max(state.maxDriftPpm, Math.abs(current.driftMaxPpm));
+      state.maxSustainedDriftPpm = Math.max(
+        state.maxSustainedDriftPpm,
+        Math.abs(current.driftAvgPpm),
+      );
       state.maxUnderruns = Math.max(state.maxUnderruns, current.underruns);
       state.maxQueueDrops = Math.max(state.maxQueueDrops, current.queueDrops);
       state.maxAgeDrops = Math.max(state.maxAgeDrops, current.ageDrops);
@@ -245,9 +248,9 @@ function statusFor(summary) {
       status = "warn";
       reasons.push(`participant ${participant.id} underruns=${participant.maxUnderruns}`);
     }
-    if (participant.maxDriftPpm > DRIFT_REVIEW_PPM) {
+    if (participant.maxSustainedDriftPpm > DRIFT_REVIEW_PPM) {
       status = "warn";
-      reasons.push(`participant ${participant.id} drift_ppm=${participant.maxDriftPpm}`);
+      reasons.push(`participant ${participant.id} drift_avg_ppm=${participant.maxSustainedDriftPpm}`);
     }
     if (participant.maxSequenceGaps > 0 || participant.maxLateOrReordered > 0) {
       status = "warn";
@@ -313,14 +316,14 @@ function markdownReport(summaries) {
     "",
     "## Participant Diagnostics",
     "",
-    "| File | Participant | Diags | Last q | Max q | Jitter | Queue limit | Last age ms | Max drift ppm | Underruns | Drops q/age | Detail limit/overflow | Seq gap/late | Target trim |",
+    "| File | Participant | Diags | Last q | Max q | Jitter | Queue limit | Last age ms | Max sustained drift ppm | Underruns | Drops q/age | Detail limit/overflow | Seq gap/late | Target trim |",
     "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: |",
   );
   for (const summary of summaries) {
     for (const participant of summary.participants.values()) {
       const last = participant.last ?? {};
       lines.push(
-        `| ${summary.file} | ${participant.id} | ${participant.diagCount} | ${last.queue ?? ""} | ${participant.maxQueue} | ${last.jitterBuffer ?? ""} | ${last.queueLimit ?? ""} | ${last.ageAvgMs ?? ""} | ${participant.maxDriftPpm} | ${participant.maxUnderruns} | ${participant.maxQueueDrops}/${participant.maxAgeDrops} | ${participant.maxLimitDrops}/${participant.maxOverflowDrops} | ${participant.maxSequenceGaps}/${participant.maxLateOrReordered} | ${participant.maxTargetTrim} |`,
+        `| ${summary.file} | ${participant.id} | ${participant.diagCount} | ${last.queue ?? ""} | ${participant.maxQueue} | ${last.jitterBuffer ?? ""} | ${last.queueLimit ?? ""} | ${last.ageAvgMs ?? ""} | ${participant.maxSustainedDriftPpm} | ${participant.maxUnderruns} | ${participant.maxQueueDrops}/${participant.maxAgeDrops} | ${participant.maxLimitDrops}/${participant.maxOverflowDrops} | ${participant.maxSequenceGaps}/${participant.maxLateOrReordered} | ${participant.maxTargetTrim} |`,
       );
     }
   }
@@ -330,7 +333,7 @@ function markdownReport(summaries) {
     "## Notes",
     "",
     "- `pass` means this parser found no warning indicators in the parsed log, not that audio was subjectively perfect.",
-    "- `warn` means the log contains warning/error lines, audio health warnings, underruns, sequence issues, drift above `250 ppm`, or other diagnostics that need review.",
+    "- `warn` means the log contains warning/error lines, audio health warnings, underruns, sequence issues, sustained average drift above `250 ppm`, or other diagnostics that need review.",
     "- This parser is intended for external validation logs produced with `--log-file`.",
     "",
   );
@@ -351,7 +354,7 @@ function runSelfTest() {
   const driftLog = path.join(dir, "drift.log");
   const sequenceLog = path.join(dir, "sequence.log");
   writeFixture(cleanLog, `${baseDiag}\n`);
-  writeFixture(driftLog, `${baseDiag.replace("drift_ppm last/avg/max=0.0/0.0/0.0", "drift_ppm last/avg/max=0.0/0.0/300.0")}\n`);
+  writeFixture(driftLog, `${baseDiag.replace("drift_ppm last/avg/max=0.0/0.0/0.0", "drift_ppm last/avg/max=0.0/300.0/300.0")}\n`);
   writeFixture(sequenceLog, `${baseDiag.replace("seq gap/late=0/0", "seq gap/late=1/0")}\n`);
 
   const clean = statusFor(parseLog(cleanLog));
@@ -359,7 +362,7 @@ function runSelfTest() {
     throw new Error(`expected clean log to pass, got ${clean.status}: ${clean.reasons}`);
   }
   const drift = statusFor(parseLog(driftLog));
-  if (drift.status !== "warn" || !drift.reasons.includes("drift_ppm=300")) {
+  if (drift.status !== "warn" || !drift.reasons.includes("drift_avg_ppm=300")) {
     throw new Error(`expected drift log to warn on drift, got ${drift.status}: ${drift.reasons}`);
   }
   const sequence = statusFor(parseLog(sequenceLog));
