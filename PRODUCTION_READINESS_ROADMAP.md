@@ -5,10 +5,6 @@ notes were broader than the current launch target.
 
 ## Gate 1: SFU Production Hardening
 
-Status: Active for the current V1 branch. Implement native SFU limits,
-rate-limiting, counters, and validation probes in `udpstuff`; keep deployment
-firewall/process-supervision controls as release operations.
-
 Before public official or community SFU usage, the server needs basic
 production controls.
 
@@ -33,8 +29,6 @@ production controls.
 
 ## Gate 2: SFU-Authoritative Presence And Capacity
 
-Status: Deferred. Do not touch `jam-app` or Convex for this gate yet.
-
 Convex and Electron can support the product UI, but active performer presence
 and capacity should come from the SFU.
 
@@ -51,8 +45,6 @@ and capacity should come from the SFU.
 - Electron native process state remains local UI state only.
 
 ## Gate 7: Room Lifecycle, Rules, And Moderation
-
-Status: Deferred until after Gate 2.
 
 Keep this after the SFU hardening and authoritative presence work, because room
 rules depend on reliable live room state.

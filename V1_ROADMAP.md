@@ -39,13 +39,11 @@ the production gates that still matter for V1.
 
 ### Gate 2: SFU-Authoritative Presence And Capacity
 
-- Deferred for now.
 - SFU heartbeat, room/performer counts, join/leave/stale events, backend live
   room state, SFU-backed `maxPerformers`, and full-room token refusal.
 
 ### Gate 7: Room Lifecycle, Rules, And Moderation
 
-- Deferred for now.
 - Inactivity cleanup, global/community room rules, private room rules, host
   controls, moderation controls if needed, duplicate launch behavior, and stale
   session cleanup.

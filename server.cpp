@@ -27,7 +27,6 @@
 #include "periodic_timer.h"
 #include "protocol.h"
 #include "server_config.h"
-#include "server_hardening.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -63,14 +62,6 @@ struct ServerOptions {
     std::string server_id = "local-dev";
     std::string join_secret;
     std::string log_file_path;
-    size_t      max_clients = server_config::DEFAULT_MAX_CLIENTS;
-    size_t      max_active_rooms = server_config::DEFAULT_MAX_ACTIVE_ROOMS;
-    size_t      max_performers_per_room = server_config::DEFAULT_MAX_PERFORMERS_PER_ROOM;
-    size_t      ip_packets_per_second = server_config::DEFAULT_IP_PACKETS_PER_SECOND;
-    size_t      ip_bytes_per_second = server_config::DEFAULT_IP_BYTES_PER_SECOND;
-    size_t      room_packets_per_second = server_config::DEFAULT_ROOM_PACKETS_PER_SECOND;
-    size_t      participant_packets_per_second =
-        server_config::DEFAULT_PARTICIPANT_PACKETS_PER_SECOND;
 };
 
 template <size_t N>
@@ -85,9 +76,7 @@ public:
         : options_(options),
           socket_(io_context, udp::endpoint(udp::v4(), options.port)),
           alive_check_timer_(io_context, server_config::ALIVE_CHECK_INTERVAL,
-                             [this]() { alive_check_timer_callback(); }),
-          metrics_timer_(io_context, server_config::METRICS_LOG_INTERVAL,
-                         [this]() { metrics_timer_callback(); }) {
+                             [this]() { alive_check_timer_callback(); }) {
         // Optimize UDP socket buffers for high-throughput packet forwarding
         try {
             socket_.set_option(asio::socket_base::receive_buffer_size(131072));  // 128KB
@@ -118,18 +107,7 @@ public:
             return;
         }
 
-        const auto now = std::chrono::steady_clock::now();
-        metrics_.packets_rx.fetch_add(1, std::memory_order_relaxed);
-        metrics_.bytes_rx.fetch_add(bytes, std::memory_order_relaxed);
-
         if (!message_validator::has_valid_header(bytes)) {
-            metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
-            do_receive();
-            return;
-        }
-
-        if (!allow_ip_packet(now, bytes)) {
-            metrics_.rate_limit_drops.fetch_add(1, std::memory_order_relaxed);
             do_receive();
             return;
         }
@@ -151,8 +129,6 @@ public:
     // Send with optional shared_ptr to keep data alive during async operation
     void send(void* data, std::size_t len, const udp::endpoint& target,
               const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
-        metrics_.packets_tx.fetch_add(1, std::memory_order_relaxed);
-        metrics_.bytes_tx.fetch_add(len, std::memory_order_relaxed);
         socket_.async_send_to(asio::buffer(data, len), target,
                               [keep_alive](std::error_code error_code, std::size_t) {
                                   if (error_code) {
@@ -169,49 +145,6 @@ private:
         uint64_t                              drops = 0;
         bool                                  first_log_emitted = false;
     };
-
-    struct IpRateLimitInfo {
-        TokenBucket packet_bucket;
-        TokenBucket byte_bucket;
-        std::chrono::steady_clock::time_point last_seen{};
-        std::chrono::steady_clock::time_point last_log{};
-    };
-
-    bool allow_ip_packet(std::chrono::steady_clock::time_point now, size_t bytes) {
-        const std::string ip = remote_endpoint_.address().to_string();
-        auto& state = ip_rate_limits_[ip];
-        state.last_seen = now;
-        const bool packet_allowed = state.packet_bucket.allow(
-            1, options_.ip_packets_per_second,
-            static_cast<double>(options_.ip_packets_per_second), now);
-        const bool byte_allowed = state.byte_bucket.allow(
-            bytes, options_.ip_bytes_per_second, static_cast<double>(options_.ip_bytes_per_second),
-            now);
-        if (!packet_allowed || !byte_allowed) {
-            if (now - state.last_log >= server_config::UNKNOWN_ENDPOINT_LOG_INTERVAL) {
-                Log::warn("Rate limiting UDP endpoint {}:{}", ip, remote_endpoint_.port());
-                state.last_log = now;
-            }
-            return false;
-        }
-        return true;
-    }
-
-    bool allow_room_packet(const std::string& room_id, std::chrono::steady_clock::time_point now) {
-        if (room_id.empty()) {
-            return true;
-        }
-        auto& bucket = room_packet_limits_[room_id];
-        return bucket.allow(1, options_.room_packets_per_second,
-                            static_cast<double>(options_.room_packets_per_second), now);
-    }
-
-    bool allow_participant_packet(const udp::endpoint& endpoint,
-                                  std::chrono::steady_clock::time_point now) {
-        auto& bucket = participant_packet_limits_[endpoint];
-        return bucket.allow(1, options_.participant_packets_per_second,
-                            static_cast<double>(options_.participant_packets_per_second), now);
-    }
 
     void handle_receive_error(std::error_code error_code) {
         Log::error("receive error: {}", error_code.message());
@@ -241,7 +174,6 @@ private:
 
     void handle_ctrl_message(std::size_t bytes) {
         if (bytes < sizeof(CtrlHdr)) {
-            metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
             do_receive();
             return;
         }
@@ -250,14 +182,6 @@ private:
         std::memcpy(&chdr, recv_buf_.data(), sizeof(CtrlHdr));
 
         auto now = std::chrono::steady_clock::now();
-        if (chdr.type != CtrlHdr::Cmd::JOIN) {
-            const std::string room_id = client_manager_.get_room_id(remote_endpoint_);
-            if (!allow_room_packet(room_id, now) ||
-                !allow_participant_packet(remote_endpoint_, now)) {
-                metrics_.rate_limit_drops.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
 
         switch (chdr.type) {
             case CtrlHdr::Cmd::JOIN:
@@ -294,8 +218,6 @@ private:
         if (bytes < sizeof(JoinHdr)) {
             Log::warn("Rejecting JOIN from {}:{}: packet too small",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
-            metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
-            metrics_.joins_rejected.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -310,13 +232,11 @@ private:
         if (room_id.empty() || profile_id.empty()) {
             Log::warn("Rejecting JOIN from {}:{}: missing room or profile id",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
-            metrics_.joins_rejected.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (token.empty() && !options_.allow_insecure_dev_joins) {
             Log::warn("Rejecting JOIN from {}:{} room '{}': missing token",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id);
-            metrics_.joins_rejected.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (!token.empty() && !options_.allow_insecure_dev_joins) {
@@ -326,39 +246,12 @@ private:
                 Log::warn("Rejecting JOIN from {}:{} room '{}': {}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
                           result.reason);
-                metrics_.joins_rejected.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
         }
 
-        if (client_manager_.count() >= options_.max_clients &&
-            !client_manager_.exists(remote_endpoint_)) {
-            metrics_.joins_rejected.fetch_add(1, std::memory_order_relaxed);
-            metrics_.capacity_rejects.fetch_add(1, std::memory_order_relaxed);
-            Log::warn("Rejecting JOIN for room '{}': server capacity reached ({})", room_id,
-                      options_.max_clients);
-            return;
-        }
-        if (!client_manager_.room_exists(room_id) &&
-            client_manager_.room_count() >= options_.max_active_rooms) {
-            metrics_.joins_rejected.fetch_add(1, std::memory_order_relaxed);
-            metrics_.capacity_rejects.fetch_add(1, std::memory_order_relaxed);
-            Log::warn("Rejecting JOIN for room '{}': active room limit reached ({})", room_id,
-                      options_.max_active_rooms);
-            return;
-        }
-        if (client_manager_.count_room_clients(room_id) >= options_.max_performers_per_room &&
-            !client_manager_.exists(remote_endpoint_)) {
-            metrics_.joins_rejected.fetch_add(1, std::memory_order_relaxed);
-            metrics_.capacity_rejects.fetch_add(1, std::memory_order_relaxed);
-            Log::warn("Rejecting JOIN for room '{}': performer limit reached ({})", room_id,
-                      options_.max_performers_per_room);
-            return;
-        }
-
         uint32_t client_id = client_manager_.register_performer_client(
             remote_endpoint_, now, room_id, profile_id, display_name);
-        metrics_.joins_accepted.fetch_add(1, std::memory_order_relaxed);
         Log::info("JOIN: {}:{} room='{}' user='{}' display='{}' (ID: {}, {})",
                   remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
                   profile_id, display_name, client_id,
@@ -376,25 +269,16 @@ private:
                                         : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
         if (!message_validator::is_valid_audio_packet(bytes, min_audio_packet_size)) {
             Log::debug("Audio packet too small: {} bytes", bytes);
-            metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
             do_receive();
             return;
         }
 
         if (!client_manager_.exists(remote_endpoint_)) {
-            metrics_.unauthorized_drops.fetch_add(1, std::memory_order_relaxed);
             record_unknown_audio_drop(remote_endpoint_);
             return;
         }
 
-        const auto now = std::chrono::steady_clock::now();
-        const std::string room_id = client_manager_.get_room_id(remote_endpoint_);
-        if (!allow_room_packet(room_id, now) || !allow_participant_packet(remote_endpoint_, now)) {
-            metrics_.rate_limit_drops.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-
-        client_manager_.update_alive(remote_endpoint_, now);
+        client_manager_.update_alive(remote_endpoint_, std::chrono::steady_clock::now());
 
         // Get sender's client ID
         uint32_t sender_id = client_manager_.get_client_id(remote_endpoint_);
@@ -413,14 +297,12 @@ private:
     void handle_metronome_sync(std::size_t bytes, std::chrono::steady_clock::time_point now) {
         if (bytes < sizeof(MetronomeSyncHdr)) {
             Log::debug("Metronome sync packet too small: {} bytes", bytes);
-            metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
         if (!client_manager_.exists(remote_endpoint_)) {
             Log::warn("Dropping metronome sync from unjoined endpoint {}:{}",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
-            metrics_.unauthorized_drops.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -486,59 +368,12 @@ private:
 
     void alive_check_timer_callback() {
         auto now = std::chrono::steady_clock::now();
-        auto timed_out_clients =
-            client_manager_.remove_timed_out_client_infos(now, server_config::CLIENT_TIMEOUT);
+        auto timed_out_ids =
+            client_manager_.remove_timed_out_clients(now, server_config::CLIENT_TIMEOUT);
 
-        for (const auto& timed_out: timed_out_clients) {
-            Log::info("Client timed out (ID: {})", timed_out.client_id);
-            broadcast_participant_leave(timed_out.client_id);
-        }
-    }
-
-    void metrics_timer_callback() {
-        cleanup_rate_limits(std::chrono::steady_clock::now());
-        const auto room_counts = client_manager_.get_room_counts();
-        Log::info(
-            "SFU metrics: clients={} rooms={} rx={}B/{}pkt tx={}B/{}pkt joins={}/{} "
-            "drops malformed/unauth/rate/capacity={}/{}/{}/{}",
-            client_manager_.count(), room_counts.size(),
-            metrics_.bytes_rx.load(std::memory_order_relaxed),
-            metrics_.packets_rx.load(std::memory_order_relaxed),
-            metrics_.bytes_tx.load(std::memory_order_relaxed),
-            metrics_.packets_tx.load(std::memory_order_relaxed),
-            metrics_.joins_accepted.load(std::memory_order_relaxed),
-            metrics_.joins_rejected.load(std::memory_order_relaxed),
-            metrics_.malformed_packets.load(std::memory_order_relaxed),
-            metrics_.unauthorized_drops.load(std::memory_order_relaxed),
-            metrics_.rate_limit_drops.load(std::memory_order_relaxed),
-            metrics_.capacity_rejects.load(std::memory_order_relaxed));
-    }
-
-    void cleanup_rate_limits(std::chrono::steady_clock::time_point now) {
-        for (auto it = ip_rate_limits_.begin(); it != ip_rate_limits_.end();) {
-            if (now - it->second.last_seen > server_config::UNKNOWN_ENDPOINT_TTL) {
-                it = ip_rate_limits_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        for (auto it = participant_packet_limits_.begin(); it != participant_packet_limits_.end();) {
-            if (!client_manager_.exists(it->first) &&
-                now - it->second.last_seen() > server_config::UNKNOWN_ENDPOINT_TTL) {
-                it = participant_packet_limits_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        for (auto it = room_packet_limits_.begin(); it != room_packet_limits_.end();) {
-            if (!client_manager_.room_exists(it->first) &&
-                now - it->second.last_seen() > server_config::UNKNOWN_ENDPOINT_TTL) {
-                it = room_packet_limits_.erase(it);
-            } else {
-                ++it;
-            }
+        for (uint32_t timed_out_id: timed_out_ids) {
+            Log::info("Client timed out (ID: {})", timed_out_id);
+            broadcast_participant_leave(timed_out_id);
         }
     }
 
@@ -596,11 +431,7 @@ private:
     udp::socket   socket_;
 
     ClientManager client_manager_;
-    ServerMetrics metrics_;
     std::unordered_map<udp::endpoint, UnknownEndpointInfo, endpoint_hash> unknown_endpoints_;
-    std::unordered_map<std::string, IpRateLimitInfo> ip_rate_limits_;
-    std::unordered_map<std::string, TokenBucket> room_packet_limits_;
-    std::unordered_map<udp::endpoint, TokenBucket, endpoint_hash> participant_packet_limits_;
     uint64_t unknown_audio_drops_since_log_ = 0;
     std::chrono::steady_clock::time_point last_unknown_audio_summary_ =
         std::chrono::steady_clock::now();
@@ -609,7 +440,6 @@ private:
     udp::endpoint                                  remote_endpoint_;
 
     PeriodicTimer alive_check_timer_;
-    PeriodicTimer metrics_timer_;
 };
 
 ServerOptions parse_server_options(int argc, char** argv) {
@@ -626,21 +456,6 @@ ServerOptions parse_server_options(int argc, char** argv) {
             options.log_file_path = argv[++i];
         } else if (arg == "--allow-insecure-dev-joins") {
             options.allow_insecure_dev_joins = true;
-        } else if (arg == "--max-clients" && i + 1 < argc) {
-            options.max_clients = static_cast<size_t>(std::stoull(argv[++i]));
-        } else if (arg == "--max-active-rooms" && i + 1 < argc) {
-            options.max_active_rooms = static_cast<size_t>(std::stoull(argv[++i]));
-        } else if (arg == "--max-performers-per-room" && i + 1 < argc) {
-            options.max_performers_per_room = static_cast<size_t>(std::stoull(argv[++i]));
-        } else if (arg == "--ip-packets-per-second" && i + 1 < argc) {
-            options.ip_packets_per_second = static_cast<size_t>(std::stoull(argv[++i]));
-        } else if (arg == "--ip-bytes-per-second" && i + 1 < argc) {
-            options.ip_bytes_per_second = static_cast<size_t>(std::stoull(argv[++i]));
-        } else if (arg == "--room-packets-per-second" && i + 1 < argc) {
-            options.room_packets_per_second = static_cast<size_t>(std::stoull(argv[++i]));
-        } else if (arg == "--participant-packets-per-second" && i + 1 < argc) {
-            options.participant_packets_per_second =
-                static_cast<size_t>(std::stoull(argv[++i]));
         }
     }
     return options;
@@ -662,11 +477,6 @@ int main(int argc, char** argv) {
             Log::info("Logging to {}", options.log_file_path);
         }
         Log::info("Forwarding audio packets between clients");
-        Log::info("Limits: clients={} rooms={} performers_per_room={} ip={}/{}Bps room={}pps participant={}pps",
-                  options.max_clients, options.max_active_rooms,
-                  options.max_performers_per_room, options.ip_packets_per_second,
-                  options.ip_bytes_per_second, options.room_packets_per_second,
-                  options.participant_packets_per_second);
         if (options.allow_insecure_dev_joins) {
             Log::warn("Insecure performer dev joins enabled");
         } else if (options.join_secret.empty()) {
