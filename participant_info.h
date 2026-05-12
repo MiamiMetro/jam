@@ -43,6 +43,8 @@ struct ParticipantData {
     double                                  opus_resample_phase = 0.0;
     uint64_t                                opus_rate_last_queue_limit_drops = 0;
     int                                     opus_rate_correction_callbacks = 0;
+    std::atomic<int64_t>                    opus_playout_rate_ratio_micros{1'000'000};
+    std::atomic<int>                        opus_rate_correction_callbacks_observed{0};
     std::atomic<size_t>                     opus_pcm_buffered_frames_observed{0};
     std::atomic<uint64_t>                   opus_packets_decoded_in_callback{0};
     std::atomic<uint64_t>                   opus_queue_limit_drops{0};
@@ -138,6 +140,8 @@ struct ParticipantInfo {
     uint64_t opus_age_limit_drops;
     uint64_t opus_decode_buffer_overflow_drops;
     uint64_t opus_target_trim_drops;
+    double   opus_playout_rate_ratio;
+    int      opus_rate_correction_callbacks;
     size_t   last_packet_frame_count;
     size_t   last_callback_frame_count;
     int      underrun_count;

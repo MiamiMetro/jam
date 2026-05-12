@@ -27,8 +27,15 @@ A gate is complete only when:
     adaptation instead of whole-packet queue shedding. The default Opus burst
     capacity and packet-age guard now provide enough headroom for that
     controller to stabilize without changing the 8-packet jitter target.
-    Evidence required: Windows/macOS session logs must show materially reduced
-    or zero steady queue-limit drops before this item is accepted.
+    New harness coverage models 120-frame Opus packets feeding 128-frame output
+    callbacks plus positive and negative receiver clock skew. Evidence required:
+    Windows/macOS session logs must show materially reduced or zero steady
+    queue-limit drops before this item is accepted.
+  - Playout diagnostics: in progress. Participant logs now include the current
+    Opus playout ratio and remaining correction callbacks beside decoded packet
+    and drop rates. Evidence required: refreshed cross-machine logs must explain
+    whether any remaining queue drops happen while the controller is pinned,
+    idle, or oscillating.
   - Benign device capability diagnostics: in progress. RtAudio callback-size
     adjustment and unavailable backend-latency reporting now log as `info`,
     not warning, because they describe host capability/fallback behavior rather
@@ -77,7 +84,8 @@ A gate is complete only when:
 - `udp_impair_proxy` now builds as an actual UDP-path impairment tool for live
   SFU/client testing.
 - `cmake --build build --target opus_receiver_harness_self_test --config Debug`
-  passed and runs the core harness assertions as a build target.
+  passed and runs the core harness assertions as a build target, including the
+  adaptive callback-mismatch and receiver clock-skew cases.
 - `.\build\Debug\client.exe --startup-config-smoke --codec opus --frames 120 --jitter 7 --queue-limit 20 --age-limit-ms 80 --auto-jitter`
   passed and proved startup tuning flags apply without opening the GUI/audio stream.
 - `tools/opus-validation.mjs` now collects cross-platform smoke evidence into

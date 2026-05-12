@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <fstream>
@@ -15,9 +16,12 @@ constexpr int SAMPLE_RATE = 48000;
 constexpr int DEFAULT_FRAMES = 120;
 constexpr int DEFAULT_PACKETS = 1200;
 constexpr int IMPULSE_PACKET = 20;
+constexpr int PCM_BUFFER_FRAMES = 1920;
 
 struct Config {
     int frames = DEFAULT_FRAMES;
+    int callback_frames = DEFAULT_FRAMES;
+    bool callback_frames_set = false;
     int packets = DEFAULT_PACKETS;
     int jitter_target = 5;
     int queue_limit = 64;
@@ -28,6 +32,7 @@ struct Config {
     std::string timeline_path;
     bool sweep = false;
     bool auto_jitter = false;
+    bool adaptive_playout = false;
     bool self_test = false;
 };
 
@@ -40,6 +45,7 @@ struct Packet {
 struct Metrics {
     int enqueued = 0;
     int played = 0;
+    int decoded_packets = 0;
     int plc = 0;
     int underruns = 0;
     int full_rebuffers = 0;
@@ -59,6 +65,9 @@ struct Metrics {
     int final_jitter_target = 0;
     int auto_increases = 0;
     int auto_decreases = 0;
+    double playout_ratio_last = 1.0;
+    double playout_ratio_sum = 0.0;
+    int playout_ratio_observations = 0;
 };
 
 int64_t packet_interval_us(int frames) {
@@ -71,7 +80,10 @@ int64_t receiver_callback_interval_us(const Config& config) {
                         : config.receiver_clock_ppm;
     const double scale = 1.0 + (static_cast<double>(ppm) / 1'000'000.0);
     return std::max<int64_t>(
-        1, static_cast<int64_t>(static_cast<double>(packet_interval_us(config.frames)) * scale));
+        1, static_cast<int64_t>(
+               (static_cast<double>(config.callback_frames) * 1'000'000.0 /
+                static_cast<double>(SAMPLE_RATE)) *
+               scale));
 }
 
 int ready_packets_for_target(int target) {
@@ -276,6 +288,57 @@ void observe_auto_jitter_stable(const Config& config, Metrics& metrics, int& jit
     }
 }
 
+double avg_playout_ratio(const Metrics& metrics) {
+    if (metrics.playout_ratio_observations == 0) {
+        return 1.0;
+    }
+    return metrics.playout_ratio_sum /
+           static_cast<double>(metrics.playout_ratio_observations);
+}
+
+double adaptive_playout_ratio(const Config& config, const std::deque<Packet>& queue,
+                              int pcm_buffered_frames, int jitter_target,
+                              int queue_limit_drops, int& last_queue_limit_drops,
+                              int& correction_callbacks, Metrics& metrics) {
+    const double decoded_packets =
+        static_cast<double>(pcm_buffered_frames) / static_cast<double>(config.frames);
+    const double queued_packets = static_cast<double>(queue.size()) + decoded_packets;
+    const double target_packets = static_cast<double>(std::max(1, jitter_target));
+    const double queue_error = queued_packets - target_packets;
+    double ratio = std::clamp(1.0 + (queue_error * 0.05), 0.96, 1.18);
+
+    if (queue_limit_drops > last_queue_limit_drops) {
+        last_queue_limit_drops = queue_limit_drops;
+        correction_callbacks = 400;
+    }
+    if (correction_callbacks > 0) {
+        correction_callbacks--;
+        if (queued_packets >= target_packets * 0.5) {
+            ratio = std::max(ratio, 1.18);
+        }
+    }
+
+    metrics.playout_ratio_last = ratio;
+    metrics.playout_ratio_sum += ratio;
+    metrics.playout_ratio_observations++;
+    return ratio;
+}
+
+int adaptive_required_input_frames(double phase, int callback_frames, double ratio) {
+    if (callback_frames <= 0) {
+        return 0;
+    }
+    const double last_source = phase + (static_cast<double>(callback_frames - 1) * ratio);
+    return static_cast<int>(std::floor(last_source)) + 2;
+}
+
+int adaptive_consumed_frames(double& phase, int callback_frames, double ratio) {
+    const double consumed_exact = phase + (static_cast<double>(callback_frames) * ratio);
+    const int consumed_frames = static_cast<int>(std::floor(consumed_exact));
+    phase = consumed_exact - static_cast<double>(consumed_frames);
+    return consumed_frames;
+}
+
 Metrics run_simulation(const Config& config) {
     const std::vector<Packet> arrivals = make_packets(config);
     const int64_t interval_us = packet_interval_us(config.frames);
@@ -291,6 +354,10 @@ Metrics run_simulation(const Config& config) {
     int auto_instability_events = 0;
     int auto_stable_callbacks = 0;
     int next_expected_seq = 0;
+    int pcm_buffered_frames = 0;
+    double resample_phase = 0.0;
+    int rate_last_queue_limit_drops = 0;
+    int rate_correction_callbacks = 0;
     size_t next_arrival = 0;
 
     const int callback_count = config.packets + 160;
@@ -311,7 +378,9 @@ Metrics run_simulation(const Config& config) {
             }
             queue.push_back(arrivals[next_arrival]);
             metrics.enqueued++;
-            trim_queue(config, jitter_target, queue, metrics);
+            if (!config.adaptive_playout) {
+                trim_queue(config, jitter_target, queue, metrics);
+            }
             next_arrival++;
         }
 
@@ -331,6 +400,73 @@ Metrics run_simulation(const Config& config) {
             metrics.age_limit_drops++;
             raise_auto_jitter(config, metrics, jitter_target, auto_instability_events,
                               auto_stable_callbacks, ready, consecutive_empty_callbacks);
+        }
+
+        if (config.adaptive_playout) {
+            const double ratio = adaptive_playout_ratio(
+                config, queue, pcm_buffered_frames, jitter_target, metrics.queue_limit_drops,
+                rate_last_queue_limit_drops, rate_correction_callbacks, metrics);
+            int required_frames =
+                adaptive_required_input_frames(resample_phase, config.callback_frames, ratio);
+            while (pcm_buffered_frames < required_frames && !queue.empty()) {
+                Packet packet = queue.front();
+                queue.pop_front();
+                metrics.decoded_packets++;
+
+                if (packet.seq > next_expected_seq) {
+                    metrics.sequence_gaps += packet.seq - next_expected_seq;
+                } else if (packet.seq < next_expected_seq) {
+                    metrics.late_packets++;
+                }
+                next_expected_seq = std::max(next_expected_seq, packet.seq + 1);
+                observe_age(metrics, now_us - packet.arrival_us);
+
+                if (pcm_buffered_frames + config.frames > PCM_BUFFER_FRAMES) {
+                    pcm_buffered_frames = 0;
+                    metrics.queue_limit_drops++;
+                    rate_correction_callbacks = 400;
+                    break;
+                }
+
+                pcm_buffered_frames += config.frames;
+                required_frames =
+                    adaptive_required_input_frames(resample_phase, config.callback_frames, ratio);
+
+                if (packet.seq == IMPULSE_PACKET && metrics.latency_samples < 0) {
+                    metrics.latency_samples = static_cast<int>(
+                        ((now_us - packet.send_us) * static_cast<int64_t>(SAMPLE_RATE)) /
+                        1'000'000LL);
+                }
+            }
+
+            if (pcm_buffered_frames >= required_frames) {
+                const int consumed =
+                    adaptive_consumed_frames(resample_phase, config.callback_frames, ratio);
+                pcm_buffered_frames = std::max(0, pcm_buffered_frames - consumed);
+                metrics.played++;
+                consecutive_empty_callbacks = 0;
+                observe_auto_jitter_stable(config, metrics, jitter_target,
+                                           auto_instability_events, auto_stable_callbacks);
+                continue;
+            }
+
+            if (next_arrival >= arrivals.size()) {
+                break;
+            }
+
+            metrics.underruns++;
+            metrics.plc++;
+            consecutive_empty_callbacks++;
+            raise_auto_jitter(config, metrics, jitter_target, auto_instability_events,
+                              auto_stable_callbacks, ready, consecutive_empty_callbacks);
+            if (consecutive_empty_callbacks >= rebuffer_threshold_for_target(jitter_target)) {
+                metrics.full_rebuffers++;
+                ready = false;
+                consecutive_empty_callbacks = 0;
+                pcm_buffered_frames = 0;
+                resample_phase = 0.0;
+            }
+            continue;
         }
 
         if (!queue.empty()) {
@@ -429,9 +565,9 @@ std::string status_reason(const Metrics& metrics) {
 
 void print_header() {
     std::cout
-        << "scenario,frames,jitter_target,queue_limit,age_limit_ms,receiver_ppm,auto_jitter,final_jitter,auto_inc,auto_dec,played,enqueued,latency_ms,"
+        << "scenario,frames,callback_frames,jitter_target,queue_limit,age_limit_ms,receiver_ppm,auto_jitter,adaptive_playout,final_jitter,auto_inc,auto_dec,played,decoded_packets,enqueued,latency_ms,"
            "avg_age_ms,max_age_ms,avg_queue,max_queue,min_queue,underruns,plc,full_rebuffers,"
-           "target_trims,queue_drops,age_drops,seq_gaps,late,status,reason\n";
+           "target_trims,queue_drops,age_drops,seq_gaps,late,ratio_last,ratio_avg,status,reason\n";
 }
 
 void print_row(const Config& config, const Metrics& metrics) {
@@ -439,17 +575,19 @@ void print_row(const Config& config, const Metrics& metrics) {
         metrics.min_queue_after_ready == std::numeric_limits<int>::max()
             ? 0
             : metrics.min_queue_after_ready;
-    std::cout << config.scenario << ',' << config.frames << ',' << config.jitter_target << ','
-              << config.queue_limit << ',' << config.age_limit_ms << ','
-              << config.receiver_clock_ppm << ',' << (config.auto_jitter ? 1 : 0) << ','
-              << metrics.final_jitter_target << ',' << metrics.auto_increases << ','
-              << metrics.auto_decreases << ',' << metrics.played << ','
-              << metrics.enqueued << ',' << latency_ms(config, metrics) << ',' << avg_age_ms(metrics)
+    std::cout << config.scenario << ',' << config.frames << ',' << config.callback_frames << ','
+              << config.jitter_target << ',' << config.queue_limit << ',' << config.age_limit_ms
+              << ',' << config.receiver_clock_ppm << ',' << (config.auto_jitter ? 1 : 0) << ','
+              << (config.adaptive_playout ? 1 : 0) << ',' << metrics.final_jitter_target << ','
+              << metrics.auto_increases << ',' << metrics.auto_decreases << ',' << metrics.played
+              << ',' << metrics.decoded_packets << ',' << metrics.enqueued << ','
+              << latency_ms(config, metrics) << ',' << avg_age_ms(metrics)
               << ',' << max_age_ms(metrics) << ',' << avg_queue(metrics) << ',' << metrics.max_queue
               << ',' << min_queue << ',' << metrics.underruns << ',' << metrics.plc << ','
               << metrics.full_rebuffers << ',' << metrics.target_trims << ','
               << metrics.queue_limit_drops << ',' << metrics.age_limit_drops << ','
               << metrics.sequence_gaps << ',' << metrics.late_packets << ','
+              << metrics.playout_ratio_last << ',' << avg_playout_ratio(metrics) << ','
               << (stable(metrics) ? "ok" : "warn") << ',' << status_reason(metrics) << '\n';
 }
 
@@ -461,6 +599,9 @@ Config parse_args(int argc, char** argv) {
             config.scenario = argv[++i];
         } else if (arg == "--frames" && i + 1 < argc) {
             config.frames = std::stoi(argv[++i]);
+        } else if (arg == "--callback-frames" && i + 1 < argc) {
+            config.callback_frames = std::stoi(argv[++i]);
+            config.callback_frames_set = true;
         } else if (arg == "--packets" && i + 1 < argc) {
             config.packets = std::stoi(argv[++i]);
         } else if (arg == "--jitter" && i + 1 < argc) {
@@ -478,6 +619,8 @@ Config parse_args(int argc, char** argv) {
             config.scenario = "timeline";
         } else if (arg == "--auto-jitter") {
             config.auto_jitter = true;
+        } else if (arg == "--adaptive-playout") {
+            config.adaptive_playout = true;
         } else if (arg == "--self-test") {
             config.self_test = true;
         } else if (arg == "--sweep") {
@@ -485,6 +628,10 @@ Config parse_args(int argc, char** argv) {
         }
     }
     config.frames = std::max(1, config.frames);
+    if (!config.callback_frames_set) {
+        config.callback_frames = config.frames;
+    }
+    config.callback_frames = std::max(1, config.callback_frames);
     config.packets = std::max(IMPULSE_PACKET + 1, config.packets);
     config.jitter_target = std::max(0, config.jitter_target);
     config.queue_limit = std::max(1, config.queue_limit);
@@ -551,6 +698,35 @@ int run_self_test() {
     Metrics drift_metrics = run_simulation(drift);
     ok &= expect(!stable(drift_metrics) && drift_metrics.underruns > 0,
                  "clock-drift-underruns", "receiver clock skew is distinguishable");
+
+    Config callback_mismatch;
+    callback_mismatch.scenario = "clean";
+    callback_mismatch.frames = 120;
+    callback_mismatch.callback_frames = 128;
+    callback_mismatch.callback_frames_set = true;
+    callback_mismatch.packets = 24000;
+    callback_mismatch.jitter_target = 5;
+    callback_mismatch.queue_limit = 32;
+    callback_mismatch.adaptive_playout = true;
+    Metrics callback_mismatch_metrics = run_simulation(callback_mismatch);
+    ok &= expect(stable(callback_mismatch_metrics) &&
+                     callback_mismatch_metrics.decoded_packets > 23000,
+                 "adaptive-callback-mismatch-stable",
+                 "120-frame packets stay stable on 128-frame callbacks");
+
+    Config receiver_slow = callback_mismatch;
+    receiver_slow.receiver_clock_ppm = 25000;
+    Metrics receiver_slow_metrics = run_simulation(receiver_slow);
+    ok &= expect(stable(receiver_slow_metrics) && avg_playout_ratio(receiver_slow_metrics) > 1.0,
+                 "adaptive-slow-receiver-stable",
+                 "positive receiver clock skew drains backlog without hard drops");
+
+    Config receiver_fast = callback_mismatch;
+    receiver_fast.receiver_clock_ppm = -25000;
+    Metrics receiver_fast_metrics = run_simulation(receiver_fast);
+    ok &= expect(stable(receiver_fast_metrics) && avg_playout_ratio(receiver_fast_metrics) < 1.0,
+                 "adaptive-fast-receiver-stable",
+                 "negative receiver clock skew slows playout without underruns");
 
     return ok ? 0 : 1;
 }

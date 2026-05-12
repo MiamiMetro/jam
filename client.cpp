@@ -1036,6 +1036,10 @@ private:
             }
         }
 
+        participant.opus_playout_rate_ratio_micros.store(
+            static_cast<int64_t>(ratio * 1'000'000.0), std::memory_order_relaxed);
+        participant.opus_rate_correction_callbacks_observed.store(
+            participant.opus_rate_correction_callbacks, std::memory_order_relaxed);
         return ratio;
     }
 
@@ -1515,8 +1519,9 @@ private:
                 drop_rate.pcm_send_per_sec, drop_rate.jitter_depth_per_sec,
                 drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec);
             Log::info(
-                "Participant playout rates {}: decoded_packets={:.1f}/s drops limit/age/overflow/target={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
-                p.id, decoded_packet_rate, queue_limit_drop_rate, age_limit_drop_rate,
+                "Participant playout rates {}: decoded_packets={:.1f}/s ratio={:.4f} correction_callbacks={} drops limit/age/overflow/target={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
+                p.id, decoded_packet_rate, p.opus_playout_rate_ratio,
+                p.opus_rate_correction_callbacks, queue_limit_drop_rate, age_limit_drop_rate,
                 decode_overflow_drop_rate, target_trim_rate);
 
             if (elapsed_sec > 0.0 &&
@@ -1859,11 +1864,11 @@ private:
                 }
             }
 
+            double playout_ratio = opus_playout_rate_ratio(participant);
             if (participant.last_codec == AudioCodec::Opus &&
                 participant.opus_pcm_buffered_frames >=
                     opus_resample_required_input_frames(
-                        participant, frame_count, opus_playout_rate_ratio(participant))) {
-                const double playout_ratio = opus_playout_rate_ratio(participant);
+                        participant, frame_count, playout_ratio)) {
                 mix_resampled_opus_pcm(participant, output_buffer, frame_count, out_channels,
                                        participant.gain, playout_ratio);
                 observe_opus_pcm_depth(participant);

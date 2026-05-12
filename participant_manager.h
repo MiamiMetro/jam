@@ -134,6 +134,11 @@ public:
                 data->opus_decode_buffer_overflow_drops.load(std::memory_order_relaxed);
             info.opus_target_trim_drops =
                 data->opus_target_trim_drops.load(std::memory_order_relaxed);
+            info.opus_playout_rate_ratio =
+                data->opus_playout_rate_ratio_micros.load(std::memory_order_relaxed) /
+                1'000'000.0;
+            info.opus_rate_correction_callbacks =
+                data->opus_rate_correction_callbacks_observed.load(std::memory_order_relaxed);
             info.last_packet_frame_count =
                 data->last_packet_frame_count.load(std::memory_order_relaxed);
             info.last_callback_frame_count =
