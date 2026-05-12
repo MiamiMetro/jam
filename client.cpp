@@ -1092,6 +1092,49 @@ private:
         consume_opus_pcm_buffer(participant, consumed_frames);
     }
 
+    static void mix_available_opus_pcm_with_tail(ParticipantData& participant,
+                                                 float* output_buffer,
+                                                 unsigned long output_frames,
+                                                 size_t output_channels, float gain,
+                                                 double ratio) {
+        if (output_frames == 0 || output_buffer == nullptr ||
+            participant.opus_pcm_buffered_frames == 0) {
+            return;
+        }
+
+        const double start_phase = participant.opus_resample_phase;
+        const size_t last_index = participant.opus_pcm_buffered_frames - 1;
+        for (unsigned long i = 0; i < output_frames; ++i) {
+            const double source_pos = start_phase + (static_cast<double>(i) * ratio);
+            const auto requested_index = static_cast<size_t>(std::floor(source_pos));
+            const size_t index = std::min(requested_index, last_index);
+            const float frac = requested_index < last_index
+                                   ? static_cast<float>(source_pos -
+                                                        static_cast<double>(requested_index))
+                                   : 0.0F;
+            const float a = participant.opus_pcm_buffer[index];
+            const float b = index + 1 < participant.opus_pcm_buffered_frames
+                                ? participant.opus_pcm_buffer[index + 1]
+                                : a;
+            const float sample = (a + ((b - a) * frac)) * gain;
+
+            if (output_channels == 1) {
+                output_buffer[i] += sample;
+            } else {
+                const size_t base = static_cast<size_t>(i) * output_channels;
+                output_buffer[base] += sample;
+                output_buffer[base + 1] += sample;
+            }
+        }
+
+        const double consumed_exact =
+            start_phase + (static_cast<double>(output_frames) * ratio);
+        const auto consumed_frames = std::min(
+            static_cast<size_t>(std::floor(consumed_exact)),
+            participant.opus_pcm_buffered_frames);
+        consume_opus_pcm_buffer(participant, consumed_frames);
+    }
+
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
         size_t previous_max = participant.queue_depth_max.load(std::memory_order_relaxed);
         while (depth > previous_max &&
@@ -2047,6 +2090,13 @@ private:
                         observe_auto_jitter_stable(participant);
                         participant.opus_consecutive_empty_callbacks = 0;
                         active_count++;
+                    } else if (participant.opus_pcm_buffered_frames > 0) {
+                        mix_available_opus_pcm_with_tail(participant, output_buffer, frame_count,
+                                                        out_channels, participant.gain,
+                                                        playout_ratio);
+                        observe_opus_pcm_depth(participant);
+                        participant.opus_consecutive_empty_callbacks = 0;
+                        active_count++;
                     }
 
                     if (participant.is_speaking && !was_speaking) {
@@ -2128,6 +2178,18 @@ private:
                 // Underrun - use PLC instead of silence for smoother audio
                 size_t current_queue_size = participant.opus_queue.size_approx();
                 observe_participant_queue_depth(participant, current_queue_size);
+
+                if (participant.last_codec == AudioCodec::Opus &&
+                    participant.opus_pcm_buffered_frames > 0) {
+                    const double playout_ratio = opus_playout_rate_ratio(participant);
+                    mix_available_opus_pcm_with_tail(participant, output_buffer, frame_count,
+                                                    out_channels, participant.gain,
+                                                    playout_ratio);
+                    observe_opus_pcm_depth(participant);
+                    participant.opus_consecutive_empty_callbacks = 0;
+                    active_count++;
+                    return;
+                }
 
                 int plc_samples = 0;
                 if (participant.last_codec == AudioCodec::Opus) {

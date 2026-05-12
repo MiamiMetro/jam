@@ -451,6 +451,14 @@ Metrics run_simulation(const Config& config) {
                 continue;
             }
 
+            if (pcm_buffered_frames > 0) {
+                pcm_buffered_frames = 0;
+                resample_phase = 0.0;
+                metrics.played++;
+                consecutive_empty_callbacks = 0;
+                continue;
+            }
+
             if (next_arrival >= arrivals.size()) {
                 break;
             }

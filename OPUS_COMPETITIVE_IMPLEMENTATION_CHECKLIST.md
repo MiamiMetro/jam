@@ -42,6 +42,12 @@ A gate is complete only when:
     interpolation point clamps to the available sample instead. Evidence
     required: refreshed live logs must show fewer tiny PLC/underrun callbacks,
     especially on macOS CoreAudio's 15-frame callback path.
+  - Partial PCM tail playout: in progress. If a callback arrives with decoded
+    Opus PCM buffered but just below the resampler's requested input count, the
+    receiver now plays the available tail instead of discarding the callback
+    into PLC/rebuffer accounting. Evidence required: refreshed live logs should
+    stop producing repeated `Jitter buffer ready` churn during otherwise
+    healthy queued playout.
   - Playout diagnostics: in progress. Participant logs now include the current
     Opus playout ratio and remaining correction callbacks beside decoded packet
     and drop rates. Evidence required: refreshed cross-machine logs must explain
