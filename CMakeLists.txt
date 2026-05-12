@@ -30,3 +30,6 @@ target_link_libraries(udp_impair_proxy PRIVATE asio)
 
 add_executable(multi_participant_jitter_probe multi_participant_jitter_probe.cpp)
 target_link_libraries(multi_participant_jitter_probe PRIVATE asio)
+
+add_executable(recording_writer_self_test recording_writer_self_test.cpp)
+target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)

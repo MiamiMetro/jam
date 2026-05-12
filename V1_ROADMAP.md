@@ -11,17 +11,17 @@ the production gates that still matter for V1.
 - Local click generation on each client.
 - Simple room-level controls and beat indicator.
 
-### Local Multitrack Recording
-
-- Separate WAV tracks for local mic, each remote participant, and master mix.
-- Timestamped recording folder.
-- Disk writer thread or equivalent non-audio-callback writer path.
-
 ### Tap Tempo
 
 - Tap button in the metronome UI.
 - Recent-tap averaging with reset after pauses.
 - Sets the shared metronome BPM.
+
+### Local Multitrack Recording
+
+- Separate WAV tracks for local mic, each remote participant, and master mix.
+- Timestamped recording folder.
+- Disk writer thread or equivalent non-audio-callback writer path.
 
 ### Dockable Modular UI
 
@@ -50,10 +50,10 @@ the production gates that still matter for V1.
 
 ## Intended Order
 
-1. Gate 1: SFU production hardening.
-2. Gate 2: SFU-authoritative presence and capacity.
-3. Shared metronome.
-4. Local multitrack recording.
-5. Tap tempo.
+1. Shared metronome.
+2. Tap tempo.
+3. Local multitrack recording.
+4. Gate 1: SFU production hardening.
+5. Gate 2: SFU-authoritative presence and capacity.
 6. Gate 7: room lifecycle, rules, and moderation.
 7. Dockable modular UI.
