@@ -1195,6 +1195,14 @@ private:
             ((static_cast<double>(arrival_elapsed_ns) - expected_elapsed_ns) /
              expected_elapsed_ns) *
             1'000'000'000.0);
+        constexpr int64_t DRIFT_ARRIVAL_OUTLIER_PPM_MILLI = 1'000'000;
+        const int64_t abs_sample_drift =
+            drift_ppm_milli < 0 ? -drift_ppm_milli : drift_ppm_milli;
+        if (abs_sample_drift > DRIFT_ARRIVAL_OUTLIER_PPM_MILLI) {
+            participant.drift_reference_sequence = packet.sequence;
+            participant.drift_reference_time = packet.timestamp;
+            return;
+        }
         participant.receiver_drift_ppm_last_milli.store(drift_ppm_milli,
                                                         std::memory_order_relaxed);
 
@@ -1208,13 +1216,11 @@ private:
         const uint64_t observations =
             participant.receiver_drift_observations.fetch_add(1, std::memory_order_relaxed) + 1;
         if (observations > DRIFT_MAX_WARMUP_OBSERVATIONS) {
-            const int64_t abs_drift =
-                drift_ppm_milli < 0 ? -drift_ppm_milli : drift_ppm_milli;
             int64_t previous_abs_max =
                 participant.receiver_drift_ppm_abs_max_milli.load(std::memory_order_relaxed);
-            while (abs_drift > previous_abs_max &&
+            while (abs_sample_drift > previous_abs_max &&
                    !participant.receiver_drift_ppm_abs_max_milli.compare_exchange_weak(
-                       previous_abs_max, abs_drift, std::memory_order_relaxed)) {
+                       previous_abs_max, abs_sample_drift, std::memory_order_relaxed)) {
             }
         }
 
