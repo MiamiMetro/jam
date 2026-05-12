@@ -2238,16 +2238,16 @@ private:
                     return;
                 }
 
-                // Handle Opus rebuffering state (PLC handles short gaps above)
-                if (current_queue_size == 0 && participant.buffer_ready) {
-                    participant.underrun_count++;
+                // Handle Opus rebuffering state. Short empty callbacks are covered by
+                // PLC/tail playout above; only a sustained run is a hard underrun.
+                if (participant.buffer_ready) {
                     participant.opus_consecutive_empty_callbacks++;
-                    observe_auto_jitter_instability(participant);
                     if (participant.opus_consecutive_empty_callbacks >=
                         static_cast<int>(opus_rebuffer_empty_callback_threshold(participant))) {
+                        participant.underrun_count++;
+                        observe_auto_jitter_instability(participant);
                         participant.buffer_ready = false;
                         participant.opus_consecutive_empty_callbacks = 0;
-                        // Only log first rebuffer or every 10th to reduce noise
                         if (participant.underrun_count == 1 ||
                             participant.underrun_count % 10 == 0) {
                             Log::info("Participant {} rebuffering (underruns: {}, PLC: {})",
@@ -2255,8 +2255,6 @@ private:
                                       participant.plc_count);
                         }
                     }
-                } else if (participant.buffer_ready) {
-                    participant.underrun_count++;
                 }
             }
         });

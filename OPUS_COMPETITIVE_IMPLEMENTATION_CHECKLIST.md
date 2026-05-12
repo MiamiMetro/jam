@@ -48,6 +48,11 @@ A gate is complete only when:
     into PLC/rebuffer accounting. Evidence required: refreshed live logs should
     stop producing repeated `Jitter buffer ready` churn during otherwise
     healthy queued playout.
+  - Hard-underrun accounting: in progress. Short Opus empty callbacks now stay
+    in transient PLC/tail handling; `underrun_count`, auto-jitter rebuffer, and
+    `buffer_ready=false` are reserved for sustained empty runs that cross the
+    rebuffer threshold. Evidence required: strict session logs must keep
+    `underruns=0` unless a true rebuffer occurs.
   - Playout diagnostics: in progress. Participant logs now include the current
     Opus playout ratio and remaining correction callbacks beside decoded packet
     and drop rates. Evidence required: refreshed cross-machine logs must explain

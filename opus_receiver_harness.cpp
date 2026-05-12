@@ -463,12 +463,12 @@ Metrics run_simulation(const Config& config) {
                 break;
             }
 
-            metrics.underruns++;
             metrics.plc++;
             consecutive_empty_callbacks++;
             raise_auto_jitter(config, metrics, jitter_target, auto_instability_events,
                               auto_stable_callbacks, ready, consecutive_empty_callbacks);
             if (consecutive_empty_callbacks >= rebuffer_threshold_for_target(jitter_target)) {
+                metrics.underruns++;
                 metrics.full_rebuffers++;
                 ready = false;
                 consecutive_empty_callbacks = 0;
