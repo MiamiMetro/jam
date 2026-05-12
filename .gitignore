@@ -17,6 +17,8 @@ build/
 out/
 cmake-build-*/
 hls/
+validation/
+validation_logs/
 
 # Dependencies / caches
 node_modules/
