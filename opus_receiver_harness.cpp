@@ -305,7 +305,7 @@ double adaptive_playout_ratio(const Config& config, const std::deque<Packet>& qu
     const double queued_packets = static_cast<double>(queue.size()) + decoded_packets;
     const double target_packets = static_cast<double>(std::max(1, jitter_target));
     const double queue_error = queued_packets - target_packets;
-    double ratio = std::clamp(1.0 + (queue_error * 0.05), 0.96, 1.18);
+    double ratio = std::clamp(1.0 + (queue_error * 0.01), 0.95, 1.08);
 
     if (queue_limit_drops > last_queue_limit_drops) {
         last_queue_limit_drops = queue_limit_drops;
@@ -314,7 +314,7 @@ double adaptive_playout_ratio(const Config& config, const std::deque<Packet>& qu
     if (correction_callbacks > 0) {
         correction_callbacks--;
         if (queued_packets >= target_packets * 0.5) {
-            ratio = std::max(ratio, 1.18);
+            ratio = std::max(ratio, 1.04);
         }
     }
 

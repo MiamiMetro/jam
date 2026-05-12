@@ -1021,7 +1021,7 @@ private:
         const double target_packets =
             static_cast<double>(opus_playout_target_queue_packets(participant));
         const double queue_error = queued_packets - target_packets;
-        double ratio = std::clamp(1.0 + (queue_error * 0.05), 0.96, 1.18);
+        double ratio = std::clamp(1.0 + (queue_error * 0.01), 0.95, 1.08);
 
         const uint64_t queue_limit_drops =
             participant.opus_queue_limit_drops.load(std::memory_order_relaxed);
@@ -1032,7 +1032,7 @@ private:
         if (participant.opus_rate_correction_callbacks > 0) {
             participant.opus_rate_correction_callbacks--;
             if (queued_packets >= target_packets * 0.5) {
-                ratio = std::max(ratio, 1.18);
+                ratio = std::max(ratio, 1.04);
             }
         }
 

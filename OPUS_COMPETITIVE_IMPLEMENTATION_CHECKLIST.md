@@ -31,6 +31,12 @@ A gate is complete only when:
     callbacks plus positive and negative receiver clock skew. Evidence required:
     Windows/macOS session logs must show materially reduced or zero steady
     queue-limit drops before this item is accepted.
+  - Receiver rate damping: in progress. The live 2026-05-12 short run showed
+    the first controller hitting `1.1800`, draining to rebuffer, then filling
+    back to the receive cap. The controller is now damped to a narrower
+    `0.95` to `1.08` range with gentler drop feedback. Evidence required:
+    refreshed live logs must show the ratio no longer oscillates between the
+    old hard endpoints and that underrun/PLC churn is reduced.
   - Playout diagnostics: in progress. Participant logs now include the current
     Opus playout ratio and remaining correction callbacks beside decoded packet
     and drop rates. Evidence required: refreshed cross-machine logs must explain
