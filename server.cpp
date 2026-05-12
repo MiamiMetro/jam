@@ -32,6 +32,8 @@ using asio::ip::udp;
 using namespace std::chrono_literals;
 using namespace server_config;
 
+constexpr int64_t METRONOME_SCHEDULE_AHEAD_NS = 150'000'000;
+
 static const char* runtime_platform_name() {
 #if defined(_WIN32)
     return "windows";
@@ -204,6 +206,9 @@ private:
                 // Clients shouldn't send this, only server broadcasts it
                 Log::warn("Client sent PARTICIPANT_LEAVE (should only come from server)");
                 break;
+            case CtrlHdr::Cmd::METRONOME_SYNC:
+                handle_metronome_sync(bytes, now);
+                break;
             default:
                 Log::warn("Unknown CTRL cmd: {} from {}:{}", static_cast<int>(chdr.type),
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
@@ -247,8 +252,15 @@ private:
             }
         }
 
-        uint32_t client_id = client_manager_.register_performer_client(
+        auto registration = client_manager_.register_performer_client(
             remote_endpoint_, now, room_id, profile_id, display_name);
+        for (uint32_t removed_client_id: registration.removed_client_ids) {
+            Log::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
+                      removed_client_id, room_id, profile_id);
+            broadcast_participant_leave(removed_client_id);
+        }
+
+        uint32_t client_id = registration.client_id;
         Log::info("JOIN: {}:{} room='{}' user='{}' display='{}' (ID: {}, {})",
                   remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
                   profile_id, display_name, client_id,
@@ -289,6 +301,40 @@ private:
         auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
                                                                         recv_buf_.data() + bytes);
         forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
+    }
+
+    void handle_metronome_sync(std::size_t bytes, std::chrono::steady_clock::time_point now) {
+        if (bytes < sizeof(MetronomeSyncHdr)) {
+            Log::debug("Metronome sync packet too small: {} bytes", bytes);
+            return;
+        }
+
+        if (!client_manager_.exists(remote_endpoint_)) {
+            Log::warn("Dropping metronome sync from unjoined endpoint {}:{}",
+                      remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            return;
+        }
+
+        client_manager_.update_alive(remote_endpoint_, now);
+
+        MetronomeSyncHdr sync{};
+        std::memcpy(&sync, recv_buf_.data(), sizeof(MetronomeSyncHdr));
+        sync.sequence = ++metronome_sequence_;
+        sync.effective_server_time_ns = steady_ns(now) + METRONOME_SCHEDULE_AHEAD_NS;
+        std::memcpy(recv_buf_.data(), &sync, sizeof(MetronomeSyncHdr));
+
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(
+            recv_buf_.data(), recv_buf_.data() + sizeof(MetronomeSyncHdr));
+        auto endpoints = client_manager_.get_room_endpoints_except(remote_endpoint_);
+        endpoints.push_back(remote_endpoint_);
+        for (const auto& endpoint: endpoints) {
+            send(packet_copy->data(), packet_copy->size(), endpoint, packet_copy);
+        }
+    }
+
+    static int64_t steady_ns(std::chrono::steady_clock::time_point time) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch())
+            .count();
     }
 
     void record_unknown_audio_drop(const udp::endpoint& endpoint) {
@@ -408,6 +454,7 @@ private:
     ClientManager client_manager_;
     std::unordered_map<udp::endpoint, UnknownEndpointInfo, endpoint_hash> unknown_endpoints_;
     uint64_t unknown_audio_drops_since_log_ = 0;
+    uint32_t metronome_sequence_ = 0;
     std::chrono::steady_clock::time_point last_unknown_audio_summary_ =
         std::chrono::steady_clock::now();
 

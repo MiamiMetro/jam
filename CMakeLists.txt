@@ -18,6 +18,9 @@ target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog 
 add_executable(room_routing_probe room_routing_probe.cpp)
 target_link_libraries(room_routing_probe PRIVATE asio spdlog::spdlog opus token_crypto)
 
+add_executable(client_manager_self_test client_manager_self_test.cpp)
+target_link_libraries(client_manager_self_test PRIVATE asio)
+
 add_executable(opus_receiver_harness opus_receiver_harness.cpp)
 add_custom_target(opus_receiver_harness_self_test
     COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test
@@ -30,3 +33,6 @@ target_link_libraries(udp_impair_proxy PRIVATE asio)
 
 add_executable(multi_participant_jitter_probe multi_participant_jitter_probe.cpp)
 target_link_libraries(multi_participant_jitter_probe PRIVATE asio)
+
+add_executable(recording_writer_self_test recording_writer_self_test.cpp)
+target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)

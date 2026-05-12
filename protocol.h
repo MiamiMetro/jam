@@ -51,6 +51,7 @@ struct CtrlHdr : MsgHdr {
         ALIVE             = 3,
         PARTICIPANT_LEAVE = 4,  // Server broadcasts when participant leaves
         PARTICIPANT_INFO  = 6,  // Server broadcasts room-local participant metadata
+        METRONOME_SYNC    = 7,  // Server relays room-local metronome state
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
@@ -66,6 +67,17 @@ struct JoinHdr : CtrlHdr {
 struct ParticipantInfoHdr : CtrlHdr {
     Bytes<64> profile_id;
     Bytes<64> display_name;
+};
+
+constexpr uint8_t METRONOME_FLAG_RUNNING = 1 << 0;
+
+struct MetronomeSyncHdr : CtrlHdr {
+    uint32_t bpm_milli      = 120000;
+    uint32_t beat_number    = 0;
+    uint8_t  flags          = 0;
+    int64_t  sender_time_ns = 0;
+    int64_t  effective_server_time_ns = 0;
+    uint32_t sequence = 0;
 };
 
 struct AudioHdr : MsgHdr {

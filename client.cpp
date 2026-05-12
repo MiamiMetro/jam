@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +55,7 @@
 #include "participant_manager.h"
 #include "periodic_timer.h"
 #include "protocol.h"
+#include "recording_writer.h"
 #include "wav_file_playback.h"
 
 using asio::ip::udp;
@@ -282,6 +284,7 @@ public:
     void stop_audio_stream() {
         audio_.stop_audio_stream();
         stop_pcm_sender_thread();
+        stop_recording();
     }
 
     // Getters for UI access
@@ -291,6 +294,10 @@ public:
 
     unsigned short get_server_port() const {
         return server_endpoint_.port();
+    }
+
+    std::string get_room_id() const {
+        return performer_join_options_.room_id;
     }
 
     unsigned short get_local_port() const {
@@ -539,6 +546,124 @@ public:
         audio_codec_.store(codec, std::memory_order_release);
         audio_config_.frames_per_buffer =
             normalize_buffer_frames_for_codec(codec, audio_config_.frames_per_buffer);
+    }
+
+    struct MetronomeState {
+        float    bpm;
+        bool     running;
+        uint32_t beat_number;
+        uint64_t sync_sent;
+        uint64_t sync_received;
+        bool     clock_ready;
+        double   clock_offset_ms;
+    };
+
+    MetronomeState get_metronome_state() const {
+        return MetronomeState{
+            static_cast<float>(metronome_bpm_milli_.load(std::memory_order_acquire)) / 1000.0F,
+            metronome_running_.load(std::memory_order_acquire),
+            metronome_beat_number_.load(std::memory_order_acquire),
+            metronome_sync_sent_.load(std::memory_order_relaxed),
+            metronome_sync_received_.load(std::memory_order_relaxed),
+            server_clock_ready_.load(std::memory_order_acquire),
+            static_cast<double>(server_clock_offset_ns_.load(std::memory_order_relaxed)) / 1e6,
+        };
+    }
+
+    void set_metronome_bpm(float bpm, bool send_sync = true) {
+        const int bpm_milli = std::clamp(static_cast<int>(std::lrint(bpm * 1000.0F)), 30000,
+                                         240000);
+        if (send_sync) {
+            commit_metronome_bpm_milli(bpm_milli);
+        } else {
+            metronome_bpm_milli_.store(bpm_milli, std::memory_order_release);
+        }
+    }
+
+    void commit_metronome_bpm(float bpm) {
+        const int bpm_milli = std::clamp(static_cast<int>(std::lrint(bpm * 1000.0F)), 30000,
+                                         240000);
+        commit_metronome_bpm_milli(bpm_milli);
+    }
+
+    void start_metronome() {
+        send_metronome_sync(metronome_bpm_milli_.load(std::memory_order_acquire), true, 0);
+    }
+
+    void stop_metronome() {
+        send_metronome_sync(metronome_bpm_milli_.load(std::memory_order_acquire), false,
+                            metronome_beat_number_.load(std::memory_order_acquire));
+    }
+
+    void tap_metronome_tempo() {
+        const auto now = std::chrono::steady_clock::now();
+        if (tap_count_ > 0 && now - tap_times_[(tap_index_ + tap_times_.size() - 1) %
+                                               tap_times_.size()] > 2s) {
+            tap_count_ = 0;
+            tap_index_ = 0;
+        }
+
+        tap_times_[tap_index_] = now;
+        tap_index_ = (tap_index_ + 1) % tap_times_.size();
+        tap_count_ = std::min(tap_count_ + 1, tap_times_.size());
+
+        if (tap_count_ < 3) {
+            return;
+        }
+
+        double total_interval_ms = 0.0;
+        size_t interval_count = 0;
+        for (size_t i = 1; i < tap_count_; ++i) {
+            const size_t newer = (tap_index_ + tap_times_.size() - i) % tap_times_.size();
+            const size_t older = (tap_index_ + tap_times_.size() - i - 1) % tap_times_.size();
+            const auto interval = tap_times_[newer] - tap_times_[older];
+            total_interval_ms +=
+                std::chrono::duration<double, std::milli>(interval).count();
+            ++interval_count;
+        }
+
+        if (interval_count == 0 || total_interval_ms <= 0.0) {
+            return;
+        }
+
+        const double avg_interval_ms = total_interval_ms / static_cast<double>(interval_count);
+        commit_metronome_bpm(static_cast<float>(60000.0 / avg_interval_ms));
+    }
+
+    struct RecordingState {
+        bool        active;
+        std::string folder;
+        size_t      queued_blocks;
+        uint64_t    dropped_blocks;
+    };
+
+    RecordingState get_recording_state() const {
+        return RecordingState{
+            recording_writer_.is_active(),
+            recording_writer_.folder(),
+            recording_writer_.queued_blocks(),
+            recording_writer_.dropped_blocks(),
+        };
+    }
+
+    bool start_recording() {
+        const bool started =
+            recording_writer_.start(static_cast<uint32_t>(audio_config_.sample_rate));
+        if (started) {
+            Log::info("Recording started: {}", recording_writer_.folder());
+        } else {
+            Log::error("Recording failed to start");
+        }
+        return started;
+    }
+
+    void stop_recording() {
+        const bool was_active = recording_writer_.is_active();
+        const std::string folder = recording_writer_.folder();
+        recording_writer_.stop();
+        if (was_active && !folder.empty()) {
+            Log::info("Recording stopped: {}", folder);
+        }
     }
 
     // WAV file playback methods
@@ -801,6 +926,46 @@ private:
         uint32_t sample_rate = 48000;
         std::chrono::steady_clock::time_point capture_time;
     };
+
+    static int64_t steady_now_ns() {
+        const auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch())
+            .count();
+    }
+
+    uint32_t next_metronome_boundary_beat() const {
+        return metronome_beat_number_.load(std::memory_order_acquire) + 1;
+    }
+
+    void send_metronome_sync(int bpm_milli, bool running, uint32_t beat_number) {
+        MetronomeSyncHdr sync{};
+        sync.magic = CTRL_MAGIC;
+        sync.type = CtrlHdr::Cmd::METRONOME_SYNC;
+        sync.bpm_milli = static_cast<uint32_t>(std::max(1, bpm_milli));
+        sync.beat_number = beat_number;
+        sync.flags = running ? METRONOME_FLAG_RUNNING : 0;
+        sync.sender_time_ns = steady_now_ns();
+
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(MetronomeSyncHdr));
+        std::memcpy(buf->data(), &sync, sizeof(MetronomeSyncHdr));
+        send(buf->data(), buf->size(), buf);
+        metronome_sync_sent_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void commit_metronome_bpm_milli(int bpm_milli) {
+        const int current_bpm_milli = metronome_bpm_milli_.load(std::memory_order_acquire);
+        const int pending_bpm_milli =
+            metronome_pending_bpm_milli_.load(std::memory_order_acquire);
+        const uint32_t pending_sequence =
+            metronome_pending_sequence_.load(std::memory_order_acquire);
+        if (bpm_milli == current_bpm_milli &&
+            (pending_sequence == 0 || pending_bpm_milli == bpm_milli)) {
+            return;
+        }
+        send_metronome_sync(bpm_milli,
+                            metronome_running_.load(std::memory_order_acquire),
+                            next_metronome_boundary_beat());
+    }
 
     void start_pcm_sender_thread() {
         if (pcm_sender_running_.exchange(true, std::memory_order_acq_rel)) {
@@ -1629,8 +1794,24 @@ private:
                 const auto display_name = fixed_string(info.display_name);
                 participant_manager_.set_participant_metadata(info.participant_id, profile_id,
                                                               display_name);
+                recording_writer_.set_participant_metadata(info.participant_id, profile_id,
+                                                           display_name);
                 Log::info("Participant {} metadata: user='{}' display='{}'", info.participant_id,
                           profile_id, display_name);
+                break;
+            }
+            case CtrlHdr::Cmd::METRONOME_SYNC: {
+                if (bytes < sizeof(MetronomeSyncHdr)) {
+                    break;
+                }
+                MetronomeSyncHdr sync{};
+                std::memcpy(&sync, recv_buf_.data(), sizeof(MetronomeSyncHdr));
+                schedule_metronome_sync(sync);
+                metronome_sync_received_.fetch_add(1, std::memory_order_relaxed);
+                Log::info("Metronome sync: bpm={:.1f} running={} beat={} seq={} effective_ns={}",
+                          static_cast<double>(sync.bpm_milli) / 1000.0,
+                          (sync.flags & METRONOME_FLAG_RUNNING) != 0, sync.beat_number,
+                          sync.sequence, sync.effective_server_time_ns);
                 break;
             }
             default:
@@ -1669,15 +1850,21 @@ private:
         auto current_time =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
         auto rtt = (current_time - hdr.t1_client_send) - (hdr.t3_server_send - hdr.t2_server_recv);
-        // auto offset =
-        //     ((hdr.t2_server_recv - hdr.t1_client_send) + (hdr.t3_server_send - current_time)) /
-        //     2;
+        auto offset =
+            ((hdr.t2_server_recv - hdr.t1_client_send) + (hdr.t3_server_send - current_time)) /
+            2;
 
         double rtt_ms = static_cast<double>(rtt) / 1e6;
-        // double offset_ms = static_cast<double>(offset) / 1e6;
 
         // Store RTT for GUI display (thread-safe atomic update)
         rtt_ms_.store(rtt_ms, std::memory_order_relaxed);
+        if (!server_clock_ready_.exchange(true, std::memory_order_acq_rel)) {
+            server_clock_offset_ns_.store(offset, std::memory_order_release);
+        } else {
+            const int64_t previous = server_clock_offset_ns_.load(std::memory_order_relaxed);
+            server_clock_offset_ns_.store(((previous * 15) + offset) / 16,
+                                          std::memory_order_release);
+        }
 
         // print live stats
         // Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
@@ -1839,6 +2026,162 @@ private:
                 participant.last_packet_time = packet.timestamp;
             }
         });
+    }
+
+    void schedule_metronome_sync(const MetronomeSyncHdr& sync) {
+        const uint32_t current_sequence =
+            metronome_pending_sequence_.load(std::memory_order_acquire);
+        if (sync.sequence != 0 && sync.sequence <= current_sequence) {
+            return;
+        }
+        const int bpm_milli = std::clamp(static_cast<int>(sync.bpm_milli), 30000, 240000);
+        metronome_pending_bpm_milli_.store(bpm_milli, std::memory_order_relaxed);
+        metronome_pending_running_.store((sync.flags & METRONOME_FLAG_RUNNING) != 0,
+                                         std::memory_order_relaxed);
+        metronome_pending_beat_number_.store(sync.beat_number, std::memory_order_relaxed);
+        const bool clock_ready = server_clock_ready_.load(std::memory_order_acquire);
+        const int64_t effective_ns =
+            sync.effective_server_time_ns > 0 && clock_ready
+                ? sync.effective_server_time_ns
+                : steady_now_ns() + server_clock_offset_ns_.load(std::memory_order_acquire) +
+                      150'000'000LL;
+        metronome_pending_effective_server_time_ns_.store(effective_ns,
+                                                          std::memory_order_relaxed);
+        metronome_pending_sequence_.store(sync.sequence == 0 ? current_sequence + 1 : sync.sequence,
+                                          std::memory_order_release);
+    }
+
+    static int64_t ns_delta_to_samples(int64_t ns, size_t sample_rate) {
+        return static_cast<int64_t>((static_cast<long double>(ns) *
+                                     static_cast<long double>(sample_rate)) /
+                                    1'000'000'000.0L);
+    }
+
+    static int64_t beat_interval_samples(int bpm_milli, size_t sample_rate) {
+        return std::max<int64_t>(
+            1, static_cast<int64_t>((static_cast<long double>(sample_rate) *
+                                     60'000.0L) /
+                                    static_cast<long double>(std::max(1, bpm_milli))));
+    }
+
+    void prepare_metronome_schedule(int64_t local_time_ns, size_t sample_rate) {
+        const uint32_t pending_sequence =
+            metronome_pending_sequence_.load(std::memory_order_acquire);
+        if (pending_sequence == 0 || pending_sequence == metronome_prepared_sequence_) {
+            return;
+        }
+
+        const int64_t effective_ns =
+            metronome_pending_effective_server_time_ns_.load(std::memory_order_relaxed);
+        const int64_t offset_ns = server_clock_offset_ns_.load(std::memory_order_acquire);
+        const int64_t local_effective_ns = effective_ns - offset_ns;
+        const int64_t delta_samples =
+            ns_delta_to_samples(local_effective_ns - local_time_ns, sample_rate);
+        metronome_prepared_effective_sample_ =
+            metronome_audio_sample_cursor_ + delta_samples;
+        metronome_prepared_sequence_ = pending_sequence;
+    }
+
+    void apply_due_metronome_schedule(size_t sample_rate) {
+        if (metronome_prepared_sequence_ == 0 ||
+            metronome_prepared_sequence_ == metronome_applied_sequence_ ||
+            metronome_audio_sample_cursor_ < metronome_prepared_effective_sample_) {
+            return;
+        }
+
+        const int bpm_milli =
+            std::max(1, metronome_pending_bpm_milli_.load(std::memory_order_relaxed));
+        const bool running = metronome_pending_running_.load(std::memory_order_relaxed);
+        const uint32_t beat = metronome_pending_beat_number_.load(std::memory_order_relaxed);
+        const int64_t interval_samples = beat_interval_samples(bpm_milli, sample_rate);
+
+        metronome_bpm_milli_.store(bpm_milli, std::memory_order_release);
+        metronome_running_.store(running, std::memory_order_release);
+        metronome_beat_number_.store(beat, std::memory_order_release);
+        metronome_epoch_sample_ =
+            metronome_prepared_effective_sample_ - (static_cast<int64_t>(beat) * interval_samples);
+        metronome_timeline_ready_ = true;
+        metronome_applied_sequence_ = metronome_prepared_sequence_;
+    }
+
+    void mix_metronome_click(float* output_buffer, unsigned long frame_count, size_t out_channels) {
+        const int bpm_milli = std::max(1, metronome_bpm_milli_.load(std::memory_order_acquire));
+        const size_t sample_rate = static_cast<size_t>(std::max(1, audio_config_.sample_rate));
+        const int64_t interval_samples = beat_interval_samples(bpm_milli, sample_rate);
+        const size_t click_samples = std::max<size_t>(1, sample_rate / 35);
+        prepare_metronome_schedule(steady_now_ns(), sample_rate);
+
+        constexpr double PI = 3.14159265358979323846;
+        for (unsigned long frame = 0; frame < frame_count; ++frame) {
+            apply_due_metronome_schedule(sample_rate);
+
+            if (!metronome_running_.load(std::memory_order_acquire) ||
+                !metronome_timeline_ready_) {
+                ++metronome_audio_sample_cursor_;
+                continue;
+            }
+
+            const int64_t elapsed_samples =
+                metronome_audio_sample_cursor_ - metronome_epoch_sample_;
+            if (elapsed_samples < 0) {
+                ++metronome_audio_sample_cursor_;
+                continue;
+            }
+
+            const uint32_t beat_number =
+                static_cast<uint32_t>(elapsed_samples / interval_samples) + 1;
+            const size_t click_sample =
+                static_cast<size_t>(elapsed_samples % interval_samples);
+            metronome_beat_number_.store(beat_number, std::memory_order_release);
+
+            if (click_sample < click_samples) {
+                const bool downbeat = ((beat_number - 1) % 4) == 0;
+                const double frequency = downbeat ? 1320.0 : 880.0;
+                const double t = static_cast<double>(click_sample) /
+                                 static_cast<double>(sample_rate);
+                const double envelope =
+                    std::exp(-7.0 * static_cast<double>(click_sample) /
+                             static_cast<double>(click_samples));
+                const float click =
+                    static_cast<float>(std::sin(2.0 * PI * frequency * t) * envelope * 0.22);
+                for (size_t channel = 0; channel < out_channels; ++channel) {
+                    const size_t index = (frame * out_channels) + channel;
+                    output_buffer[index] = std::clamp(output_buffer[index] + click, -1.0F, 1.0F);
+                }
+            }
+
+            ++metronome_audio_sample_cursor_;
+        }
+    }
+
+    void record_mono_block(RecordingWriter::TrackKind kind, uint32_t participant_id,
+                           const float* samples, size_t frame_count) {
+        recording_writer_.enqueue(kind, participant_id,
+                                  static_cast<uint32_t>(audio_config_.sample_rate), samples,
+                                  frame_count);
+    }
+
+    void record_master_mix(const float* output_buffer, unsigned long frame_count,
+                           size_t out_channels) {
+        if (!recording_writer_.is_active() || output_buffer == nullptr ||
+            frame_count > RecordingWriter::MAX_FRAMES_PER_BLOCK) {
+            return;
+        }
+
+        if (out_channels == 1) {
+            record_mono_block(RecordingWriter::TrackKind::Master, 0, output_buffer, frame_count);
+            return;
+        }
+
+        std::array<float, RecordingWriter::MAX_FRAMES_PER_BLOCK> mono{};
+        for (unsigned long frame = 0; frame < frame_count; ++frame) {
+            float sum = 0.0F;
+            for (size_t channel = 0; channel < out_channels; ++channel) {
+                sum += output_buffer[(frame * out_channels) + channel];
+            }
+            mono[frame] = sum / static_cast<float>(out_channels);
+        }
+        record_mono_block(RecordingWriter::TrackKind::Master, 0, mono.data(), frame_count);
     }
 
     static int audio_callback(const void* input, void* output, unsigned long frame_count,
@@ -2020,6 +2363,13 @@ private:
                     return;
                 }
 
+                if (static_cast<size_t>(decoded_samples) <=
+                    RecordingWriter::MAX_FRAMES_PER_BLOCK) {
+                    client->record_mono_block(RecordingWriter::TrackKind::Participant,
+                                              participant_id, participant.pcm_buffer.data(),
+                                              static_cast<size_t>(decoded_samples));
+                }
+
                 if (opus_packet.codec == AudioCodec::Opus) {
                     const size_t decoded_frames = static_cast<size_t>(decoded_samples);
                     if (participant.opus_pcm_buffered_frames + decoded_frames <=
@@ -2064,6 +2414,12 @@ private:
 
                         const size_t next_decoded_frames =
                             static_cast<size_t>(next_decoded_samples);
+                        if (next_decoded_frames <= RecordingWriter::MAX_FRAMES_PER_BLOCK) {
+                            client->record_mono_block(RecordingWriter::TrackKind::Participant,
+                                                      participant_id,
+                                                      participant.pcm_buffer.data(),
+                                                      next_decoded_frames);
+                        }
                         if (participant.opus_pcm_buffered_frames + next_decoded_frames >
                             participant.opus_pcm_buffer.size()) {
                             participant.opus_pcm_buffered_frames = 0;
@@ -2319,6 +2675,9 @@ private:
             }
         }
 
+        client->mix_metronome_click(output_buffer, frame_count, out_channels);
+        client->record_master_mix(output_buffer, frame_count, out_channels);
+
         // Encode and send own audio (always send to maintain timing, even if silence)
         // Mix WAV with microphone input before encoding
         if (client->audio_.is_stream_active()) {
@@ -2346,6 +2705,8 @@ private:
 
                 float rms = audio_analysis::calculate_rms(pcm_input.data(), frame_count);
                 client->own_audio_level_.store(rms);
+                client->record_mono_block(RecordingWriter::TrackKind::Self, 0, pcm_input.data(),
+                                          frame_count);
 
                 const size_t payload_bytes = frame_count * sizeof(int16_t);
                 if (payload_bytes <= AUDIO_BUF_SIZE) {
@@ -2389,6 +2750,8 @@ private:
 
             float rms = audio_analysis::calculate_rms(opus_input.data(), frame_count);
             client->own_audio_level_.store(rms);
+            client->record_mono_block(RecordingWriter::TrackKind::Self, 0, opus_input.data(),
+                                      frame_count);
             client->enqueue_opus_send_samples(
                 opus_input.data(), frame_count,
                 static_cast<uint32_t>(client->audio_config_.sample_rate), callback_start);
@@ -2448,10 +2811,31 @@ private:
 
     ParticipantManager participant_manager_;
     WavFilePlayback    wav_playback_;
+    RecordingWriter    recording_writer_;
 
     // WAV playback volume/gain (thread-safe with atomic)
     std::atomic<float> wav_gain_{1.0F};          // Default to 100% volume
     std::atomic<bool>  wav_muted_local_{false};  // Mute locally (still sends over network)
+
+    std::atomic<int>      metronome_bpm_milli_{120000};
+    std::atomic<bool>     metronome_running_{false};
+    std::atomic<uint32_t> metronome_beat_number_{0};
+    std::atomic<uint64_t> metronome_sync_sent_{0};
+    std::atomic<uint64_t> metronome_sync_received_{0};
+    std::atomic<int>      metronome_pending_bpm_milli_{120000};
+    std::atomic<bool>     metronome_pending_running_{false};
+    std::atomic<uint32_t> metronome_pending_beat_number_{0};
+    std::atomic<int64_t>  metronome_pending_effective_server_time_ns_{0};
+    std::atomic<uint32_t> metronome_pending_sequence_{0};
+    uint32_t              metronome_prepared_sequence_ = 0;
+    int64_t               metronome_prepared_effective_sample_ = 0;
+    uint32_t              metronome_applied_sequence_ = 0;
+    int64_t               metronome_epoch_sample_ = 0;
+    int64_t               metronome_audio_sample_cursor_ = 0;
+    bool                  metronome_timeline_ready_ = false;
+    std::array<std::chrono::steady_clock::time_point, 8> tap_times_{};
+    size_t                                             tap_count_ = 0;
+    size_t                                             tap_index_ = 0;
 
     // Microphone mute (thread-safe with atomic)
     std::atomic<bool> mic_muted_{false};  // Mute mic (doesn't send to server)
@@ -2464,6 +2848,8 @@ private:
 
     // RTT tracking (thread-safe with atomic)
     std::atomic<double> rtt_ms_{0.0};
+    std::atomic<int64_t> server_clock_offset_ns_{0};
+    std::atomic<bool>    server_clock_ready_{false};
 
     // Total bytes sent/received (cumulative counters)
     std::atomic<uint64_t> total_bytes_rx_{0};
@@ -2526,7 +2912,7 @@ static void draw_master_strip(Client& client, float available_height) {
     // Dynamic fader height - scale with available space, min 200, max based on window
     // Reserved space: title, mute btn, fader/meter, label, separator, latency section (4 lines),
     // separator, WAV section
-    float fader_height = std::max(200.0F, available_height - 370.0F);
+    float fader_height = std::max(120.0F, available_height - 560.0F);
 
     // Padding constant
     constexpr float PADDING = 8.0F;
@@ -2692,6 +3078,93 @@ static void draw_master_strip(Client& client, float available_height) {
         }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%d ms max", client.get_jitter_packet_age_limit_ms());
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // ========== METRONOME SECTION ==========
+        Client::MetronomeState metronome = client.get_metronome_state();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Metronome:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+        static float metronome_draft_bpm = 120.0F;
+        static bool metronome_bpm_editing = false;
+        static bool metronome_bpm_dirty = false;
+        static auto metronome_bpm_last_edit = std::chrono::steady_clock::now();
+        constexpr auto METRONOME_BPM_DEBOUNCE = std::chrono::milliseconds(350);
+        if (!metronome_bpm_editing && !metronome_bpm_dirty) {
+            metronome_draft_bpm = metronome.bpm;
+        }
+        ImGui::PushItemWidth(width);
+        if (ImGui::InputFloat("##MetronomeBpm", &metronome_draft_bpm, 1.0F, 5.0F, "%.1f BPM")) {
+            metronome_draft_bpm = std::clamp(metronome_draft_bpm, 30.0F, 240.0F);
+            metronome_bpm_dirty = true;
+            metronome_bpm_last_edit = std::chrono::steady_clock::now();
+        }
+        metronome_bpm_editing = ImGui::IsItemActive();
+        ImGui::PopItemWidth();
+        if (metronome_bpm_dirty && !metronome_bpm_editing &&
+            std::chrono::steady_clock::now() - metronome_bpm_last_edit >=
+                METRONOME_BPM_DEBOUNCE) {
+            client.commit_metronome_bpm(metronome_draft_bpm);
+            metronome_bpm_dirty = false;
+        }
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+        if (ImGui::Button(metronome.running ? "Stop##Metronome" : "Start##Metronome",
+                          ImVec2((width - style.ItemSpacing.x) * 0.5F, 0))) {
+            if (metronome.running) {
+                client.stop_metronome();
+            } else {
+                client.start_metronome();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Tap##Metronome", ImVec2((width - style.ItemSpacing.x) * 0.5F, 0))) {
+            client.tap_metronome_tempo();
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Beat: %u", metronome.beat_number);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Sync: %llu/%llu",
+                    static_cast<unsigned long long>(metronome.sync_sent),
+                    static_cast<unsigned long long>(metronome.sync_received));
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Clock sync: %s", metronome.clock_ready ? "Locked" : "Syncing");
+        char clock_tooltip[160];
+        std::snprintf(clock_tooltip, sizeof(clock_tooltip),
+                      "Raw monotonic-clock offset: %.2f ms. Large values are normal across machines.",
+                      metronome.clock_offset_ms);
+        JamGui::ShowTooltipOnHover(clock_tooltip);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // ========== RECORDING SECTION ==========
+        Client::RecordingState recording = client.get_recording_state();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Recording:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
+        if (recording.active) {
+            if (ImGui::Button("Stop Recording", ImVec2(width, 0))) {
+                client.stop_recording();
+            }
+        } else if (ImGui::Button("Start Recording", ImVec2(width, 0))) {
+            client.start_recording();
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("%s", recording.active ? "REC" : "Idle");
+        if (!recording.folder.empty()) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            ImGui::TextWrapped("%s", recording.folder.c_str());
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Queued: %zu", recording.queued_blocks);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Dropped: %llu",
+                    static_cast<unsigned long long>(recording.dropped_blocks));
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -3357,6 +3830,11 @@ void draw_client_ui(Client& client) {
             std::string server_info =
                 client.get_server_address() + ":" + std::to_string(client.get_server_port());
             ImGui::Text("Server: %s", server_info.c_str());
+
+            ImGui::Separator();
+
+            // Room
+            ImGui::Text("Room: %s", client.get_room_id().c_str());
 
             ImGui::Separator();
 

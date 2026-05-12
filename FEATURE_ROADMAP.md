@@ -13,6 +13,13 @@ diagnostic work has moved into the Opus completion docs.
 - Sync data should include BPM, beat number, and a timestamp.
 - UI needs BPM entry, start/stop, and a simple beat indicator.
 
+### Tap Tempo
+
+- Tap button in the metronome UI.
+- Use several recent taps to estimate BPM.
+- Feed the calculated BPM into the shared metronome controls.
+- Reset the tap window after a pause.
+
 ### Local Multitrack Recording
 
 - Record the local mic, each remote participant, and the master mix.
@@ -20,13 +27,6 @@ diagnostic work has moved into the Opus completion docs.
 - Create one timestamped folder per recording session.
 - Keep disk writing off the audio callback.
 - Recording state should be visible and hard to trigger accidentally.
-
-### Tap Tempo
-
-- Tap button in the metronome UI.
-- Use several recent taps to estimate BPM.
-- Feed the calculated BPM into the shared metronome controls.
-- Reset the tap window after a pause.
 
 ### Dockable Modular UI
 
@@ -36,3 +36,10 @@ diagnostic work has moved into the Opus completion docs.
 - Default layout should remain simple for small screens.
 - Advanced users should be able to rearrange modules for large or multi-monitor
   setups.
+
+## Intended Order
+
+1. Shared metronome.
+2. Tap tempo.
+3. Local multitrack recording.
+4. Dockable modular UI.

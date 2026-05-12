@@ -92,6 +92,51 @@ bool receive_any_audio(udp::socket& socket, std::chrono::milliseconds timeout) {
     return false;
 }
 
+void send_metronome_sync(udp::socket& socket, const udp::endpoint& server) {
+    MetronomeSyncHdr sync{};
+    sync.magic = CTRL_MAGIC;
+    sync.type = CtrlHdr::Cmd::METRONOME_SYNC;
+    sync.bpm_milli = 120000;
+    sync.beat_number = 4;
+    sync.flags = METRONOME_FLAG_RUNNING;
+    socket.send_to(asio::buffer(&sync, sizeof(sync)), server);
+}
+
+bool receive_metronome_sync(udp::socket& socket, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::array<unsigned char, 1024> buffer{};
+    udp::endpoint sender;
+
+    socket.non_blocking(true);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::error_code ec;
+        const size_t bytes = socket.receive_from(asio::buffer(buffer), sender, 0, ec);
+        if (!ec && bytes >= sizeof(CtrlHdr)) {
+            MsgHdr hdr{};
+            std::memcpy(&hdr, buffer.data(), sizeof(hdr));
+            if (hdr.magic != CTRL_MAGIC) {
+                continue;
+            }
+            CtrlHdr ctrl{};
+            std::memcpy(&ctrl, buffer.data(), sizeof(ctrl));
+            if (ctrl.type == CtrlHdr::Cmd::METRONOME_SYNC) {
+                return true;
+            }
+            continue;
+        }
+        if (!ec) {
+            continue;
+        }
+        if (ec != asio::error::would_block && ec != asio::error::try_again) {
+            std::cerr << "receive error: " << ec.message() << "\n";
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+
+    return false;
+}
+
 int main(int argc, char** argv) {
     std::string server_address = "127.0.0.1";
     short       server_port    = 9999;
@@ -130,6 +175,7 @@ int main(int argc, char** argv) {
     udp::socket room_a_sender(io, udp::endpoint(udp::v4(), 0));
     udp::socket room_a_receiver(io, udp::endpoint(udp::v4(), 0));
     udp::socket room_b_receiver(io, udp::endpoint(udp::v4(), 0));
+    udp::socket room_a_rejoin_sender(io, udp::endpoint(udp::v4(), 0));
 
     send_join(room_a_sender, server, "room-a", "user-a1",
                      make_token(secret, server_id, "room-a", "user-a1", ttl_ms,
@@ -150,12 +196,32 @@ int main(int argc, char** argv) {
     const bool same_room_received      = receive_any_audio(room_a_receiver, 500ms);
     const bool different_room_received = receive_any_audio(room_b_receiver, 250ms);
 
+    send_metronome_sync(room_a_sender, server);
+    const bool same_room_metronome_received = receive_metronome_sync(room_a_receiver, 500ms);
+    const bool different_room_metronome_received = receive_metronome_sync(room_b_receiver, 250ms);
+
+    send_join(room_a_rejoin_sender, server, "room-a", "user-a1",
+                     make_token(secret, server_id, "room-a", "user-a1", ttl_ms,
+                                token_room_override, token_user_override, malformed_token));
+    std::this_thread::sleep_for(50ms);
+
+    room_a_sender.send_to(asio::buffer(packet->data(), packet->size()), server);
+    const bool stale_duplicate_forwarded = receive_any_audio(room_a_receiver, 250ms);
+
+    room_a_rejoin_sender.send_to(asio::buffer(packet->data(), packet->size()), server);
+    const bool rejoined_sender_forwarded = receive_any_audio(room_a_receiver, 500ms);
+
     send_leave(room_a_sender, server);
+    send_leave(room_a_rejoin_sender, server);
     send_leave(room_a_receiver, server);
     send_leave(room_b_receiver, server);
 
     std::cout << "same_room_received=" << same_room_received << "\n";
     std::cout << "different_room_received=" << different_room_received << "\n";
+    std::cout << "same_room_metronome_received=" << same_room_metronome_received << "\n";
+    std::cout << "different_room_metronome_received=" << different_room_metronome_received << "\n";
+    std::cout << "stale_duplicate_forwarded=" << stale_duplicate_forwarded << "\n";
+    std::cout << "rejoined_sender_forwarded=" << rejoined_sender_forwarded << "\n";
 
     if (!same_room_received) {
         std::cerr << "same-room audio was not forwarded\n";
@@ -164,6 +230,22 @@ int main(int argc, char** argv) {
     if (different_room_received) {
         std::cerr << "different-room audio leaked\n";
         return 3;
+    }
+    if (!same_room_metronome_received) {
+        std::cerr << "same-room metronome sync was not forwarded\n";
+        return 4;
+    }
+    if (different_room_metronome_received) {
+        std::cerr << "different-room metronome sync leaked\n";
+        return 5;
+    }
+    if (stale_duplicate_forwarded) {
+        std::cerr << "stale duplicate sender was still forwarded\n";
+        return 6;
+    }
+    if (!rejoined_sender_forwarded) {
+        std::cerr << "rejoined sender was not forwarded\n";
+        return 7;
     }
     return 0;
 }
