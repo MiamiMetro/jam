@@ -308,7 +308,7 @@ public:
         Log::info("{} input channel(s), {} output channel(s) at {} Hz", input_channel_count_,
                   output_channel_count_, config.sample_rate);
         if (static_cast<int>(buffer_frames) != config.frames_per_buffer) {
-            Log::warn("RtAudio adjusted buffer size from {} to {}", config.frames_per_buffer,
+            Log::info("RtAudio adjusted buffer size from {} to {}", config.frames_per_buffer,
                       buffer_frames);
         }
 
@@ -347,7 +347,7 @@ public:
         Log::info("Actual buffer:    {} frames ({:.3f} ms)", info.actual_buffer_frames,
                   info.buffer_duration_ms);
         if (!info.backend_latency_available) {
-            Log::warn("RtAudio backend latency is unavailable or reported as zero");
+            Log::info("RtAudio backend latency is unavailable or reported as zero");
         }
     }
 

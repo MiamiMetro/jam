@@ -40,6 +40,9 @@ struct ParticipantData {
     std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
     std::array<float, 1920>                 opus_pcm_buffer{};
     size_t                                  opus_pcm_buffered_frames = 0;
+    double                                  opus_resample_phase = 0.0;
+    uint64_t                                opus_rate_last_queue_limit_drops = 0;
+    int                                     opus_rate_correction_callbacks = 0;
     std::atomic<size_t>                     opus_pcm_buffered_frames_observed{0};
     std::atomic<uint64_t>                   opus_packets_decoded_in_callback{0};
     std::atomic<uint64_t>                   opus_queue_limit_drops{0};
@@ -100,6 +103,7 @@ struct ParticipantData {
     uint32_t                drift_reference_sample_rate = 48000;
     uint16_t                drift_reference_frame_count = 0;
     std::chrono::steady_clock::time_point drift_reference_time{};
+    std::atomic<uint64_t>   receiver_drift_observations{0};
     std::atomic<int64_t>    receiver_drift_ppm_last_milli{0};
     std::atomic<int64_t>    receiver_drift_ppm_avg_milli{0};
     std::atomic<int64_t>    receiver_drift_ppm_abs_max_milli{0};

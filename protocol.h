@@ -19,11 +19,11 @@ constexpr size_t TARGET_OPUS_QUEUE_SIZE    = 3;   // Target queue size for adapt
 constexpr size_t MIN_JITTER_BUFFER_PACKETS = 3;   // Minimum packets before playback starts
 constexpr size_t MIN_OPUS_JITTER_PACKETS = 0;     // Manual testing can disable Opus prebuffer
 constexpr size_t DEFAULT_OPUS_JITTER_PACKETS = 8; // Default Opus playout target
-constexpr size_t DEFAULT_OPUS_QUEUE_LIMIT_PACKETS = 16; // Default Opus burst capacity
+constexpr size_t DEFAULT_OPUS_QUEUE_LIMIT_PACKETS = 32; // Default Opus burst capacity
 constexpr size_t MAX_OPUS_JITTER_PACKETS = 32;    // User-facing Opus jitter limit
 constexpr size_t MIN_OPUS_QUEUE_LIMIT_PACKETS = 1;
 constexpr size_t MAX_OPUS_QUEUE_LIMIT_PACKETS = 64; // User-facing Opus queue limit
-constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 40;  // Default age limit at playout
+constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 80;  // Default age limit at playout
 constexpr int    MIN_JITTER_PACKET_AGE_MS = 0;        // Manual testing can disable age drops
 constexpr int    MAX_JITTER_PACKET_AGE_MS = 250;      // User-facing age limit
 

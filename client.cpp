@@ -997,6 +997,7 @@ private:
     static void consume_opus_pcm_buffer(ParticipantData& participant, size_t frame_count) {
         if (participant.opus_pcm_buffered_frames <= frame_count) {
             participant.opus_pcm_buffered_frames = 0;
+            participant.opus_resample_phase = 0.0;
             return;
         }
 
@@ -1006,6 +1007,81 @@ private:
                       static_cast<std::ptrdiff_t>(participant.opus_pcm_buffered_frames),
                   participant.opus_pcm_buffer.begin());
         participant.opus_pcm_buffered_frames = remaining;
+    }
+
+    static double opus_playout_rate_ratio(ParticipantData& participant) {
+        const size_t packet_frames =
+            participant.last_packet_frame_count.load(std::memory_order_relaxed);
+        const double decoded_packets =
+            packet_frames > 0 ? static_cast<double>(participant.opus_pcm_buffered_frames) /
+                                    static_cast<double>(packet_frames)
+                              : 0.0;
+        const double queued_packets =
+            static_cast<double>(participant.opus_queue.size_approx()) + decoded_packets;
+        const double target_packets =
+            static_cast<double>(opus_playout_target_queue_packets(participant));
+        const double queue_error = queued_packets - target_packets;
+        double ratio = std::clamp(1.0 + (queue_error * 0.05), 0.96, 1.18);
+
+        const uint64_t queue_limit_drops =
+            participant.opus_queue_limit_drops.load(std::memory_order_relaxed);
+        if (queue_limit_drops > participant.opus_rate_last_queue_limit_drops) {
+            participant.opus_rate_last_queue_limit_drops = queue_limit_drops;
+            participant.opus_rate_correction_callbacks = 400;
+        }
+        if (participant.opus_rate_correction_callbacks > 0) {
+            participant.opus_rate_correction_callbacks--;
+            if (queued_packets >= target_packets * 0.5) {
+                ratio = std::max(ratio, 1.18);
+            }
+        }
+
+        return ratio;
+    }
+
+    static size_t opus_resample_required_input_frames(const ParticipantData& participant,
+                                                      unsigned long output_frames,
+                                                      double ratio) {
+        if (output_frames == 0) {
+            return 0;
+        }
+        const double last_source =
+            participant.opus_resample_phase +
+            (static_cast<double>(output_frames - 1) * ratio);
+        return static_cast<size_t>(std::floor(last_source)) + 2;
+    }
+
+    static void mix_resampled_opus_pcm(ParticipantData& participant, float* output_buffer,
+                                       unsigned long output_frames, size_t output_channels,
+                                       float gain, double ratio) {
+        if (output_frames == 0 || output_buffer == nullptr) {
+            return;
+        }
+
+        const double start_phase = participant.opus_resample_phase;
+        for (unsigned long i = 0; i < output_frames; ++i) {
+            const double source_pos = start_phase + (static_cast<double>(i) * ratio);
+            const auto index = static_cast<size_t>(std::floor(source_pos));
+            const float frac = static_cast<float>(source_pos - static_cast<double>(index));
+            const float a = participant.opus_pcm_buffer[index];
+            const float b = participant.opus_pcm_buffer[index + 1];
+            const float sample = (a + ((b - a) * frac)) * gain;
+
+            if (output_channels == 1) {
+                output_buffer[i] += sample;
+            } else {
+                const size_t base = static_cast<size_t>(i) * output_channels;
+                output_buffer[base] += sample;
+                output_buffer[base + 1] += sample;
+            }
+        }
+
+        const double consumed_exact =
+            start_phase + (static_cast<double>(output_frames) * ratio);
+        const auto consumed_frames = static_cast<size_t>(std::floor(consumed_exact));
+        participant.opus_resample_phase =
+            consumed_exact - static_cast<double>(consumed_frames);
+        consume_opus_pcm_buffer(participant, consumed_frames);
     }
 
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
@@ -1048,7 +1124,7 @@ private:
         }
 
         const uint32_t elapsed_packets = packet.sequence - participant.drift_reference_sequence;
-        if (elapsed_packets < 200) {
+        if (elapsed_packets < 2000) {
             return;
         }
 
@@ -1077,14 +1153,22 @@ private:
             previous_avg == 0 ? drift_ppm_milli : ((previous_avg * 63) + drift_ppm_milli) / 64;
         participant.receiver_drift_ppm_avg_milli.store(next_avg, std::memory_order_relaxed);
 
-        const int64_t abs_drift =
-            drift_ppm_milli < 0 ? -drift_ppm_milli : drift_ppm_milli;
-        int64_t previous_abs_max =
-            participant.receiver_drift_ppm_abs_max_milli.load(std::memory_order_relaxed);
-        while (abs_drift > previous_abs_max &&
-               !participant.receiver_drift_ppm_abs_max_milli.compare_exchange_weak(
-                   previous_abs_max, abs_drift, std::memory_order_relaxed)) {
+        constexpr uint64_t DRIFT_MAX_WARMUP_OBSERVATIONS = 16;
+        const uint64_t observations =
+            participant.receiver_drift_observations.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (observations > DRIFT_MAX_WARMUP_OBSERVATIONS) {
+            const int64_t abs_drift =
+                drift_ppm_milli < 0 ? -drift_ppm_milli : drift_ppm_milli;
+            int64_t previous_abs_max =
+                participant.receiver_drift_ppm_abs_max_milli.load(std::memory_order_relaxed);
+            while (abs_drift > previous_abs_max &&
+                   !participant.receiver_drift_ppm_abs_max_milli.compare_exchange_weak(
+                       previous_abs_max, abs_drift, std::memory_order_relaxed)) {
+            }
         }
+
+        participant.drift_reference_sequence = packet.sequence;
+        participant.drift_reference_time = packet.timestamp;
     }
 
     static void observe_opus_pcm_depth(ParticipantData& participant) {
@@ -1105,7 +1189,17 @@ private:
     }
 
     static size_t opus_rebuffer_empty_callback_threshold(const ParticipantData& participant) {
-        return std::max<size_t>(3, opus_playout_target_queue_packets(participant));
+        const size_t packet_frames =
+            participant.last_packet_frame_count.load(std::memory_order_relaxed);
+        const size_t callback_frames =
+            participant.last_callback_frame_count.load(std::memory_order_relaxed);
+        const size_t target_packets = opus_playout_target_queue_packets(participant);
+        if (packet_frames > 0 && callback_frames > 0 && callback_frames < packet_frames) {
+            const size_t callbacks_per_packet =
+                (packet_frames + callback_frames - 1) / callback_frames;
+            return std::max<size_t>(3, target_packets * callbacks_per_packet);
+        }
+        return std::max<size_t>(3, target_packets);
     }
 
     static void observe_auto_jitter_instability(ParticipantData& participant) {
@@ -1766,18 +1860,12 @@ private:
             }
 
             if (participant.last_codec == AudioCodec::Opus &&
-                participant.opus_pcm_buffered_frames >= frame_count) {
-                if (out_channels == 1) {
-                    audio_analysis::mix_with_gain(output_buffer,
-                                                  participant.opus_pcm_buffer.data(), frame_count,
-                                                  participant.gain);
-                } else {
-                    audio_analysis::mix_mono_to_stereo(output_buffer,
-                                                       participant.opus_pcm_buffer.data(),
-                                                       frame_count, out_channels,
-                                                       participant.gain);
-                }
-                consume_opus_pcm_buffer(participant, frame_count);
+                participant.opus_pcm_buffered_frames >=
+                    opus_resample_required_input_frames(
+                        participant, frame_count, opus_playout_rate_ratio(participant))) {
+                const double playout_ratio = opus_playout_rate_ratio(participant);
+                mix_resampled_opus_pcm(participant, output_buffer, frame_count, out_channels,
+                                       participant.gain, playout_ratio);
                 observe_opus_pcm_depth(participant);
                 observe_auto_jitter_stable(participant);
                 participant.opus_consecutive_empty_callbacks = 0;
@@ -1886,7 +1974,10 @@ private:
                             1, std::memory_order_relaxed);
                     }
 
-                    while (participant.opus_pcm_buffered_frames < frame_count) {
+                    double playout_ratio = opus_playout_rate_ratio(participant);
+                    size_t required_input_frames = opus_resample_required_input_frames(
+                        participant, frame_count, playout_ratio);
+                    while (participant.opus_pcm_buffered_frames < required_input_frames) {
                         OpusPacket next_packet;
                         if (!participant.opus_queue.try_dequeue(next_packet) ||
                             next_packet.codec != AudioCodec::Opus) {
@@ -1925,6 +2016,9 @@ private:
                         participant.opus_pcm_buffered_frames += next_decoded_frames;
                         participant.opus_packets_decoded_in_callback.fetch_add(
                             1, std::memory_order_relaxed);
+                        playout_ratio = opus_playout_rate_ratio(participant);
+                        required_input_frames = opus_resample_required_input_frames(
+                            participant, frame_count, playout_ratio);
                     }
 
                     float rms = audio_analysis::calculate_rms(participant.pcm_buffer.data(),
@@ -1934,17 +2028,12 @@ private:
                     bool was_speaking       = participant.is_speaking;
                     participant.is_speaking = audio_analysis::detect_voice_activity(rms);
 
-                    if (participant.opus_pcm_buffered_frames >= frame_count) {
-                        if (out_channels == 1) {
-                            audio_analysis::mix_with_gain(output_buffer,
-                                                          participant.opus_pcm_buffer.data(),
-                                                          frame_count, participant.gain);
-                        } else {
-                            audio_analysis::mix_mono_to_stereo(
-                                output_buffer, participant.opus_pcm_buffer.data(), frame_count,
-                                out_channels, participant.gain);
-                        }
-                        consume_opus_pcm_buffer(participant, frame_count);
+                    playout_ratio = opus_playout_rate_ratio(participant);
+                    required_input_frames = opus_resample_required_input_frames(
+                        participant, frame_count, playout_ratio);
+                    if (participant.opus_pcm_buffered_frames >= required_input_frames) {
+                        mix_resampled_opus_pcm(participant, output_buffer, frame_count,
+                                               out_channels, participant.gain, playout_ratio);
                         observe_opus_pcm_depth(participant);
                         observe_auto_jitter_stable(participant);
                         participant.opus_consecutive_empty_callbacks = 0;
