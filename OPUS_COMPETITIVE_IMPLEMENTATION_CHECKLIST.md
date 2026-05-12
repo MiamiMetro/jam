@@ -9,46 +9,49 @@ gate exists; this checklist tracks what must be built, tested, and accepted.
 
 ## 9+ Finish Implementation Checklist
 
-This is the short execution checklist for finishing the current competitive
-Opus push. Status values are `done`, `in_progress`, `pending`, or `blocked`.
+This is the short execution checklist for the current competitive Opus push.
+Status values are `done`, `in_progress`, `pending`, or `blocked`.
 
 - Status `done`: competitor-informed receiver work is implemented in the Opus
   path: per-participant jitter, auto jitter, playout-rate adaptation, partial
   PCM-tail playout, hard-rebuffer-only underrun accounting, and Opus playout
   headroom.
-- Status `in_progress`: drift diagnostics now ignore startup warmup and reject
+- Status `done`: drift diagnostics now ignore startup warmup and reject
   implausible arrival-timing outliers. They also use a longer arrival-time
   observation window so ordinary OS/network scheduling jitter does not look
   like hardware clock drift, and strict evidence review now warns on sustained
-  average drift rather than one-sample arrival maxima. Verify with fresh
-  cross-machine logs after this change is committed, pushed, pulled, and
-  rebuilt on macOS.
-- Status `pending`: run current-source local verification on Windows with
-  `node tools/opus-local-verify.mjs --out build/opus-local-verify/current`.
-- Status `pending`: push the current receiver/diagnostic code and pull it on
-  macOS, then build `client` and `opus_receiver_harness_self_test` from
-  `/Users/berkay/Documents/jam`.
-- Status `pending`: regenerate external validation commands for the new source
+  average drift rather than one-sample arrival maxima. The 30-minute logs show
+  sustained drift below the 250 ppm review threshold.
+- Status `done`: current-source local verification passed on Windows with
+  `node tools/opus-local-verify.mjs --out build/opus-local-verify/current`;
+  final acceptance reran it before promotion.
+- Status `done`: receiver, diagnostic, default, and evidence-checker changes
+  were pushed; macOS pulled the branch in `/Users/berkay/Documents/jam` and
+  built `client` plus `opus_receiver_harness_self_test`.
+- Status `done`: external validation commands were regenerated for the source
   fingerprint with `tools/opus-external-commands.mjs` using the real Windows
   LAN host address.
-- Status `pending`: rerun Windows and macOS smoke collectors from the same
+- Status `done`: Windows and macOS smoke collectors were rerun from the same
   source fingerprint and copy the macOS smoke report back to Windows.
-- Status `pending`: capture a 5-minute Windows-to-macOS Opus session launched
+- Status `done`: captured a 5-minute Windows-to-macOS Opus session launched
   from macOS Terminal, then summarize the Windows client, macOS client, and
-  server logs with `tools/opus-log-summary.mjs`.
-- Status `pending`: capture a 5-minute macOS-to-Windows Opus session using the
-  same process and summarize the three logs.
-- Status `pending`: capture the long Opus session, preferably 30 minutes, with
-  both machines on the same current source and no manifest warning allowance.
-- Status `pending`: initialize `validation/opus-external-validation.json` from
-  the collected smoke reports and session logs, then replace placeholder
+  server logs with `tools/opus-log-summary.mjs`; all three logs passed with no
+  warnings, underruns, drops, sequence issues, or health warnings.
+- Status `done`: captured a 5-minute macOS-to-Windows Opus session using the
+  same process; all three logs passed with no warnings, underruns, drops,
+  sequence issues, or health warnings.
+- Status `done`: captured a 30-minute long Opus session with both machines
+  connected on the same current source and no manifest warning allowance; both
+  client logs passed with zero underruns, drops, sequence issues, or health
+  warnings.
+- Status `done`: initialized `validation/opus-external-validation.json` from
+  the collected smoke reports and session logs, then replaced placeholder
   network/listening notes with concrete Windows/macOS observations.
-- Status `pending`: pass strict external evidence checking with
+- Status `done`: strict external evidence checking passed with
   `node tools/opus-external-evidence-check.mjs validation/opus-external-validation.json --strict`.
-- Status `pending`: pass final acceptance with
+- Status `done`: final acceptance passed with
   `node tools/opus-acceptance.mjs --external-manifest validation/opus-external-validation.json`.
-- Status `pending`: only after strict acceptance, do the completion audit and
-  map each 9+ requirement to evidence before calling the goal complete.
+- Status `done`: final completion audit passed inside the acceptance command.
 
 ## Completion Rule
 
