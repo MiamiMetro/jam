@@ -14,16 +14,16 @@ constexpr uint32_t AUDIO_V2_MAGIC = 0x41553249;  // 'AU2I'
 constexpr size_t AUDIO_BUF_SIZE = 512;
 
 // Jitter buffer configuration (CLIENT/LISTENER ONLY - server just relays packets)
-constexpr size_t MAX_OPUS_QUEUE_SIZE       = 64;  // Hard safety cap for Opus receive queue
+constexpr size_t MAX_OPUS_QUEUE_SIZE       = 128; // Hard safety cap for Opus receive queue
 constexpr size_t TARGET_OPUS_QUEUE_SIZE    = 3;   // Target queue size for adaptive management
 constexpr size_t MIN_JITTER_BUFFER_PACKETS = 3;   // Minimum packets before playback starts
 constexpr size_t MIN_OPUS_JITTER_PACKETS = 0;     // Manual testing can disable Opus prebuffer
 constexpr size_t DEFAULT_OPUS_JITTER_PACKETS = 8; // Default Opus playout target
-constexpr size_t DEFAULT_OPUS_QUEUE_LIMIT_PACKETS = 64; // Default Opus burst capacity
+constexpr size_t DEFAULT_OPUS_QUEUE_LIMIT_PACKETS = 96; // Default Opus burst capacity
 constexpr size_t MAX_OPUS_JITTER_PACKETS = 32;    // User-facing Opus jitter limit
 constexpr size_t MIN_OPUS_QUEUE_LIMIT_PACKETS = 1;
-constexpr size_t MAX_OPUS_QUEUE_LIMIT_PACKETS = 64; // User-facing Opus queue limit
-constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 120; // Default age limit at playout
+constexpr size_t MAX_OPUS_QUEUE_LIMIT_PACKETS = 128; // User-facing Opus queue limit
+constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 200; // Default age limit at playout
 constexpr int    MIN_JITTER_PACKET_AGE_MS = 0;        // Manual testing can disable age drops
 constexpr int    MAX_JITTER_PACKET_AGE_MS = 250;      // User-facing age limit
 

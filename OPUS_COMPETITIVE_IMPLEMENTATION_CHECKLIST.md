@@ -75,7 +75,7 @@ A gate is complete only when:
   - Receiver rate damping: in progress. The live 2026-05-12 short runs showed
     the first controller hitting `1.1800`, draining to rebuffer, then filling
     back to the receive cap. The controller now uses asymmetric damping
-    (`0.95` to `1.04`) and the default burst cap is 64 packets. Evidence
+    (`0.95` to `1.04`) and the default burst cap is 96 packets. Evidence
     required: refreshed live logs must show lower queue-limit drops without
     increasing underrun/PLC churn.
   - Resampler boundary handling: in progress. The adaptive PCM resampler no
@@ -97,7 +97,7 @@ A gate is complete only when:
   - Playout target headroom: in progress. The Opus receiver can become ready at
     the configured jitter floor, but the adaptive rate target now stabilizes
     near the midpoint of the receive burst headroom, capped by the user-facing
-    jitter maximum. The default packet-age guard is 120 ms to match the larger
+    jitter maximum. The default packet-age guard is 200 ms to match the larger
     burst headroom. Evidence required: refreshed logs must show no queue-limit
     drops, no age drops, and no hard underruns at default command settings.
   - Playout diagnostics: in progress. Participant logs now include the current
@@ -820,10 +820,11 @@ Evidence:
   - Receive jitter target defaults to `8` packets because the local and
     competitor evidence favors a conservative Opus internet default, not
     because local finite probes prove `8` is universally clean.
-  - Queue limit defaults to `16` packets, giving burst capacity without using
-    the queue limit as the main latency control.
-  - Packet age limit defaults to `40 ms`, keeping old packets bounded while
-    still allowing the default `8`-packet target room to breathe.
+  - Queue limit defaults to `96` packets, giving emergency burst capacity
+    without using the queue limit as the main latency control.
+  - Packet age limit defaults to `200 ms`, keeping old packets bounded while
+    allowing transient macOS/Windows callback stalls to drain through the
+    adaptive playout controller instead of forcing whole-packet drops.
   - Auto jitter is enabled by default because competitor evidence favors
     automatic receive buffering and the harness shows auto reduces deterministic
     Wi-Fi/tunnel underruns without hiding the latency cost.
