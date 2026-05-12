@@ -1021,7 +1021,8 @@ private:
         const double target_packets =
             static_cast<double>(opus_playout_target_queue_packets(participant));
         const double queue_error = queued_packets - target_packets;
-        double ratio = std::clamp(1.0 + (queue_error * 0.01), 0.95, 1.08);
+        const double gain = queue_error < 0.0 ? 0.01 : 0.005;
+        double ratio = std::clamp(1.0 + (queue_error * gain), 0.95, 1.04);
 
         const uint64_t queue_limit_drops =
             participant.opus_queue_limit_drops.load(std::memory_order_relaxed);
