@@ -47,7 +47,7 @@ function usage() {
       "Validates the external Opus evidence packet before promoting the branch.",
       "Start from OPUS_EXTERNAL_VALIDATION_MANIFEST.example.json after running",
       "Windows/macOS smoke and real cross-machine Opus sessions.",
-      "Use --strict when warnings should fail the command.",
+      "Use --strict when unreviewed or non-session warnings should fail the command.",
       "",
       "Init path options:",
       "  --windows-smoke <report.md>",
@@ -759,7 +759,10 @@ function validateManifest(manifestPath) {
 }
 
 function strictFailure(result) {
-  return result.errors.length > 0 || result.warnings.length > 0;
+  return (
+    result.errors.length > 0 ||
+    result.warnings.some((warning) => !warning.includes(": allowed warning indicators:"))
+  );
 }
 
 function splitLogList(value, fallback) {
