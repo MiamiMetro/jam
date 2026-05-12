@@ -21,6 +21,16 @@ bool valid_wav(const std::filesystem::path& path) {
            std::filesystem::file_size(path) > 44;
 }
 
+bool file_contains(const std::filesystem::path& path, const std::string& needle) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    const std::string contents((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+    return contents.find(needle) != std::string::npos;
+}
+
 int main() {
     const auto root = std::filesystem::temp_directory_path() / "jam_recording_writer_self_test";
     std::error_code ec;
@@ -31,6 +41,7 @@ int main() {
         std::cerr << "failed to start writer\n";
         return 2;
     }
+    writer.set_participant_metadata(42, "remote-profile", "Remote Player");
 
     float samples[120]{};
     for (size_t i = 0; i < 120; ++i) {
@@ -43,8 +54,12 @@ int main() {
     writer.stop();
 
     const std::filesystem::path folder = writer.folder();
+    const auto manifest = folder / "recording_manifest.tsv";
     const bool ok = valid_wav(folder / "master_mix.wav") && valid_wav(folder / "self.wav") &&
-                    valid_wav(folder / "user_42.wav");
+                    valid_wav(folder / "user_42.wav") && file_contains(manifest, "user_42.wav") &&
+                    file_contains(manifest, "remote-profile") &&
+                    file_contains(manifest, "Remote Player") &&
+                    writer.dropped_blocks() == 0;
     std::filesystem::remove_all(root, ec);
 
     if (!ok) {

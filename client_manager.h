@@ -20,20 +20,57 @@ public:
 
     ClientManager() : next_client_id_(1) {}
 
-    uint32_t register_performer_client(const endpoint& ep, time_point now, std::string room_id,
-                                    std::string profile_id, std::string display_name) {
+    struct RegistrationResult {
+        uint32_t              client_id = 0;
+        std::vector<uint32_t> removed_client_ids;
+    };
+
+    RegistrationResult register_performer_client(const endpoint& ep, time_point now,
+                                                 std::string room_id, std::string profile_id,
+                                                 std::string display_name) {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto&                       client = clients_[ep];
-        if (client.client_id == 0) {
+
+        RegistrationResult result;
+        auto existing = clients_.find(ep);
+        const bool can_reuse_existing =
+            existing != clients_.end() && existing->second.room_id == room_id &&
+            existing->second.profile_id == profile_id;
+
+        if (can_reuse_existing) {
+            auto& client = existing->second;
+            client.last_alive           = now;
+            client.display_name         = std::move(display_name);
+            client.joined_with_metadata = true;
+            result.client_id            = client.client_id;
+        } else {
+            if (existing != clients_.end()) {
+                result.removed_client_ids.push_back(existing->second.client_id);
+                clients_.erase(existing);
+            }
+
+            ClientInfo client;
             client.client_id = next_client_id_++;
             client.joined_at = now;
+            client.last_alive = now;
+            client.room_id = room_id;
+            client.profile_id = profile_id;
+            client.display_name = std::move(display_name);
+            client.joined_with_metadata = true;
+            result.client_id = client.client_id;
+            clients_[ep] = std::move(client);
         }
-        client.last_alive   = now;
-        client.room_id      = std::move(room_id);
-        client.profile_id   = std::move(profile_id);
-        client.display_name = std::move(display_name);
-        client.joined_with_metadata = true;
-        return client.client_id;
+
+        for (auto it = clients_.begin(); it != clients_.end();) {
+            if (it->first != ep && it->second.room_id == room_id &&
+                it->second.profile_id == profile_id) {
+                result.removed_client_ids.push_back(it->second.client_id);
+                it = clients_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        return result;
     }
 
     // Update client last_alive timestamp

@@ -76,6 +76,8 @@ struct MetronomeSyncHdr : CtrlHdr {
     uint32_t beat_number    = 0;
     uint8_t  flags          = 0;
     int64_t  sender_time_ns = 0;
+    int64_t  effective_server_time_ns = 0;
+    uint32_t sequence = 0;
 };
 
 struct AudioHdr : MsgHdr {

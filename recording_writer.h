@@ -8,6 +8,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -32,6 +33,11 @@ public:
         std::array<float, MAX_FRAMES_PER_BLOCK> samples{};
     };
 
+    struct ParticipantMetadata {
+        std::string profile_id;
+        std::string display_name;
+    };
+
     ~RecordingWriter() {
         stop();
     }
@@ -49,6 +55,7 @@ public:
         }
 
         queued_blocks_.store(0, std::memory_order_release);
+        dropped_blocks_.store(0, std::memory_order_release);
         stop_requested_.store(false, std::memory_order_release);
         active_.store(true, std::memory_order_release);
         writer_thread_ = std::thread([this]() { writer_loop(); });
@@ -80,16 +87,33 @@ public:
         return queued_blocks_.load(std::memory_order_acquire);
     }
 
+    uint64_t dropped_blocks() const {
+        return dropped_blocks_.load(std::memory_order_acquire);
+    }
+
+    void set_participant_metadata(uint32_t participant_id, std::string profile_id,
+                                  std::string display_name) {
+        if (participant_id == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(metadata_mutex_);
+        participant_metadata_[participant_id] = {std::move(profile_id), std::move(display_name)};
+    }
+
     void enqueue(TrackKind kind, uint32_t participant_id, uint32_t sample_rate,
                  const float* samples, size_t frame_count) {
         if (!is_active() || samples == nullptr || frame_count == 0 ||
             frame_count > MAX_FRAMES_PER_BLOCK) {
+            if (is_active()) {
+                dropped_blocks_.fetch_add(1, std::memory_order_relaxed);
+            }
             return;
         }
 
         constexpr size_t MAX_QUEUED_BLOCKS = 4096;
         size_t queued = queued_blocks_.load(std::memory_order_acquire);
         if (queued >= MAX_QUEUED_BLOCKS) {
+            dropped_blocks_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -106,6 +130,9 @@ public:
 private:
     struct TrackFile {
         std::ofstream file;
+        std::string key;
+        TrackKind kind = TrackKind::Master;
+        uint32_t participant_id = 0;
         uint32_t sample_rate = 48000;
         uint32_t data_bytes = 0;
     };
@@ -140,6 +167,9 @@ private:
         const std::string key = track_key(block);
         auto [it, inserted] = tracks.try_emplace(key);
         if (inserted) {
+            it->second.key = key;
+            it->second.kind = block.kind;
+            it->second.participant_id = block.participant_id;
             it->second.sample_rate = block.sample_rate == 0 ? sample_rate_ : block.sample_rate;
             const auto path = folder_ / (key + ".wav");
             it->second.file.open(path, std::ios::binary);
@@ -190,6 +220,47 @@ private:
         track.file.close();
     }
 
+    static const char* track_kind_name(TrackKind kind) {
+        switch (kind) {
+            case TrackKind::Master:
+                return "master";
+            case TrackKind::Self:
+                return "self";
+            case TrackKind::Participant:
+                return "participant";
+        }
+        return "unknown";
+    }
+
+    ParticipantMetadata metadata_for(uint32_t participant_id) const {
+        std::lock_guard<std::mutex> lock(metadata_mutex_);
+        auto it = participant_metadata_.find(participant_id);
+        if (it == participant_metadata_.end()) {
+            return {};
+        }
+        return it->second;
+    }
+
+    void write_manifest(const std::unordered_map<std::string, TrackFile>& tracks) {
+        std::ofstream manifest(folder_ / "recording_manifest.tsv", std::ios::binary);
+        if (!manifest.is_open()) {
+            return;
+        }
+
+        manifest << "track_file\tkind\tparticipant_id\tprofile_id\tdisplay_name\tsample_rate"
+                    "\tdata_bytes\n";
+        for (const auto& [_, track]: tracks) {
+            ParticipantMetadata metadata;
+            if (track.kind == TrackKind::Participant) {
+                metadata = metadata_for(track.participant_id);
+            }
+            manifest << track.key << ".wav\t" << track_kind_name(track.kind) << "\t"
+                     << track.participant_id << "\t" << metadata.profile_id << "\t"
+                     << metadata.display_name << "\t" << track.sample_rate << "\t"
+                     << track.data_bytes << "\n";
+        }
+    }
+
     void writer_loop() {
         std::unordered_map<std::string, TrackFile> tracks;
         while (!stop_requested_.load(std::memory_order_acquire) ||
@@ -217,6 +288,7 @@ private:
         for (auto& [_, track]: tracks) {
             finalize_track(track);
         }
+        write_manifest(tracks);
     }
 
     moodycamel::ConcurrentQueue<Block> queue_;
@@ -224,6 +296,9 @@ private:
     std::atomic<bool> active_{false};
     std::atomic<bool> stop_requested_{true};
     std::atomic<size_t> queued_blocks_{0};
+    std::atomic<uint64_t> dropped_blocks_{0};
     uint32_t sample_rate_ = 48000;
     std::filesystem::path folder_;
+    mutable std::mutex metadata_mutex_;
+    std::unordered_map<uint32_t, ParticipantMetadata> participant_metadata_;
 };
