@@ -32,11 +32,36 @@ using asio::ip::udp;
 using namespace std::chrono_literals;
 using namespace server_config;
 
+static const char* runtime_platform_name() {
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#elif defined(__linux__)
+    return "linux";
+#else
+    return "unknown";
+#endif
+}
+
+static const char* runtime_arch_name() {
+#if defined(_M_X64) || defined(__x86_64__)
+    return "x64";
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    return "arm64";
+#elif defined(_M_IX86) || defined(__i386__)
+    return "x86";
+#else
+    return "unknown";
+#endif
+}
+
 struct ServerOptions {
     short       port = 9999;
     bool        allow_insecure_dev_joins = false;
     std::string server_id = "local-dev";
     std::string join_secret;
+    std::string log_file_path;
 };
 
 template <size_t N>
@@ -402,6 +427,8 @@ ServerOptions parse_server_options(int argc, char** argv) {
             options.server_id = argv[++i];
         } else if (arg == "--join-secret" && i + 1 < argc) {
             options.join_secret = argv[++i];
+        } else if (arg == "--log-file" && i + 1 < argc) {
+            options.log_file_path = argv[++i];
         } else if (arg == "--allow-insecure-dev-joins") {
             options.allow_insecure_dev_joins = true;
         }
@@ -415,9 +442,15 @@ int main(int argc, char** argv) {
         auto             options = parse_server_options(argc, argv);
 
         auto& log = Logger::instance();
-        log.init(true, false, false, "", spdlog::level::info);
+        log.init(true, false, !options.log_file_path.empty(), options.log_file_path,
+                 spdlog::level::info);
 
         Log::info("Starting SFU server on 0.0.0.0:{}", options.port);
+        Log::info("Runtime: role=server platform={} arch={}", runtime_platform_name(),
+                  runtime_arch_name());
+        if (!options.log_file_path.empty()) {
+            Log::info("Logging to {}", options.log_file_path);
+        }
         Log::info("Forwarding audio packets between clients");
         if (options.allow_insecure_dev_joins) {
             Log::warn("Insecure performer dev joins enabled");

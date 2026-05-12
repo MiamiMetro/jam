@@ -115,6 +115,13 @@ public:
             info.jitter_buffer_min_packets = data->jitter_buffer_min_packets;
             info.jitter_buffer_floor_packets = data->jitter_buffer_floor_packets;
             info.opus_queue_limit_packets = data->opus_queue_limit_packets;
+            info.opus_jitter_manual_override = data->opus_jitter_manual_override;
+            info.opus_jitter_auto_enabled = data->opus_jitter_auto_enabled;
+            info.opus_jitter_auto_floor_packets = data->opus_jitter_auto_floor_packets;
+            info.opus_jitter_auto_increases =
+                data->opus_jitter_auto_increases.load(std::memory_order_relaxed);
+            info.opus_jitter_auto_decreases =
+                data->opus_jitter_auto_decreases.load(std::memory_order_relaxed);
             info.opus_pcm_buffered_frames =
                 data->opus_pcm_buffered_frames_observed.load(std::memory_order_relaxed);
             info.opus_packets_decoded_in_callback =
@@ -147,6 +154,12 @@ public:
             info.pcm_concealment_frames =
                 data->pcm_concealment_frames.load(std::memory_order_relaxed);
             info.pcm_drift_drops = data->pcm_drift_drops.load(std::memory_order_relaxed);
+            info.receiver_drift_ppm_last =
+                data->receiver_drift_ppm_last_milli.load(std::memory_order_relaxed) / 1000.0;
+            info.receiver_drift_ppm_avg =
+                data->receiver_drift_ppm_avg_milli.load(std::memory_order_relaxed) / 1000.0;
+            info.receiver_drift_ppm_abs_max =
+                data->receiver_drift_ppm_abs_max_milli.load(std::memory_order_relaxed) / 1000.0;
             result.push_back(info);
         }
 

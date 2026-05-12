@@ -1,0 +1,72 @@
+{
+  "windowsSmokeReport": "build/opus-validation/<windows-timestamp>/report.md",
+  "windowsSmokeAllowAudioOpenFailure": false,
+  "windowsSmokeFailureExplanation": "",
+  "macSmokeReport": "build/opus-validation/<macos-timestamp>/report.md",
+  "macSmokeAllowAudioOpenFailure": false,
+  "macSmokeFailureExplanation": "",
+  "sessions": [
+    {
+      "name": "windows-to-macos-5min",
+      "direction": "windows-to-macos",
+      "room": "opus-validation-room-win-to-mac",
+      "codec": "opus",
+      "frames": 120,
+      "jitter": 8,
+      "speakerPlatform": "windows",
+      "listenerPlatform": "macos",
+      "minMinutes": 5,
+      "network": "lan-or-tunnel",
+      "subjective": "Windows source heard on macOS: clear / flicker / robotic / dropout notes",
+      "allowWarnings": false,
+      "warningExplanation": "",
+      "logs": [
+        "validation/win-to-mac-windows-client.log",
+        "validation/win-to-mac-macos-client.log",
+        "validation/win-to-mac-server.log"
+      ]
+    },
+    {
+      "name": "macos-to-windows-5min",
+      "direction": "macos-to-windows",
+      "room": "opus-validation-room-mac-to-win",
+      "codec": "opus",
+      "frames": 120,
+      "jitter": 8,
+      "speakerPlatform": "macos",
+      "listenerPlatform": "windows",
+      "minMinutes": 5,
+      "network": "lan-or-tunnel",
+      "subjective": "macOS source heard on Windows: clear / flicker / robotic / dropout notes",
+      "allowWarnings": false,
+      "warningExplanation": "",
+      "logs": [
+        "validation/mac-to-win-windows-client.log",
+        "validation/mac-to-win-macos-client.log",
+        "validation/mac-to-win-server.log"
+      ]
+    },
+    {
+      "name": "long-session-30min",
+      "direction": "bidirectional",
+      "room": "opus-validation-long-room",
+      "codec": "opus",
+      "frames": 120,
+      "jitter": 8,
+      "participants": [
+        "windows",
+        "macos"
+      ],
+      "minMinutes": 30,
+      "network": "lan-or-tunnel",
+      "subjective": "long-session notes",
+      "allowWarnings": false,
+      "warningExplanation": "",
+      "logs": [
+        "validation/windows-client-long.log",
+        "validation/macos-client-long.log",
+        "validation/server-long.log"
+      ]
+    }
+  ]
+}
