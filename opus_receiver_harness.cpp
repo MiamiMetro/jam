@@ -303,7 +303,9 @@ double adaptive_playout_ratio(const Config& config, const std::deque<Packet>& qu
     const double decoded_packets =
         static_cast<double>(pcm_buffered_frames) / static_cast<double>(config.frames);
     const double queued_packets = static_cast<double>(queue.size()) + decoded_packets;
-    const double target_packets = static_cast<double>(std::max(1, jitter_target));
+    const int queue_midpoint = std::max(1, config.queue_limit / 2);
+    const int target = std::max(std::max(1, jitter_target), std::min(32, queue_midpoint));
+    const double target_packets = static_cast<double>(target);
     const double queue_error = queued_packets - target_packets;
     const double gain = queue_error < 0.0 ? 0.01 : 0.005;
     double ratio = std::clamp(1.0 + (queue_error * gain), 0.95, 1.04);

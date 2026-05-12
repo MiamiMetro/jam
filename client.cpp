@@ -1228,13 +1228,16 @@ private:
     }
 
     static size_t opus_playout_target_queue_packets(const ParticipantData& participant) {
-        // Target 0 means "no extra prebuffer"; keep one packet available to play now.
-        return std::max<size_t>(1, participant.jitter_buffer_min_packets);
+        const size_t jitter_floor = std::max<size_t>(1, participant.jitter_buffer_min_packets);
+        const size_t queue_midpoint =
+            std::max<size_t>(1, participant.opus_queue_limit_packets / 2);
+        return std::max(jitter_floor,
+                        std::min<size_t>(MAX_OPUS_JITTER_PACKETS, queue_midpoint));
     }
 
     static size_t ready_threshold_packets(const ParticipantData& participant) {
         if (participant.last_codec == AudioCodec::Opus) {
-            return opus_playout_target_queue_packets(participant);
+            return std::max<size_t>(1, participant.jitter_buffer_min_packets);
         }
         return participant.jitter_buffer_min_packets;
     }

@@ -53,6 +53,12 @@ A gate is complete only when:
     `buffer_ready=false` are reserved for sustained empty runs that cross the
     rebuffer threshold. Evidence required: strict session logs must keep
     `underruns=0` unless a true rebuffer occurs.
+  - Playout target headroom: in progress. The Opus receiver can become ready at
+    the configured jitter floor, but the adaptive rate target now stabilizes
+    near the midpoint of the receive burst headroom, capped by the user-facing
+    jitter maximum. The default packet-age guard is 120 ms to match the larger
+    burst headroom. Evidence required: refreshed logs must show no queue-limit
+    drops, no age drops, and no hard underruns at default command settings.
   - Playout diagnostics: in progress. Participant logs now include the current
     Opus playout ratio and remaining correction callbacks beside decoded packet
     and drop rates. Evidence required: refreshed cross-machine logs must explain
