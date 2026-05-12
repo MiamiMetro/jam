@@ -1175,7 +1175,10 @@ private:
         }
 
         const uint32_t elapsed_packets = packet.sequence - participant.drift_reference_sequence;
-        if (elapsed_packets < 2000) {
+        // Arrival timestamps include OS/network scheduling jitter; use a longer
+        // window so the diagnostic reflects clock drift instead of one callback hiccup.
+        constexpr uint32_t DRIFT_MIN_OBSERVATION_PACKETS = 12'000;
+        if (elapsed_packets < DRIFT_MIN_OBSERVATION_PACKETS) {
             return;
         }
 
