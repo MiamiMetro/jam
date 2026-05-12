@@ -1527,6 +1527,8 @@ steps.push(
     [
       path.join("tools", "opus-completion-audit.mjs"),
       "--status",
+      "--external-manifest",
+      path.join(outDir, "missing-status-manifest.json"),
       "--local-report",
       path.join(outDir, "report.md"),
     ],
