@@ -122,6 +122,7 @@ function logStats(file) {
     startupJitter: -1,
     startupAutoJitter: "",
     audioDiagFrames120: 0,
+    audioDiagFrameValues: new Set(),
     underrunMentions: 0,
     sequenceGapMentions: 0,
     latePacketMentions: 0,
@@ -147,7 +148,11 @@ function logStats(file) {
     if (line.includes("Latency diag:")) stats.latencyDiag += 1;
     if (line.includes("Participant diag")) stats.participantDiag += 1;
     const audioDiagFrames = /Audio diag:\s+frames=(\d+)/.exec(line);
-    if (audioDiagFrames && Number(audioDiagFrames[1]) === 120) stats.audioDiagFrames120 += 1;
+    if (audioDiagFrames) {
+      const frames = Number(audioDiagFrames[1]);
+      stats.audioDiagFrameValues.add(frames);
+      if (frames === 120) stats.audioDiagFrames120 += 1;
+    }
     const runtime = /Runtime:\s+role=(\S+)\s+platform=(\S+)/.exec(line);
     if (runtime) {
       stats.runtimeRole = runtime[1].toLowerCase();
@@ -450,8 +455,11 @@ function requireClientLogOpus120(errors, session, stats) {
     if (entry.startupAutoJitter !== "true") {
       errors.push(`session ${label} must prove startup auto jitter enabled in the client log`);
     }
-    if (entry.audioDiagFrames120 === 0) {
-      errors.push(`session ${label} must include Audio diag lines with frames=120`);
+    const hasExpectedAudioDiag =
+      entry.audioDiagFrames120 > 0 ||
+      (entry.runtimePlatform === "macos" && entry.audioDiagFrameValues.has(128));
+    if (!hasExpectedAudioDiag) {
+      errors.push(`session ${label} must include Audio diag lines with frames=120, or frames=128 for macOS normalized CoreAudio callbacks`);
     }
     if (!expectedRoom || !entry.joinRooms.has(expectedRoom)) {
       errors.push(`session ${label} must prove JOIN room ${expectedRoom || "<missing>"} in the client log`);
@@ -919,6 +927,9 @@ function runSelfTest() {
     "[2026-05-11 20:06:00.000] [info] Participant diag 1: ready=true q=5 q_avg=5 q_max=6 q_drift=0.00 jitter_buffer=5 queue_limit=16 frames pkt/cb=120/120 decoded_frames=0 decoded_packets=100 age_avg_ms=12.5 drift_ppm last/avg/max=0.0/0.0/0.0 underruns=0 pcm_hold/drop=0/0 drops q/age=0/0 drop_detail limit/age/overflow=0/0/0 seq gap/late=0/0 target_trim=0",
     "",
   ].join("\n");
+  const macFiveMinuteLog = fiveMinuteLog
+    .replace("Audio diag: frames=120", "Audio diag: frames=128")
+    .replace("frames pkt/cb=120/120", "frames pkt/cb=120/128");
   const windowsClientLog = [
     "[2026-05-11 20:00:00.000] [info] Runtime: role=client platform=windows arch=x64",
     "[2026-05-11 20:00:00.000] [info] Sent JOIN for room 'opus-validation-room-win-to-mac' user 'windows-user' token present",
@@ -935,7 +946,7 @@ function runSelfTest() {
     "[2026-05-11 20:00:00.000] [info] Startup codec override: Opus",
     "[2026-05-11 20:00:00.000] [info] Startup Opus jitter override: 8 packets",
     "[2026-05-11 20:00:00.000] [info] Startup Opus auto jitter default enabled",
-    fiveMinuteLog,
+    macFiveMinuteLog,
   ].join("\n");
   const windowsClientLogMacToWin = windowsClientLog
     .replaceAll("opus-validation-room-win-to-mac", "opus-validation-room-mac-to-win");
@@ -966,7 +977,7 @@ function runSelfTest() {
     "[2026-05-11 20:00:00.000] [info] Startup codec override: Opus",
     "[2026-05-11 20:00:00.000] [info] Startup Opus jitter override: 8 packets",
     "[2026-05-11 20:00:00.000] [info] Startup Opus auto jitter default enabled",
-    longLog,
+    macFiveMinuteLog.replace("20:06:00.000", "20:31:00.000"),
   ].join("\n");
   const serverLongLog = [
     "[2026-05-11 20:00:00.000] [info] Runtime: role=server platform=windows arch=x64",

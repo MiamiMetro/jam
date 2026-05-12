@@ -69,9 +69,9 @@ A gate is complete only when:
   runs the external evidence checker self-test into
   `build/opus-local-evidence/<timestamp>/report.md`.
 - The external evidence checker rejects manifests whose client logs do not
-  prove Opus `120` startup and `Audio diag: frames=120`; it also rejects smoke
-  reports without neighboring startup client logs proving the expected platform
-  and Opus `120`.
+  prove Opus `120` startup and audio diagnostics at `frames=120`, or
+  macOS-normalized `frames=128`; it also rejects smoke reports without
+  neighboring startup client logs proving the expected platform and Opus `120`.
 - `tools/opus-local-verify.mjs` runs the complete local verification set and
   writes `build/opus-local-verify/<timestamp>/report.md`.
 - `tools/opus-external-commands.mjs` generates copy/paste Windows/macOS

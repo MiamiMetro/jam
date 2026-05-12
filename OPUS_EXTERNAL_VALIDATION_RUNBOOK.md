@@ -229,7 +229,10 @@ The manifest checker requires both Windows and macOS client runtime lines in
 each external session and a server runtime log for the same session. It also
 requires the client logs to prove Opus `120` startup settings, auto jitter, the
 expected validation room, and `Audio diag: frames=120` during the captured
-session. The server log must prove the same room with `JOIN: ... room='...'`.
+session. On macOS, the checker also accepts `Audio diag: frames=128` because
+CoreAudio/RtAudio can normalize the requested `120`-frame callback to the
+nearest valid callback size while startup logs still prove the `--frames 120`
+request. The server log must prove the same room with `JOIN: ... room='...'`.
 The server log must also show at least one non-loopback client endpoint; if all
 server JOIN endpoints are IPv4/IPv6 loopback, IPv4-mapped IPv6 loopback, or
 unspecified addresses, including full-form IPv6 variants, the evidence is
@@ -315,7 +318,7 @@ Interpretation:
 - Each client log must prove the actual launch used `Startup codec override:
   Opus`, `Startup requested buffer override: 120 frames`, startup jitter `8`,
   auto jitter enabled, the expected `Sent JOIN for room ...` line, and audio
-  diagnostics with `frames=120`.
+  diagnostics with `frames=120`, or macOS-normalized `frames=128`.
 - Each server log must prove `Runtime: role=server` and a matching
   `JOIN: ... room='...'` line for the manifest session room.
 - Do not reuse the exact same log path across different manifest sessions.
