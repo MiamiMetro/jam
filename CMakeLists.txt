@@ -18,6 +18,9 @@ target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog 
 add_executable(room_routing_probe room_routing_probe.cpp)
 target_link_libraries(room_routing_probe PRIVATE asio spdlog::spdlog opus token_crypto)
 
+add_executable(server_hardening_probe server_hardening_probe.cpp)
+target_link_libraries(server_hardening_probe PRIVATE asio spdlog::spdlog opus token_crypto)
+
 add_executable(opus_receiver_harness opus_receiver_harness.cpp)
 add_custom_target(opus_receiver_harness_self_test
     COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test

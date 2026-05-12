@@ -18,6 +18,13 @@ public:
     using endpoint   = asio::ip::udp::endpoint;
     using time_point = std::chrono::steady_clock::time_point;
 
+    struct RemovedClientInfo {
+        uint32_t    client_id = 0;
+        std::string room_id;
+        std::string profile_id;
+        std::string display_name;
+    };
+
     ClientManager() : next_client_id_(1) {}
 
     uint32_t register_performer_client(const endpoint& ep, time_point now, std::string room_id,
@@ -80,6 +87,43 @@ public:
     size_t count() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return clients_.size();
+    }
+
+    size_t room_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_map<std::string, bool> rooms;
+        rooms.reserve(clients_.size());
+        for (const auto& [_, info]: clients_) {
+            rooms.emplace(info.room_id, true);
+        }
+        return rooms.size();
+    }
+
+    size_t count_room_clients(const std::string& room_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t count = 0;
+        for (const auto& [_, info]: clients_) {
+            if (info.room_id == room_id) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    bool room_exists(const std::string& room_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [_, info]: clients_) {
+            if (info.room_id == room_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string get_room_id(const endpoint& ep) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        return it != clients_.end() ? it->second.room_id : std::string{};
     }
 
     // Get all client endpoints (copy for safe iteration)
@@ -158,6 +202,37 @@ public:
         }
 
         return timed_out_ids;
+    }
+
+    std::vector<RemovedClientInfo> remove_timed_out_client_infos(
+        time_point now, std::chrono::seconds timeout) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<RemovedClientInfo> timed_out;
+
+        for (auto it = clients_.begin(); it != clients_.end();) {
+            if (now - it->second.last_alive > timeout) {
+                timed_out.push_back(RemovedClientInfo{
+                    it->second.client_id,
+                    it->second.room_id,
+                    it->second.profile_id,
+                    it->second.display_name,
+                });
+                it = clients_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        return timed_out;
+    }
+
+    std::unordered_map<std::string, size_t> get_room_counts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_map<std::string, size_t> counts;
+        for (const auto& [_, info]: clients_) {
+            counts[info.room_id]++;
+        }
+        return counts;
     }
 
     // Access client info with lock (use with caution - callback must be fast)
