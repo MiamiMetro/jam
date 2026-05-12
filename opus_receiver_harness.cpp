@@ -330,7 +330,7 @@ int adaptive_required_input_frames(double phase, int callback_frames, double rat
         return 0;
     }
     const double last_source = phase + (static_cast<double>(callback_frames - 1) * ratio);
-    return static_cast<int>(std::floor(last_source)) + 2;
+    return static_cast<int>(std::floor(last_source)) + 1;
 }
 
 int adaptive_consumed_frames(double& phase, int callback_frames, double ratio) {

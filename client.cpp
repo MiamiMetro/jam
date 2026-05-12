@@ -1053,7 +1053,7 @@ private:
         const double last_source =
             participant.opus_resample_phase +
             (static_cast<double>(output_frames - 1) * ratio);
-        return static_cast<size_t>(std::floor(last_source)) + 2;
+        return static_cast<size_t>(std::floor(last_source)) + 1;
     }
 
     static void mix_resampled_opus_pcm(ParticipantData& participant, float* output_buffer,
@@ -1069,7 +1069,10 @@ private:
             const auto index = static_cast<size_t>(std::floor(source_pos));
             const float frac = static_cast<float>(source_pos - static_cast<double>(index));
             const float a = participant.opus_pcm_buffer[index];
-            const float b = participant.opus_pcm_buffer[index + 1];
+            const float b =
+                index + 1 < participant.opus_pcm_buffered_frames
+                    ? participant.opus_pcm_buffer[index + 1]
+                    : a;
             const float sample = (a + ((b - a) * frac)) * gain;
 
             if (output_channels == 1) {

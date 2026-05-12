@@ -37,6 +37,11 @@ A gate is complete only when:
     (`0.95` to `1.04`) and the default burst cap is 64 packets. Evidence
     required: refreshed live logs must show lower queue-limit drops without
     increasing underrun/PLC churn.
+  - Resampler boundary handling: in progress. The adaptive PCM resampler no
+    longer requires an extra future sample at exact packet boundaries; the last
+    interpolation point clamps to the available sample instead. Evidence
+    required: refreshed live logs must show fewer tiny PLC/underrun callbacks,
+    especially on macOS CoreAudio's 15-frame callback path.
   - Playout diagnostics: in progress. Participant logs now include the current
     Opus playout ratio and remaining correction callbacks beside decoded packet
     and drop rates. Evidence required: refreshed cross-machine logs must explain
