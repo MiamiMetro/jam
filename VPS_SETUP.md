@@ -20,6 +20,8 @@ set SERVER_ID=istanbul-test
 set JOIN_SECRET=replace-with-a-long-random-secret
 ```
 
+Also choose a strong Linux password for the `jam` user. This password is for `sudo` on the VPS, not for SSH login.
+
 ## 1. Create a local SSH key
 
 Run this in Windows `cmd` on your own computer, not on the VPS:
@@ -56,7 +58,7 @@ export VPS_SSH_PORT="2222"
 apt-get update
 apt-get install -y sudo ufw git cmake ninja-build build-essential pkg-config ca-certificates
 
-adduser --disabled-password --gecos "" jam
+adduser --gecos "" jam
 usermod -aG sudo jam
 
 install -d -m 700 -o jam -g jam /home/jam/.ssh
@@ -131,6 +133,15 @@ Open a new terminal on your own computer and verify the new SSH path before clos
 ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST%
 ```
 
+In that new `jam` SSH session, verify sudo works before closing the root session:
+
+```bash
+sudo true
+sudo systemctl status ssh --no-pager
+```
+
+If either command fails, do not continue. Fix sudo while the root session is still open.
+
 After that works, remove old SSH port `22` from the firewall:
 
 ```bash
@@ -175,23 +186,23 @@ ls -lh /home/jam/jam/build/server
 
 ## 5. Create the systemd service
 
-Run on the VPS as `root`:
+Run on the VPS as `jam` or root:
 
 ```bash
 export SERVER_ID="istanbul-test"
 export JOIN_SECRET="replace-with-a-long-random-secret"
 
-install -d -m 750 -o jam -g jam /etc/jam
+sudo install -d -m 750 -o jam -g jam /etc/jam
 
-cat >/etc/jam/server.env <<EOF
+sudo tee /etc/jam/server.env >/dev/null <<EOF
 SERVER_ID=${SERVER_ID}
 JOIN_SECRET=${JOIN_SECRET}
 EOF
 
-chown root:jam /etc/jam/server.env
-chmod 640 /etc/jam/server.env
+sudo chown root:jam /etc/jam/server.env
+sudo chmod 640 /etc/jam/server.env
 
-cat >/etc/systemd/system/jam-server.service <<'EOF'
+sudo tee /etc/systemd/system/jam-server.service >/dev/null <<'EOF'
 [Unit]
 Description=Jam native UDP SFU
 After=network-online.target
@@ -216,8 +227,8 @@ ReadWritePaths=/home/jam/jam
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now jam-server
+sudo systemctl daemon-reload
+sudo systemctl enable --now jam-server
 ```
 
 Check status and logs:
@@ -294,6 +305,66 @@ Stop:
 ```bash
 sudo systemctl stop jam-server
 ```
+
+Windows `cmd` one-liners from your Windows machine.
+
+Set these first:
+
+```bat
+set VPS_HOST=your.vps.ip.or.dns
+set VPS_SSH_PORT=2222
+set LOCAL_KEY=%USERPROFILE%\.ssh\jam_vps_ed25519
+```
+
+Check service status:
+
+```bat
+ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "systemctl status jam-server --no-pager"
+```
+
+Show recent service logs:
+
+```bat
+ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "journalctl -u jam-server -n 100 --no-pager"
+```
+
+Check firewall rules:
+
+```bat
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "sudo ufw status verbose"
+```
+
+Check whether UDP port `9999` is listening:
+
+```bat
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "sudo ss -lunp | grep 9999"
+```
+
+Stop the server:
+
+```bat
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "sudo systemctl stop jam-server"
+```
+
+Start the server:
+
+```bat
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "sudo systemctl start jam-server"
+```
+
+Restart the server:
+
+```bat
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "sudo systemctl restart jam-server"
+```
+
+Deploy latest code and restart:
+
+```bat
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git pull && cmake --build build --target server && sudo systemctl restart jam-server && sudo systemctl status jam-server --no-pager"
+```
+
+The commands with `sudo` use `-t` because they may need the `jam` password.
 
 ## Notes
 
