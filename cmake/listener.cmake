@@ -13,3 +13,6 @@ include(cmake/common.cmake)
 
 add_executable(listener_bot listener_bot.cpp)
 target_link_libraries(listener_bot PRIVATE asio concurrentqueue spdlog::spdlog opus)
+
+add_executable(listener_service listener_service.cpp)
+target_link_libraries(listener_service PRIVATE asio concurrentqueue spdlog::spdlog opus)

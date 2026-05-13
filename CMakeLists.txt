@@ -18,6 +18,12 @@ target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog 
 add_executable(room_routing_probe room_routing_probe.cpp)
 target_link_libraries(room_routing_probe PRIVATE asio spdlog::spdlog opus token_crypto)
 
+add_executable(join_token_tool join_token_tool.cpp)
+target_link_libraries(join_token_tool PRIVATE token_crypto)
+
+add_executable(listener_audio_sender_probe listener_audio_sender_probe.cpp)
+target_link_libraries(listener_audio_sender_probe PRIVATE asio spdlog::spdlog opus token_crypto)
+
 add_executable(client_manager_self_test client_manager_self_test.cpp)
 target_link_libraries(client_manager_self_test PRIVATE asio)
 

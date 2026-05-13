@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+#include "protocol.h"
+
 // Per-client state for SFU server
 struct ClientInfo {
     std::chrono::steady_clock::time_point last_alive;
@@ -12,5 +14,6 @@ struct ClientInfo {
     std::string                           room_id;
     std::string                           profile_id;
     std::string                           display_name;
+    ClientRole                            role = ClientRole::Performer;
     bool                                  joined_with_metadata = false;
 };

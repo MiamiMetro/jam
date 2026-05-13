@@ -192,9 +192,10 @@ private:
             case CtrlHdr::Cmd::LEAVE: {
                 Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
                           remote_endpoint_.port());
-                uint32_t leaving_client_id = client_manager_.remove_client(remote_endpoint_);
-                if (leaving_client_id > 0) {
-                    broadcast_participant_leave(leaving_client_id);
+                auto leaving_client = client_manager_.remove_client_with_info(remote_endpoint_);
+                if (leaving_client.has_value() &&
+                    leaving_client->role == ClientRole::Performer) {
+                    broadcast_participant_leave(leaving_client->client_id);
                 }
                 break;
             }
@@ -217,19 +218,22 @@ private:
     }
 
     void handle_join(std::size_t bytes, std::chrono::steady_clock::time_point now) {
-        if (bytes < sizeof(JoinHdr)) {
+        if (bytes < JOIN_HDR_LEGACY_SIZE) {
             Log::warn("Rejecting JOIN from {}:{}: packet too small",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
             return;
         }
 
         JoinHdr join{};
-        std::memcpy(&join, recv_buf_.data(), sizeof(JoinHdr));
+        std::memcpy(&join, recv_buf_.data(), std::min(bytes, sizeof(JoinHdr)));
 
         const std::string room_id      = fixed_string(join.room_id);
         const std::string profile_id   = fixed_string(join.profile_id);
         const std::string display_name = fixed_string(join.display_name);
         const std::string token        = fixed_string(join.join_token);
+        const ClientRole  role = join.role == ClientRole::Listener ? ClientRole::Listener
+                                                                    : ClientRole::Performer;
+        const std::string role_name = role == ClientRole::Listener ? "listener" : "performer";
 
         if (room_id.empty() || profile_id.empty()) {
             Log::warn("Rejecting JOIN from {}:{}: missing room or profile id",
@@ -243,7 +247,7 @@ private:
         }
         if (!token.empty() && !options_.allow_insecure_dev_joins) {
             const auto result = performer_join_token::validate(
-                token, options_.join_secret, options_.server_id, room_id, profile_id);
+                token, options_.join_secret, options_.server_id, room_id, profile_id, role_name);
             if (!result.ok) {
                 Log::warn("Rejecting JOIN from {}:{} room '{}': {}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
@@ -252,8 +256,8 @@ private:
             }
         }
 
-        auto registration = client_manager_.register_performer_client(
-            remote_endpoint_, now, room_id, profile_id, display_name);
+        auto registration = client_manager_.register_client(remote_endpoint_, now, room_id,
+                                                            profile_id, display_name, role);
         for (uint32_t removed_client_id: registration.removed_client_ids) {
             Log::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
                       removed_client_id, room_id, profile_id);
@@ -261,11 +265,13 @@ private:
         }
 
         uint32_t client_id = registration.client_id;
-        Log::info("JOIN: {}:{} room='{}' user='{}' display='{}' (ID: {}, {})",
+        Log::info("JOIN: {}:{} room='{}' user='{}' display='{}' role='{}' (ID: {}, {})",
                   remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
-                  profile_id, display_name, client_id,
+                  profile_id, display_name, role_name, client_id,
                   token.empty() ? "insecure-dev" : "token-present");
-        broadcast_participant_info(remote_endpoint_, client_id, profile_id, display_name);
+        if (role == ClientRole::Performer) {
+            broadcast_participant_info(remote_endpoint_, client_id, profile_id, display_name);
+        }
         send_existing_participant_info_to(remote_endpoint_);
     }
 
@@ -426,6 +432,9 @@ private:
     void send_existing_participant_info_to(const udp::endpoint& joined_endpoint) {
         auto existing_clients = client_manager_.get_room_clients_except(joined_endpoint);
         for (const auto& [endpoint, info]: existing_clients) {
+            if (info.role != ClientRole::Performer) {
+                continue;
+            }
             if (info.profile_id.empty() && info.display_name.empty()) {
                 continue;
             }
