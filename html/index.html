@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+
+<body>
+    <h1>Jam Listener Stream</h1>
+    <label>
+        Room
+        <input id="room" value="room-a">
+    </label>
+    <button id="load">Load</button>
+    <audio id="stream" width="640" height="360" controls></audio>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script>
+        var stream = document.getElementById('stream');
+        var hls = null;
+
+        function sourceForRoom() {
+            var room = document.getElementById('room').value || 'room-a';
+            return '/hls/' + encodeURIComponent(room) + '/stream.m3u8';
+        }
+
+        function loadStream() {
+            var src = sourceForRoom();
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+            if (Hls.isSupported()) {
+                hls = new Hls({
+                    lowLatencyMode: true,
+                    liveSyncDurationCount: 2,
+                    liveMaxLatencyDurationCount: 4
+                });
+                hls.loadSource(src);
+                hls.attachMedia(stream);
+                hls.on(Hls.Events.MANIFEST_PARSED, function () {
+                    stream.play();
+                });
+            }
+            else if (stream.canPlayType('application/vnd.apple.mpegurl')) {
+                stream.src = src;
+                stream.addEventListener('loadedmetadata', function () {
+                    stream.play();
+                }, { once: true });
+            }
+        }
+
+        document.getElementById('load').addEventListener('click', loadStream);
+        loadStream();
+    </script>
+</body>
+
+</html>

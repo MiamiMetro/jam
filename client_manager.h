@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,9 +26,9 @@ public:
         std::vector<uint32_t> removed_client_ids;
     };
 
-    RegistrationResult register_performer_client(const endpoint& ep, time_point now,
-                                                 std::string room_id, std::string profile_id,
-                                                 std::string display_name) {
+    RegistrationResult register_client(const endpoint& ep, time_point now, std::string room_id,
+                                       std::string profile_id, std::string display_name,
+                                       ClientRole role) {
         std::lock_guard<std::mutex> lock(mutex_);
 
         RegistrationResult result;
@@ -40,11 +41,14 @@ public:
             auto& client = existing->second;
             client.last_alive           = now;
             client.display_name         = std::move(display_name);
+            client.role                 = role;
             client.joined_with_metadata = true;
             result.client_id            = client.client_id;
         } else {
             if (existing != clients_.end()) {
-                result.removed_client_ids.push_back(existing->second.client_id);
+                if (existing->second.role == ClientRole::Performer) {
+                    result.removed_client_ids.push_back(existing->second.client_id);
+                }
                 clients_.erase(existing);
             }
 
@@ -55,6 +59,7 @@ public:
             client.room_id = room_id;
             client.profile_id = profile_id;
             client.display_name = std::move(display_name);
+            client.role = role;
             client.joined_with_metadata = true;
             result.client_id = client.client_id;
             clients_[ep] = std::move(client);
@@ -63,7 +68,9 @@ public:
         for (auto it = clients_.begin(); it != clients_.end();) {
             if (it->first != ep && it->second.room_id == room_id &&
                 it->second.profile_id == profile_id) {
-                result.removed_client_ids.push_back(it->second.client_id);
+                if (it->second.role == ClientRole::Performer) {
+                    result.removed_client_ids.push_back(it->second.client_id);
+                }
                 it = clients_.erase(it);
             } else {
                 ++it;
@@ -71,6 +78,13 @@ public:
         }
 
         return result;
+    }
+
+    RegistrationResult register_performer_client(const endpoint& ep, time_point now,
+                                                 std::string room_id, std::string profile_id,
+                                                 std::string display_name) {
+        return register_client(ep, now, std::move(room_id), std::move(profile_id),
+                               std::move(display_name), ClientRole::Performer);
     }
 
     // Update client last_alive timestamp
@@ -94,6 +108,17 @@ public:
         return 0;
     }
 
+    std::optional<ClientInfo> remove_client_with_info(const endpoint& ep) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        if (it == clients_.end()) {
+            return std::nullopt;
+        }
+        ClientInfo info = it->second;
+        clients_.erase(it);
+        return info;
+    }
+
     // Check if client exists
     bool exists(const endpoint& ep) const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -105,6 +130,12 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = clients_.find(ep);
         return it != clients_.end() ? it->second.client_id : 0;
+    }
+
+    ClientRole get_client_role(const endpoint& ep) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        return it != clients_.end() ? it->second.role : ClientRole::Performer;
     }
 
     // Check if any clients exist
@@ -187,7 +218,9 @@ public:
 
         for (auto it = clients_.begin(); it != clients_.end();) {
             if (now - it->second.last_alive > timeout) {
-                timed_out_ids.push_back(it->second.client_id);
+                if (it->second.role == ClientRole::Performer) {
+                    timed_out_ids.push_back(it->second.client_id);
+                }
                 it = clients_.erase(it);
             } else {
                 ++it;

@@ -1,0 +1,13 @@
+.git
+.vs
+.vscode
+build
+build-*
+out
+dist
+hls
+validation
+validation_logs
+node_modules
+*.log
+*.tmp

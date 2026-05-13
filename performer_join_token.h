@@ -124,7 +124,8 @@ inline bool constant_time_equal(const std::string& left, const std::string& righ
 inline ValidationResult validate(const std::string& token, const std::string& secret,
                                  const std::string& expected_server_id,
                                  const std::string& expected_room_id,
-                                 const std::string& expected_profile_id) {
+                                 const std::string& expected_profile_id,
+                                 const std::string& expected_role = "performer") {
     if (secret.empty()) {
         return {false, "join secret not configured"};
     }
@@ -158,7 +159,7 @@ inline ValidationResult validate(const std::string& token, const std::string& se
     if (claims.profile_id != expected_profile_id) {
         return {false, "wrong profile id"};
     }
-    if (claims.role != "performer") {
+    if (claims.role != expected_role) {
         return {false, "wrong role"};
     }
 

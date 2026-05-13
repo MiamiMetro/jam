@@ -56,12 +56,20 @@ struct CtrlHdr : MsgHdr {
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
 
+enum class ClientRole : uint8_t {
+    Performer = 1,
+    Listener  = 2,
+};
+
+constexpr size_t JOIN_HDR_LEGACY_SIZE = sizeof(CtrlHdr) + (64 * 4) + 512;
+
 struct JoinHdr : CtrlHdr {
     Bytes<64>  room_id;
     Bytes<64>  room_handle;
     Bytes<64>  profile_id;
     Bytes<64>  display_name;
     Bytes<512> join_token;
+    ClientRole role = ClientRole::Performer;
 };
 
 struct ParticipantInfoHdr : CtrlHdr {
