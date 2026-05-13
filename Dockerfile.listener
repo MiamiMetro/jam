@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+
+FROM debian:trixie-slim AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        libasound2-dev \
+        libegl1-mesa-dev \
+        libgl1-mesa-dev \
+        libwayland-dev \
+        libx11-dev \
+        libxcursor-dev \
+        libxi-dev \
+        libxinerama-dev \
+        libxkbcommon-dev \
+        libxrandr-dev \
+        ninja-build \
+        pkg-config \
+        wayland-protocols \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /build --target listener_service
+
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /build/listener_service /usr/local/bin/listener_service
+COPY tools/listener_service_entrypoint.sh /usr/local/bin/listener_service_entrypoint.sh
+RUN chmod +x /usr/local/bin/listener_service_entrypoint.sh
+
+WORKDIR /app
+ENTRYPOINT ["/usr/local/bin/listener_service_entrypoint.sh"]
