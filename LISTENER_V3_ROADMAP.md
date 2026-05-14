@@ -1,7 +1,9 @@
 # Listener Mode V3 Roadmap
 
-Status: native terminal path in progress. `jam-app` process launch and Convex
-adapter phases are explicitly deferred until the native path is accepted.
+Status: native local path, `jam-app` process launch, local Convex adapter, and
+MediaMTX publish-auth overlay are implemented. The current development HLS URL
+is local: `http://127.0.0.1:8080/hls/<room>/stream.m3u8`. VPS/domain HLS
+remains the next production-facing step.
 
 V3 pivots listener mode away from the server-side listener-bot model. V2 proved
 that a bot can join rooms, mix audio, and write HLS, but that model is awkward
@@ -53,11 +55,13 @@ performer path remains separate and higher priority.
 - Ingest uses SRT first, not RTMP.
 - MediaMTX is the first ingest/HLS server.
 - nginx sits in front of MediaMTX.
-- Public HLS origin is a subdomain, for example:
+- Public HLS origin is local during development and a subdomain later, for example:
+  `http://127.0.0.1:8080/hls/<room-id>/stream.m3u8`
   `https://listen.<domain>/hls/<room-id>/stream.m3u8`.
 - Playback is public/unlisted in V3.
 - Publish authorization uses short-lived per-broadcast session keys.
-- MediaMTX must enforce publish authorization at ingest time.
+- MediaMTX must enforce publish authorization at ingest time before VPS
+  production/demo hardening is complete.
 - The VPS exposes a public SRT UDP ingest port.
 - V3 is audio-only.
 - Docker Compose owns the ingest/HLS stack.
@@ -77,11 +81,11 @@ Success means:
   path
 - listener mode adds no blocking work to the jam-critical audio path
 - the owner client produces a host broadcast mix from already-available audio
-- a separate broadcaster process encodes and pushes SRT to the VPS
+- a separate broadcaster process encodes and pushes SRT to local/VPS ingest
 - MediaMTX/nginx produce browser-playable HLS
 - multiple room owners can broadcast concurrently
-- `jam-app` can later launch/stop the broadcaster and show listener status
-- Convex/app code prepares product config, but native broadcaster binaries stay
+- `jam-app` launches/stops the broadcaster and shows listener status
+- Convex/app code prepares product config, and native broadcaster binaries stay
   backend-agnostic
 
 ## Architecture
@@ -127,7 +131,7 @@ server
 MediaMTX
   - internal ingest/HLS server
   - accepts SRT publishers
-  - enforces publish auth
+  - enforces publish auth through the explicit auth compose overlay
   - outputs HLS
 
 nginx
@@ -147,9 +151,8 @@ stream origin.
 
 ### App And Backend
 
-V3 terminal-first implementation should work before app integration.
-
-Later, `jam-app` owns process orchestration:
+V3 terminal-first implementation works before app integration. `jam-app` now
+owns local process orchestration:
 
 ```text
 owner starts/join jam
@@ -164,15 +167,16 @@ owner starts/join jam
 
 Convex is the first product adapter, not a native dependency.
 
-Likely room fields:
+Implemented room/session fields:
 
-- `listener_enabled`
-- `listener_status`
-- `listener_url`
-- `listener_started_at`
-- `listener_last_heartbeat_at`
-- `listener_error`
-- ingest session id or stream-key reference
+- `listenerStatus`
+- `listenerSessionId`
+- `listenerStartedAt`
+- `listenerUpdatedAt`
+- `listenerExpiresAt`
+- `listenerError`
+- `streamUrl`
+- `listener_publish_sessions` rows with hashed publish keys
 
 Backend responsibilities:
 
@@ -184,6 +188,12 @@ Backend responsibilities:
 - reconcile stale live state if broadcaster/app disappears
 
 Do not put long-lived ingest secrets in client-visible room records.
+
+The default local compose keeps the previously verified static SRT passphrase
+for terminal smoke tests. The app-backed path should run with
+`docker-compose.broadcast.auth.yml`, which enables MediaMTX HTTP auth against
+the Convex `/broadcast/auth` endpoint. `node tools\broadcast-v3-local-verify.mjs
+--auth` verifies the MediaMTX auth behavior with a local test auth server.
 
 ## Protocol And Media
 

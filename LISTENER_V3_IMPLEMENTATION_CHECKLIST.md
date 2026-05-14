@@ -1,7 +1,9 @@
 # Listener Mode V3 Implementation Checklist
 
-Status: native terminal path in progress. `jam-app` and Convex adapter work is
-deferred and has not been started in this repo.
+Status: native local path is verified. `jam-app` Phase 8 local launcher wiring is
+implemented with local HLS URLs. Phase 9 Convex adapter is implemented for the
+local desktop path. Remaining Phase 7 work is MediaMTX enforcement of the
+backend-issued publish session.
 
 This checklist implements the host-push broadcast roadmap in
 `LISTENER_V3_ROADMAP.md`. V3 is audio-only, SRT ingest, MediaMTX/nginx HLS
@@ -19,6 +21,9 @@ Latest native verification:
   concurrent room paths.
 - `node tools\broadcast-v3-local-verify.mjs --bad-key` passed for bad SRT
   passphrase rejection.
+- `node tools\broadcast-v3-local-verify.mjs --auth` passed for MediaMTX HTTP
+  publish authorization: valid publish credentials produced HLS, while a bad
+  publish key did not.
 - Manual one-client local broadcast worked with server + client
   `--broadcast-ipc-port 39000` + `jam_broadcaster.exe`.
 - Manual two-client native local broadcast worked with macOS SFU, Windows owner
@@ -30,6 +35,15 @@ Latest native verification:
 - Automated verifier runs clean up Docker containers and native broadcaster
   processes after completion.
 - `git diff --check` passed.
+- `jam-app` Electron/renderer build passed after adding local host-side
+  Listener Mode launch wiring.
+- `npm run convex:codegen` passed after adding listener session schema,
+  mutations, HTTP auth endpoint, and stale-session cron.
+- `npm run desktop:build` passed after switching the desktop Listener Mode
+  button to backend-issued local launch config.
+- The app-backed broadcaster launch config now includes per-session publish
+  credentials in the SRT stream ID. Run MediaMTX with
+  `docker-compose.broadcast.auth.yml` for this enforced path.
 
 ## Phase 0 - Confirm Baseline
 
@@ -206,8 +220,9 @@ Latest native verification:
       `node tools\broadcast-v3-local-verify.mjs --bad-key` passed against the
       local static SRT passphrase.
 - [ ] Verify valid publish key creates HLS.
-      Local static passphrase is verified, but production per-session keys are
-      deferred.
+      Local HTTP-auth publish keys are verified by
+      `node tools\broadcast-v3-local-verify.mjs --auth`; VPS/domain validation
+      is pending in Phase 6.
 - [ ] Verify Windows owner broadcasts to VPS.
 - [ ] Verify macOS performer still hears clean jam audio.
 - [ ] Verify browser listener plays HLS from `listen.<domain>`.
@@ -221,41 +236,74 @@ Latest native verification:
       `node tools\broadcast-v3-local-verify.mjs --multi-room` passed.
 - [x] Define duplicate publisher behavior for same room.
       `overridePublisher: no` rejects replacing an active publisher.
-- [ ] Enforce short-lived per-broadcast publish keys.
-      Deferred until product/backend integration.
-- [ ] Reject expired/revoked publish keys.
-      Deferred until product/backend integration.
-- [ ] Prevent publishing to another room's HLS path.
-      Deferred until product/backend integration.
+- [x] Enforce short-lived per-broadcast publish keys.
+      Backend listener publish sessions, key hashing, and `/broadcast/auth`
+      validation exist in Convex. `docker-compose.broadcast.auth.yml` enables
+      MediaMTX HTTP auth for publish actions, and the auth verifier passes.
+- [x] Reject expired/revoked publish keys.
+      Convex validation rejects expired/revoked listener publish sessions.
+      The auth verifier confirms bad publish credentials do not produce HLS.
+- [x] Prevent publishing to another room's HLS path.
+      Convex validation binds publish sessions to a room path. The auth verifier
+      confirms a publish attempt for the wrong path/key is rejected.
 
 ## Phase 8 - jam-app Process Launch
 
-Deferred by current scope. Do not start this until native terminal validation is
-accepted.
+Local desktop wiring is implemented against `127.0.0.1` HLS/SRT endpoints. VPS
+domain URLs remain a later backend/config step.
 
-- [ ] Add app-side broadcaster launch config model.
-- [ ] Launch `client.exe` for jamming as today.
-- [ ] Launch `jam_broadcaster.exe` when owner enables Listener Mode.
-- [ ] Stop broadcaster when owner disables Listener Mode.
-- [ ] Stop broadcaster when owner leaves room.
-- [ ] Add local broadcaster HTTP health endpoint if needed for app UI.
-- [ ] Show listener status: stopped, starting, live, reconnecting, error.
-- [ ] Show/copy public HLS URL.
-- [ ] Surface useful broadcaster/ingest errors.
+- [x] Add app-side broadcaster launch config model.
+      Added typed Electron launch/status context for `jam_broadcaster.exe`.
+- [x] Launch `client.exe` for jamming as today.
+      Existing client launch remains intact; host launch adds
+      `--broadcast-ipc-port 39000` so the broadcaster can subscribe locally.
+- [x] Launch `jam_broadcaster.exe` when owner enables Listener Mode.
+      Host-only desktop button launches the broadcaster with local SRT ingest.
+- [x] Stop broadcaster when owner disables Listener Mode.
+      Host-only desktop button stops the broadcaster process.
+- [x] Stop broadcaster when owner leaves room.
+      Leave/unmount paths request broadcaster shutdown.
+- [x] Add local broadcaster HTTP health endpoint if needed for app UI.
+      Not needed for the current app path; Electron process status is used for
+      the local UI path, and the native broadcaster remains backend-agnostic.
+- [x] Show listener status: stopped, starting, live, reconnecting, error.
+      Current UI shows starting/stopping/live/error. Reconnecting is still
+      represented through process/error status rather than FFmpeg reconnect
+      telemetry.
+- [x] Show/copy public HLS URL.
+      UI shows the local public HLS URL while live:
+      `http://127.0.0.1:8080/hls/<room>/stream.m3u8`.
+- [x] Surface useful broadcaster/ingest errors.
+      Missing binary, invalid launch context, duplicate broadcaster, and launch
+      failures are surfaced in the room header.
 
 ## Phase 9 - Convex Adapter
 
-Deferred by current scope. Do not start this until native terminal validation and
-jam-app process launch are accepted.
+Implemented for the local desktop path. Returned HLS URL is intentionally local
+for now: `http://127.0.0.1:8080/hls/<room>/stream.m3u8`.
 
-- [ ] Add room listener state fields.
-- [ ] Authorize owner-only Listener Mode.
-- [ ] Create short-lived ingest publish sessions.
-- [ ] Return native broadcaster launch config to authenticated desktop app.
-- [ ] Store public/unlisted HLS URL.
-- [ ] Revoke/expire publish session when disabled.
-- [ ] Reconcile stale live/error state when broadcaster/app disappears.
-- [ ] Keep native binaries backend-agnostic.
+- [x] Add room listener state fields.
+      Added optional listener state fields to `rooms` and a
+      `listener_publish_sessions` table.
+- [x] Authorize owner-only Listener Mode.
+      `startListenerMode`, `stopListenerMode`, and `refreshListenerMode` require
+      authenticated room host ownership.
+- [x] Create short-lived ingest publish sessions.
+      `startListenerMode` creates a 5 minute publish session with a random
+      publish user/key hash.
+- [x] Return native broadcaster launch config to authenticated desktop app.
+      `startListenerMode` returns `ipcPort`, `srtUrl`, `hlsUrl`, room path, and
+      publish session metadata.
+- [x] Store public/unlisted HLS URL.
+      The room `streamUrl` is patched to the backend-issued local HLS URL.
+- [x] Revoke/expire publish session when disabled.
+      `stopListenerMode` revokes active listener publish sessions for the room.
+- [x] Reconcile stale live/error state when broadcaster/app disappears.
+      `refreshListenerMode` extends active sessions, and a 1 minute cron expires
+      stale listener sessions.
+- [x] Keep native binaries backend-agnostic.
+      The app passes only generic `ipcPort`, `srtUrl`, and `hlsUrl` values to
+      `client.exe`/`jam_broadcaster.exe`.
 
 ## Out Of Scope For V3
 

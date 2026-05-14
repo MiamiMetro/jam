@@ -39,7 +39,7 @@ function usage() {
       "  node tools/build-release-client.mjs",
       "  node tools/build-release-client.mjs --build-dir build --out ../jam-app/apps/desktop/resources/client",
       "",
-      "Builds the native client in Release mode and copies it to the desktop app resources folder.",
+      "Builds the native client and broadcaster in Release mode and copies them to the desktop app resources folder.",
     ].join("\n"),
   );
 }
@@ -59,13 +59,29 @@ function existingFile(candidates) {
   return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
 }
 
-function clientCandidates(buildPath) {
-  const exe = process.platform === "win32" ? "client.exe" : "client";
+function executableCandidates(buildPath, name) {
+  const exe = process.platform === "win32" ? `${name}.exe` : name;
   return [
     path.join(buildPath, "Release", exe),
     path.join(buildPath, "RelWithDebInfo", exe),
     path.join(buildPath, exe),
   ];
+}
+
+function copyExecutable(buildPath, destinationPath, name) {
+  const candidates = executableCandidates(buildPath, name);
+  const executablePath = existingFile(candidates);
+  if (!executablePath) {
+    console.error(`Release ${name} executable not found. Checked:`);
+    for (const candidate of candidates) {
+      console.error(`  ${candidate}`);
+    }
+    process.exit(3);
+  }
+
+  const destinationFile = path.join(destinationPath, path.basename(executablePath));
+  fs.copyFileSync(executablePath, destinationFile);
+  console.log(`Copied ${executablePath} to ${destinationFile}`);
 }
 
 const options = parseArgs(process.argv.slice(2));
@@ -81,18 +97,8 @@ if (!fs.existsSync(path.join(buildPath, "CMakeCache.txt"))) {
 }
 
 run("cmake", ["--build", buildPath, "--config", "Release", "--target", "client"]);
-
-const clientPath = existingFile(clientCandidates(buildPath));
-if (!clientPath) {
-  console.error("Release client executable not found. Checked:");
-  for (const candidate of clientCandidates(buildPath)) {
-    console.error(`  ${candidate}`);
-  }
-  process.exit(3);
-}
+run("cmake", ["--build", buildPath, "--config", "Release", "--target", "jam_broadcaster"]);
 
 fs.mkdirSync(destinationPath, { recursive: true });
-const destinationFile = path.join(destinationPath, path.basename(clientPath));
-fs.copyFileSync(clientPath, destinationFile);
-
-console.log(`Copied ${clientPath} to ${destinationFile}`);
+copyExecutable(buildPath, destinationPath, "client");
+copyExecutable(buildPath, destinationPath, "jam_broadcaster");

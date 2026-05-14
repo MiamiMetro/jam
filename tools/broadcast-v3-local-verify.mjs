@@ -21,9 +21,11 @@ const mode = process.argv.includes("--ipc-stress")
     ? "ipc"
     : process.argv.includes("--multi-room")
     ? "multi-room"
-    : process.argv.includes("--bad-key")
-      ? "bad-key"
-      : "test-tone";
+    : process.argv.includes("--auth")
+      ? "auth"
+      : process.argv.includes("--bad-key")
+        ? "bad-key"
+        : "test-tone";
 const defaultRoom = `broadcast-v3-${mode}-${Date.now()}`;
 const httpPort = Number(process.env.BROADCAST_HTTP_PORT ?? 8080);
 const mediaMtxApiPort = Number(process.env.BROADCAST_MEDIAMTX_API_PORT ?? 9997);
@@ -31,6 +33,7 @@ const mediaMtxApiUser = process.env.BROADCAST_MEDIAMTX_API_USER ?? "jam-api";
 const mediaMtxApiPass = process.env.BROADCAST_MEDIAMTX_API_PASS ?? "jam-api-dev-secret";
 const srtPort = Number(process.env.BROADCAST_SRT_PORT ?? 8890);
 const ipcPort = 39000 + Math.floor(Math.random() * 2000);
+const authPort = 18000 + Math.floor(Math.random() * 2000);
 const outDir = path.join(repoRoot, "build", "broadcast-v3-local-verify");
 
 function assert(condition, message) {
@@ -213,23 +216,28 @@ function srtUrl(room, passphrase = publishPassphrase) {
   return `srt://127.0.0.1:${srtPort}?streamid=publish:${room}&passphrase=${passphrase}&pkt_size=1316`;
 }
 
+function srtAuthUrl(room, user, password, passphrase = publishPassphrase) {
+  return `srt://127.0.0.1:${srtPort}?streamid=publish:${room}:${user}:${password}&passphrase=${passphrase}&pkt_size=1316`;
+}
+
 function startBroadcaster(room, options = {}) {
   const logPath = path.join(outDir, `${mode}-${room}.log`);
   const log = fs.openSync(logPath, "w");
+  const targetSrtUrl = options.srtUrl ?? srtUrl(room, options.passphrase);
   const args =
     mode === "ipc" || mode === "ipc-stress"
       ? [
           "--ipc-port",
           String(ipcPort),
           "--srt-url",
-          srtUrl(room),
+          targetSrtUrl,
           "--duration-ms",
           String(options.durationMs ?? 22000),
         ]
       : [
           "--test-tone",
           "--srt-url",
-          srtUrl(room, options.passphrase),
+          targetSrtUrl,
           "--duration-ms",
           String(options.durationMs ?? 22000),
         ];
@@ -241,6 +249,42 @@ function startBroadcaster(room, options = {}) {
   child.on("exit", () => fs.closeSync(log));
   child.logPath = logPath;
   return child;
+}
+
+function startAuthServer({ room, user, password }) {
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      } catch {
+        res.writeHead(400);
+        res.end("bad request");
+        return;
+      }
+
+      calls.push(body);
+      const allowed =
+        body.action === "publish" &&
+        body.protocol === "srt" &&
+        body.path === room &&
+        body.user === user &&
+        (body.password === password || body.token === password);
+      res.writeHead(allowed ? 200 : 401);
+      res.end(allowed ? "ok" : "unauthorized");
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(authPort, "0.0.0.0", () => {
+      server.off("error", reject);
+      resolve({ server, calls });
+    });
+  });
 }
 
 function makeIpcPacket({ sequence, sampleRate = 48000, frameCount = 960, phase = 0 }) {
@@ -336,8 +380,27 @@ if (!fs.existsSync(broadcasterExe)) {
 fs.mkdirSync(outDir, { recursive: true });
 
 const broadcasters = [];
+let authServer;
 try {
-  run("docker", ["compose", "-f", "docker-compose.broadcast.yml", "up", "-d"]);
+  const composeArgs = ["compose", "-f", "docker-compose.broadcast.yml"];
+  if (mode === "auth") {
+    composeArgs.push("-f", "docker-compose.broadcast.auth.yml");
+  }
+  composeArgs.push("up", "-d");
+
+  let authContext;
+  if (mode === "auth") {
+    authContext = {
+      room: defaultRoom,
+      user: `user-${Date.now()}`,
+      password: `key-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    };
+    const started = await startAuthServer(authContext);
+    authServer = started;
+    process.env.BROADCAST_AUTH_HTTP_ADDRESS = `http://host.docker.internal:${authPort}/auth`;
+  }
+
+  run("docker", composeArgs);
   await waitForHealth();
   await waitForMediaMtxHealth();
 
@@ -362,6 +425,34 @@ try {
     }
     assert(rejected, "bad publish passphrase unexpectedly produced HLS");
     console.log(`PASS broadcast V3 bad-key local verification room=${defaultRoom}`);
+  } else if (mode === "auth") {
+    const valid = startBroadcaster(defaultRoom, {
+      srtUrl: srtAuthUrl(defaultRoom, authContext.user, authContext.password),
+      durationMs: 12000,
+    });
+    broadcasters.push(valid);
+    const result = await waitForPlaylist(defaultRoom);
+    assert(
+      authServer.calls.some((call) => call.action === "publish" && call.path === defaultRoom),
+      "MediaMTX did not call auth server for valid publish",
+    );
+
+    const rejectedRoom = `${defaultRoom}-bad`;
+    const rejected = startBroadcaster(rejectedRoom, {
+      srtUrl: srtAuthUrl(rejectedRoom, authContext.user, "wrong-key"),
+      durationMs: 7000,
+    });
+    broadcasters.push(rejected);
+    let rejectedPublish = false;
+    try {
+      await waitForPlaylist(rejectedRoom);
+    } catch {
+      rejectedPublish = true;
+    }
+    assert(rejectedPublish, "bad auth publish unexpectedly produced HLS");
+    console.log(
+      `PASS broadcast V3 auth local verification room=${defaultRoom} segment=${result.segment}`,
+    );
   } else {
     const broadcaster = startBroadcaster(defaultRoom, {
       durationMs: mode === "ipc-stress" ? 18000 : 22000,
@@ -398,5 +489,14 @@ try {
       broadcaster.kill();
     }
   }
-  run("docker", ["compose", "-f", "docker-compose.broadcast.yml", "down", "--remove-orphans"]);
+  if (authServer) {
+    await new Promise((resolve) => authServer.server.close(resolve));
+  }
+  const downArgs = ["compose", "-f", "docker-compose.broadcast.yml"];
+  if (mode === "auth") {
+    downArgs.push("-f", "docker-compose.broadcast.auth.yml");
+  }
+  downArgs.push("down", "--remove-orphans");
+  run("docker", downArgs);
+  delete process.env.BROADCAST_AUTH_HTTP_ADDRESS;
 }
