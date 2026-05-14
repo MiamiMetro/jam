@@ -1,0 +1,22 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.17.1
+    container_name: jam-broadcast-mediamtx
+    ports:
+      - "${BROADCAST_SRT_PORT:-8890}:8890/udp"
+      - "127.0.0.1:${BROADCAST_MEDIAMTX_API_PORT:-9997}:9997"
+    volumes:
+      - ./broadcast/mediamtx.yml:/mediamtx.yml:ro
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: jam-broadcast-nginx
+    depends_on:
+      - mediamtx
+    ports:
+      - "${BROADCAST_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./html:/usr/share/nginx/html:ro
+      - ./broadcast/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped

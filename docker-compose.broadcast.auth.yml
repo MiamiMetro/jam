@@ -1,0 +1,10 @@
+services:
+  mediamtx:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      MTX_AUTHMETHOD: http
+      MTX_AUTHHTTPADDRESS: ${BROADCAST_AUTH_HTTP_ADDRESS:?Set BROADCAST_AUTH_HTTP_ADDRESS to the Convex /broadcast/auth endpoint}
+      MTX_AUTHHTTPEXCLUDE_0_ACTION: api
+      MTX_AUTHHTTPEXCLUDE_1_ACTION: read
+      MTX_AUTHHTTPEXCLUDE_2_ACTION: playback

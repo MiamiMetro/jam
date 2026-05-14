@@ -1,0 +1,47 @@
+logLevel: info
+
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+  - user: jam-api
+    pass: jam-api-dev-secret
+    ips: []
+    permissions:
+      - action: api
+
+api: yes
+apiAddress: :9997
+
+rtsp: no
+rtmp: no
+webrtc: no
+
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigins: ['*']
+hlsVariant: fmp4
+hlsAlwaysRemux: yes
+hlsSegmentCount: 4
+hlsSegmentDuration: 1s
+hlsPartDuration: 250ms
+hlsMuxerCloseAfter: 10s
+
+srt: yes
+srtAddress: :8890
+
+pathDefaults:
+  source: publisher
+  overridePublisher: no
+  srtPublishPassphrase: jam-v3-publish-passphrase
+
+paths:
+  '~^[-A-Za-z0-9_]+$':
+    source: publisher
