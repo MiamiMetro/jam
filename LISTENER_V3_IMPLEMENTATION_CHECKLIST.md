@@ -7,26 +7,34 @@ This checklist implements the host-push broadcast roadmap in
 `LISTENER_V3_ROADMAP.md`. V3 is audio-only, SRT ingest, MediaMTX/nginx HLS
 delivery, and a separate `jam_broadcaster.exe`.
 
-Latest native verification on Windows:
+Latest native verification:
 
 - `cmake --build build --config Release --target client jam_broadcaster` passed.
 - `node tools\broadcast-v3-local-verify.mjs` passed for test tone -> SRT -> HLS.
 - `node tools\broadcast-v3-local-verify.mjs --ipc` passed for synthetic UDP IPC -> SRT -> HLS.
+- `node tools\broadcast-v3-local-verify.mjs --ipc-stress` passed for sustained
+  IPC with malformed packets and sequence gaps; latest run received 969 valid
+  packets, counted 172 dropped packets, and had 0 write failures/reconnects.
 - `node tools\broadcast-v3-local-verify.mjs --multi-room` passed for two
   concurrent room paths.
 - `node tools\broadcast-v3-local-verify.mjs --bad-key` passed for bad SRT
   passphrase rejection.
 - Manual one-client local broadcast worked with server + client
-  `--broadcast-ipc-port 39000` + `jam_broadcaster.exe`; browser/player delay was
-  about 8 seconds.
-- `docker compose -f docker-compose.broadcast.yml ps` showed no remaining containers after verification.
-- `Get-Process jam_broadcaster,client,ffmpeg,server` showed no remaining native test processes.
+  `--broadcast-ipc-port 39000` + `jam_broadcaster.exe`.
+- Manual two-client native local broadcast worked with macOS SFU, Windows owner
+  client, macOS performer client, `jam_broadcaster.exe`, and local
+  MediaMTX/nginx. The HLS stream included macOS performer audio.
+- Local HLS tuning in `broadcast/mediamtx.yml` uses 1 second segments, 4
+  retained segments, and 250 ms parts. Browser/player delay was about 3.5
+  seconds after refresh in manual testing.
+- Automated verifier runs clean up Docker containers and native broadcaster
+  processes after completion.
 - `git diff --check` passed.
 
 ## Phase 0 - Confirm Baseline
 
-- [ ] Confirm `client.exe` normal jamming still works before broadcast work.
-      Not re-run on this branch after V3 broadcaster changes.
+- [x] Confirm `client.exe` normal jamming still works before broadcast work.
+      Manual Windows/macOS native room test passed on this branch.
 - [x] Confirm V2 listener-bot code remains available but is not the V3 path.
       Existing `listener_service.cpp` and listener V2 docs remain untouched.
 - [x] Confirm branch is `v3-host-broadcast-listener`.
@@ -48,6 +56,9 @@ Latest native verification on Windows:
       Added `broadcast/mediamtx.yml` with SRT enabled on port `8890`.
 - [x] Configure MediaMTX HLS output.
       Added fMP4 HLS output in `broadcast/mediamtx.yml`.
+- [x] Tune local HLS latency for manual browser playback.
+      MediaMTX uses `hlsSegmentDuration: 1s`, `hlsSegmentCount: 4`, and
+      `hlsPartDuration: 250ms`; manual local playback was about 3.5 seconds.
 - [x] Configure nginx as public HLS proxy in front of MediaMTX.
       Added `/hls/<room>/stream.m3u8` and segment proxy routes in
       `broadcast/nginx.conf`.
@@ -59,8 +70,9 @@ Latest native verification on Windows:
       Segment route sends `Cache-Control: public, max-age=60, immutable`.
 - [x] Add local health check for nginx.
       `GET /health` returns `ok`.
-- [ ] Add local health check for MediaMTX.
-      MediaMTX API is enabled, but a dedicated verifier check is not added yet.
+- [x] Add local health check for MediaMTX.
+      `tools/broadcast-v3-local-verify.mjs` checks the MediaMTX API through a
+      localhost-only compose port using local dev API credentials.
 - [x] Verify compose starts and stops cleanly.
       Both local verifier modes bring compose up and down successfully.
 
@@ -82,9 +94,9 @@ Latest native verification on Windows:
       media segment through nginx.
 - [x] Add automated verifier for test tone -> SRT -> HLS.
       Added `tools/broadcast-v3-local-verify.mjs`.
-- [ ] Verify audible browser playback locally.
-      The verifier proves HTTP/HLS assets are present, but it does not play audio
-      through a browser.
+- [x] Verify audible browser playback locally.
+      Manual browser playback worked against
+      `http://127.0.0.1:8080/hls/room-a/stream.m3u8`.
 
 ## Phase 3 - Localhost UDP IPC Input
 
@@ -105,8 +117,11 @@ Latest native verification on Windows:
       `node tools\broadcast-v3-local-verify.mjs --ipc` passed.
 - [x] Verify invalid/short IPC packets do not crash broadcaster.
       Header and payload validation drops bad packets in `jam_broadcaster.cpp`.
-- [ ] Stress-test IPC packet loss under sustained pressure.
-      Not run yet.
+- [x] Stress-test IPC packet loss under sustained pressure.
+      `node tools\broadcast-v3-local-verify.mjs --ipc-stress` sends sustained
+      valid IPC frames with malformed packets and sequence gaps. Latest run:
+      969 packets received, 172 dropped counted, 969 frames written, 0 write
+      failures, 0 reconnects.
 
 ## Phase 4 - `client.exe` Broadcast IPC
 
@@ -139,29 +154,46 @@ Latest native verification on Windows:
 - [x] Build-check client broadcast IPC path.
       `cmake --build build --config Release --target client jam_broadcaster`
       passed.
-- [ ] Manually verify client broadcast IPC with real native audio.
-      The client path compiles, but full two-client native broadcast validation is
-      still pending.
+- [x] Manually verify client broadcast IPC with real native audio.
+      Verified with Windows owner client sending broadcast IPC to
+      `jam_broadcaster.exe`; macOS performer audio was included in HLS.
 
 ## Phase 5 - Local Full Native Validation
 
-- [ ] Start local SFU/server.
+- [x] Start local SFU/server.
+      Verified with macOS SFU on `192.168.1.102:9999`.
 - [x] Start one local SFU/server and one native owner client.
       Manual smoke test accepted JOIN with token and published owner broadcast
       IPC to local HLS.
-- [ ] Start two native clients in one room.
-- [ ] Start owner client with `--broadcast-ipc-port`.
-- [ ] Start `jam_broadcaster.exe --ipc-port ...`.
-- [ ] Verify browser hears HLS.
-- [ ] Verify owner mic is included.
-- [ ] Verify owner mute mutes owner mic in broadcast.
-- [ ] Verify metronome is not included.
-- [ ] Verify owner volume/mute changes affect stream.
+- [x] Start two native clients in one room.
+      Verified Windows owner and MacBook performer in `room-a`.
+- [x] Start owner client with `--broadcast-ipc-port`.
+      Windows owner used `--broadcast-ipc-port 39000`.
+- [x] Start `jam_broadcaster.exe --ipc-port ...`.
+      Broadcaster consumed localhost UDP IPC on port `39000` and published SRT
+      to local MediaMTX.
+- [x] Verify browser hears HLS.
+      Manual browser playback worked from local nginx HLS.
+- [x] Verify owner mic is included.
+      Manual local stream included live room audio from the broadcasting owner
+      path.
+- [x] Verify owner mute mutes owner mic in broadcast.
+      Manually confirmed in local Windows-owner/macOS-performer HLS test.
+- [x] Verify metronome is not included.
+      Manually confirmed: native jam clients can receive metronome sync, but HLS
+      broadcast did not include the click.
+- [x] Verify owner volume/mute changes affect stream.
+      Manually confirmed participant strip volume/mute changes on the Windows
+      owner affected the streamed macOS performer audio.
 - [ ] Verify broadcaster crash does not break native jam audio.
 - [ ] Verify broadcaster reconnect resumes HLS.
       Basic FFmpeg restart logic exists in `jam_broadcaster.cpp`, but it has not
-      been failure-tested.
-- [ ] Verify performer-to-performer audio remains clean.
+      caused transient client send errors and one macOS rebuffer during manual
+      kill/restart testing. HLS returned after restart, but this is not accepted
+      as a clean pass yet.
+- [x] Verify performer-to-performer audio remains clean.
+      Manual Windows/macOS native jam audio stayed clean while broadcast was
+      running.
 
 ## Phase 6 - VPS Same-Server Demo
 

@@ -1,5 +1,22 @@
 logLevel: info
 
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+  - user: jam-api
+    pass: jam-api-dev-secret
+    ips: []
+    permissions:
+      - action: api
+
 api: yes
 apiAddress: :9997
 
@@ -12,9 +29,9 @@ hlsAddress: :8888
 hlsAllowOrigins: ['*']
 hlsVariant: fmp4
 hlsAlwaysRemux: yes
-hlsSegmentCount: 5
-hlsSegmentDuration: 2s
-hlsPartDuration: 500ms
+hlsSegmentCount: 4
+hlsSegmentDuration: 1s
+hlsPartDuration: 250ms
 hlsMuxerCloseAfter: 10s
 
 srt: yes

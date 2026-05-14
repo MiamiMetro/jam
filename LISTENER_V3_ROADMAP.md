@@ -308,6 +308,13 @@ server
 -> performer-to-performer audio remains clean
 ```
 
+Status: verified locally on May 14, 2026 with a macOS SFU, Windows owner
+client, macOS performer client, `jam_broadcaster.exe`, and local
+MediaMTX/nginx. The Windows owner client sent broadcast IPC on port `39000`,
+the HLS stream played in a browser, and the stream included macOS performer
+audio. Local HLS tuning is currently 1 second segments, 4 retained segments,
+and 250 ms parts, which produced about 3.5 seconds of manual playback delay.
+
 ### Phase 5 - VPS Same-Server Demo
 
 Deploy MediaMTX/nginx compose on the same VPS as the existing SFU/server.
