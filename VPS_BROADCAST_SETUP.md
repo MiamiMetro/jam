@@ -55,6 +55,7 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plug
 sudo usermod -aG docker jam
 sudo systemctl enable --now docker
 sudo systemctl status docker --no-pager
+test -f /etc/ssl/certs/ca-certificates.crt
 ```
 
 Log out and back in so the `docker` group takes effect:
@@ -109,7 +110,21 @@ Run on the VPS as `jam`:
 
 ```bash
 cd /home/jam/jam
+git restore CMakeLists.txt
 git pull
+```
+
+`VPS_SETUP.md` comments out `include(cmake/client.cmake)` in `CMakeLists.txt`
+for server-only VPS builds. That local edit can block `git pull` even though
+this broadcast stack does not build C++. Restore `CMakeLists.txt` before pulling.
+If you also run the SFU server on this VPS, reapply the VPS-only server build
+edit after pulling:
+
+```bash
+sed -i 's/^include(cmake\/client.cmake)/# include(cmake\/client.cmake)/' CMakeLists.txt
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target server
+sudo systemctl restart jam-server
 ```
 
 If Git reports dubious ownership or permission denied inside `.git`, the repo
@@ -119,6 +134,7 @@ was probably cloned or uploaded as `root`. Fix ownership instead of only adding
 ```bash
 sudo chown -R jam:jam /home/jam/jam
 cd /home/jam/jam
+git restore CMakeLists.txt
 git pull
 ```
 
@@ -228,6 +244,10 @@ Expected facts:
 - `"hls":true`
 - `"authHTTPAddress":"https://.../broadcast/auth"`
 
+The authenticated compose override mounts the VPS CA bundle into the MediaMTX
+container. Without that, HTTPS auth can fail with `x509: certificate signed by
+unknown authority` when MediaMTX calls the Convex `/broadcast/auth` endpoint.
+
 Check logs:
 
 ```bash
@@ -258,7 +278,38 @@ http://%VPS_HOST%:8080/hls/<room-handle>/stream.m3u8
 Do not expect that URL to work until a broadcaster is actively publishing that
 room path.
 
-## 8. Start, stop, restart
+## 8. Configure Convex listener URLs
+
+After DNS points at the VPS, configure Convex to issue VPS listener URLs instead
+of local `127.0.0.1` URLs.
+
+For the current throwaway domain:
+
+```text
+http://listen.welor.fun:8080/hls/<room-handle>/stream.m3u8
+srt://listen.welor.fun:8890
+```
+
+Run locally from the `jam-app` repo, using the Convex deployment that your
+desktop app is connected to:
+
+```bash
+npx convex env set LISTENER_PUBLIC_HLS_BASE_URL "http://listen.welor.fun:8080/hls"
+npx convex env set LISTENER_SRT_BASE_URL "srt://listen.welor.fun:8890"
+npx convex env set LISTENER_SRT_PASSPHRASE "jam-v3-publish-passphrase"
+```
+
+Verify:
+
+```bash
+npx convex env list
+```
+
+The app-backed authenticated path requires these Convex values and the VPS
+compose auth overlay. If Convex still returns `127.0.0.1`, the desktop app will
+try to publish/listen on the user's own machine instead of the VPS.
+
+## 9. Start, stop, restart
 
 Run on the VPS as `jam`:
 
@@ -294,12 +345,13 @@ docker logs jam-broadcast-mediamtx -f
 docker logs jam-broadcast-nginx -f
 ```
 
-## 9. Update after code changes
+## 10. Update after code changes
 
 Run on the VPS as `jam`:
 
 ```bash
 cd /home/jam/jam
+git restore CMakeLists.txt
 git pull
 set -a
 . /home/jam/jam/.env.broadcast
@@ -309,7 +361,7 @@ docker compose -f docker-compose.broadcast.yml -f docker-compose.broadcast.auth.
 docker ps --filter "name=jam-broadcast"
 ```
 
-## 10. Windows one-liners
+## 11. Windows one-liners
 
 Set these first in Windows `cmd`:
 
@@ -343,6 +395,12 @@ Restart broadcast stack:
 ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && set -a && . ./.env.broadcast && set +a && docker compose -f docker-compose.broadcast.yml -f docker-compose.broadcast.auth.yml restart"
 ```
 
+Deploy latest broadcast stack files:
+
+```bat
+ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git restore CMakeLists.txt && git pull && set -a && . ./.env.broadcast && set +a && docker compose -f docker-compose.broadcast.yml -f docker-compose.broadcast.auth.yml up -d && docker ps --filter name=jam-broadcast"
+```
+
 Stop broadcast stack:
 
 ```bat
@@ -361,5 +419,8 @@ ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && set -
 - Do not run the app-backed authenticated path without
   `docker-compose.broadcast.auth.yml`; Convex now issues per-session publish
   credentials in the SRT stream ID.
+- If MediaMTX logs `x509: certificate signed by unknown authority`, confirm the
+  VPS has `/etc/ssl/certs/ca-certificates.crt`, then recreate the stack with
+  both compose files so the CA bundle is mounted.
 - If HLS returns `404`, check that the broadcaster is running and publishing the
   same room handle that appears in the URL.
