@@ -256,12 +256,20 @@ Share only the generated client command with that friend.
 
 ## 7. Update after code changes
 
+The initial VPS server build comments out `include(cmake/client.cmake)` in
+`CMakeLists.txt`. That local edit is intentional for VPS builds, but it makes
+the Git working tree dirty. Before `git pull`, restore the tracked file, then
+reapply the VPS-only edit after pulling.
+
 If using git:
 
 ```bash
 ssh -i "$LOCAL_KEY" -p "$VPS_SSH_PORT" jam@"$VPS_HOST"
 cd /home/jam/jam
+git restore CMakeLists.txt
 git pull
+sed -i 's/^include(cmake\/client.cmake)/# include(cmake\/client.cmake)/' CMakeLists.txt
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target server
 sudo systemctl restart jam-server
 sudo systemctl status jam-server --no-pager
@@ -361,7 +369,7 @@ ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "sudo systemctl restart
 Deploy latest code and restart:
 
 ```bat
-ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git pull && cmake --build build --target server && sudo systemctl restart jam-server && sudo systemctl status jam-server --no-pager"
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git restore CMakeLists.txt && git pull && sed -i 's/^include(cmake\/client.cmake)/# include(cmake\/client.cmake)/' CMakeLists.txt && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build --target server && sudo systemctl restart jam-server && sudo systemctl status jam-server --no-pager"
 ```
 
 The commands with `sudo` use `-t` because they may need the `jam` password.
