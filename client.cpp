@@ -1796,6 +1796,148 @@ private:
         }
     }
 
+public:
+    void log_baseline_snapshot(const std::string& label) {
+        const auto latency = get_latency_info();
+        const auto callback = get_callback_timing_info();
+        const auto devices = get_device_info();
+        const auto encoder = get_encoder_info();
+        const auto participants = participant_manager_.get_all_info();
+        const auto ns_to_ms = [](int64_t ns) {
+            return static_cast<double>(ns) / 1'000'000.0;
+        };
+
+        Log::info(
+            "Baseline snapshot [{}]: platform={} arch={} codec={} audio_active={} "
+            "input='{}' input_api={} input_channels={} input_sample_rate={:.1f} "
+            "output='{}' output_api={} output_channels={} output_sample_rate={:.1f} "
+            "requested_frames={} actual_frames={} buffer_ms={:.3f} "
+            "backend_latency_available={} input_latency_ms={:.3f} output_latency_ms={:.3f} "
+            "callback_ms last/avg/max/deadline={:.3f}/{:.3f}/{:.3f}/{:.3f} "
+            "callback_count={} over_deadline={} "
+            "jitter_packets={} queue_limit={} age_limit_ms={} auto_jitter={} "
+            "tx_packets={} tx_drops pcm/opus={}/{} "
+            "sendq_ms pcm_last/avg/max={:.3f}/{:.3f}/{:.3f} "
+            "opus_last/avg/max={:.3f}/{:.3f}/{:.3f} "
+            "encode_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
+            "send_pace_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
+            "rx_decode_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
+            "rx_playout_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
+            "rtt_ms={:.3f} rx_bytes={} tx_bytes={} participants={} "
+            "encoder channels={} sample_rate={} bitrate={} actual_bitrate={} complexity={}",
+            label,
+            runtime_platform_name(),
+            runtime_arch_name(),
+            get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
+            is_audio_stream_active() ? "true" : "false",
+            devices.input_device_name,
+            devices.input_api,
+            devices.input_channels,
+            devices.input_sample_rate,
+            devices.output_device_name,
+            devices.output_api,
+            devices.output_channels,
+            devices.output_sample_rate,
+            latency.requested_buffer_frames,
+            latency.actual_buffer_frames,
+            latency.buffer_duration_ms,
+            latency.backend_latency_available ? "true" : "false",
+            latency.input_latency_ms,
+            latency.output_latency_ms,
+            callback.last_ms,
+            callback.avg_ms,
+            callback.max_ms,
+            callback.deadline_ms,
+            callback.callback_count,
+            callback.over_deadline_count,
+            get_opus_jitter_buffer_packets(),
+            get_opus_queue_limit_packets(),
+            get_jitter_packet_age_limit_ms(),
+            get_opus_auto_jitter_default() ? "true" : "false",
+            audio_tx_sequence_.load(std::memory_order_relaxed),
+            pcm_send_drops_.load(std::memory_order_relaxed),
+            opus_send_drops_.load(std::memory_order_relaxed),
+            ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(opus_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(tx_encode_last_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(tx_encode_avg_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(tx_encode_max_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(tx_send_pace_last_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(tx_send_pace_avg_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(tx_send_pace_max_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(rx_decode_last_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(rx_decode_avg_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(rx_decode_max_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(rx_playout_last_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(rx_playout_avg_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(rx_playout_max_ns_.load(std::memory_order_relaxed)),
+            get_rtt_ms(),
+            total_bytes_rx_.load(std::memory_order_relaxed),
+            total_bytes_tx_.load(std::memory_order_relaxed),
+            participants.size(),
+            encoder.channels,
+            encoder.sample_rate,
+            encoder.bitrate,
+            encoder.actual_bitrate,
+            encoder.complexity);
+
+        for (const auto& p: participants) {
+            Log::info(
+                "Baseline participant [{}] id={} profile='{}' name='{}' ready={} "
+                "queue={} queue_avg={} queue_max={} queue_drift={:.2f} "
+                "jitter_buffer={} jitter_floor={} queue_limit={} auto_jitter={} "
+                "auto_increases={} auto_decreases={} pkt_frames={} cb_frames={} "
+                "decoded_frames={} decoded_packets={} age_ms last/avg/max={:.1f}/{:.1f}/{:.1f} "
+                "drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} "
+                "pcm_hold={} pcm_drift_drops={} drops jitter_depth/jitter_age={}/{} "
+                "drop_detail limit/age/overflow/target={}/{}/{}/{} seq gap/late={}/{} "
+                "playout_ratio={:.4f} correction_callbacks={}",
+                label,
+                p.id,
+                p.profile_id,
+                p.display_name,
+                p.buffer_ready ? "true" : "false",
+                p.queue_size,
+                p.queue_size_avg,
+                p.queue_size_max,
+                p.queue_drift_packets,
+                p.jitter_buffer_min_packets,
+                p.jitter_buffer_floor_packets,
+                p.opus_queue_limit_packets,
+                p.opus_jitter_auto_enabled ? "true" : "false",
+                p.opus_jitter_auto_increases,
+                p.opus_jitter_auto_decreases,
+                p.last_packet_frame_count,
+                p.last_callback_frame_count,
+                p.opus_pcm_buffered_frames,
+                p.opus_packets_decoded_in_callback,
+                p.packet_age_last_ms,
+                p.packet_age_avg_ms,
+                p.packet_age_max_ms,
+                p.receiver_drift_ppm_last,
+                p.receiver_drift_ppm_avg,
+                p.receiver_drift_ppm_abs_max,
+                p.underrun_count,
+                p.pcm_concealment_frames,
+                p.pcm_drift_drops,
+                p.jitter_depth_drops,
+                p.jitter_age_drops,
+                p.opus_queue_limit_drops,
+                p.opus_age_limit_drops,
+                p.opus_decode_buffer_overflow_drops,
+                p.opus_target_trim_drops,
+                p.sequence_gaps,
+                p.sequence_late_or_reordered,
+                p.opus_playout_rate_ratio,
+                p.opus_rate_correction_callbacks);
+        }
+    }
+
+private:
     void handle_ctrl_message(std::size_t bytes) {
         // Add to total bytes received
         total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
@@ -4079,6 +4221,7 @@ struct ClientStartupOptions {
     std::string server_address = "127.0.0.1";
     short server_port = 9999;
     int requested_frames = 0;
+    std::string startup_latency_profile;
     std::optional<int> startup_jitter_packets;
     std::optional<int> startup_queue_limit_packets;
     std::optional<int> startup_age_limit_ms;
@@ -4088,6 +4231,9 @@ struct ClientStartupOptions {
     bool audio_open_smoke = false;
     bool low_latency_check = false;
     bool startup_config_smoke = false;
+    int baseline_snapshot_seconds = 0;
+    int baseline_snapshot_interval_seconds = 5;
+    std::string baseline_snapshot_label = "manual";
     std::optional<AudioCodec> startup_codec;
     std::string required_audio_api;
     std::string log_file_path;
@@ -4117,6 +4263,13 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.performer_join.join_token = argv[++i];
         } else if ((arg == "--frames" || arg == "--buffer-frames") && i + 1 < argc) {
             options.requested_frames = std::stoi(argv[++i]);
+        } else if ((arg == "--latency-profile" || arg == "--opus-latency-profile") &&
+                   i + 1 < argc) {
+            options.startup_latency_profile = argv[++i];
+            std::transform(options.startup_latency_profile.begin(),
+                           options.startup_latency_profile.end(),
+                           options.startup_latency_profile.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         } else if ((arg == "--jitter" || arg == "--opus-jitter") && i + 1 < argc) {
             options.startup_jitter_packets = std::stoi(argv[++i]);
         } else if ((arg == "--queue-limit" || arg == "--opus-queue-limit") && i + 1 < argc) {
@@ -4136,6 +4289,12 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.startup_config_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
+        } else if (arg == "--baseline-snapshot-seconds" && i + 1 < argc) {
+            options.baseline_snapshot_seconds = std::stoi(argv[++i]);
+        } else if (arg == "--baseline-snapshot-interval-seconds" && i + 1 < argc) {
+            options.baseline_snapshot_interval_seconds = std::stoi(argv[++i]);
+        } else if (arg == "--baseline-snapshot-label" && i + 1 < argc) {
+            options.baseline_snapshot_label = argv[++i];
         } else if (arg == "--codec" && i + 1 < argc) {
             std::string codec = argv[++i];
             std::transform(codec.begin(), codec.end(), codec.begin(),
@@ -4154,6 +4313,43 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
         }
     }
     return options;
+}
+
+bool apply_startup_latency_profile(Client& client,
+                                   const ClientStartupOptions& startup_options) {
+    if (startup_options.startup_latency_profile.empty() ||
+        startup_options.startup_latency_profile == "default") {
+        return true;
+    }
+
+    if (startup_options.startup_latency_profile != "low") {
+        Log::error("Unknown latency profile '{}'", startup_options.startup_latency_profile);
+        return false;
+    }
+
+    constexpr int low_jitter_packets = 3;
+    constexpr int low_queue_limit_packets = 24;
+    constexpr int low_age_limit_ms = 120;
+
+    if (!startup_options.startup_codec.has_value()) {
+        client.set_audio_codec(AudioCodec::Opus);
+    }
+    if (!startup_options.startup_jitter_packets.has_value()) {
+        client.set_opus_jitter_buffer_packets(low_jitter_packets);
+    }
+    if (!startup_options.startup_queue_limit_packets.has_value()) {
+        client.set_opus_queue_limit_packets(low_queue_limit_packets);
+    }
+    if (!startup_options.startup_age_limit_ms.has_value()) {
+        client.set_jitter_packet_age_limit_ms(low_age_limit_ms);
+    }
+    if (!startup_options.startup_auto_jitter &&
+        !startup_options.startup_disable_auto_jitter) {
+        client.set_opus_auto_jitter_default(false);
+    }
+
+    Log::info("Startup latency profile: low");
+    return true;
 }
 
 void print_audio_backend_inventory() {
@@ -4299,6 +4495,11 @@ int main(int argc, char** argv) {
             Log::info("Startup requested buffer override: {} frames",
                       startup_options.requested_frames);
         }
+        if (!apply_startup_latency_profile(client_instance, startup_options)) {
+            client_instance.stop_connection();
+            log.flush();
+            return 2;
+        }
         if (startup_options.startup_codec.has_value()) {
             client_instance.set_audio_codec(*startup_options.startup_codec);
             Log::info("Startup codec override: {}",
@@ -4372,8 +4573,29 @@ int main(int argc, char** argv) {
         // Run io_context in background thread (GLFW must be on main thread on macOS)
         std::thread io_thread([&io_context]() { io_context.run(); });
 
-        // Run UI on main thread (required for GLFW on macOS)
-        {
+        if (startup_options.baseline_snapshot_seconds > 0) {
+            const int interval_seconds =
+                std::max(1, startup_options.baseline_snapshot_interval_seconds);
+            const int total_seconds = std::max(1, startup_options.baseline_snapshot_seconds);
+            Log::info("Baseline snapshot run: label={} seconds={} interval_seconds={}",
+                      startup_options.baseline_snapshot_label, total_seconds, interval_seconds);
+            client_instance.log_baseline_snapshot(startup_options.baseline_snapshot_label +
+                                                  ":start");
+            Logger::instance().flush();
+
+            for (int elapsed_seconds = 0; elapsed_seconds < total_seconds;
+                 elapsed_seconds += interval_seconds) {
+                const int sleep_seconds = std::min(interval_seconds,
+                                                   total_seconds - elapsed_seconds);
+                std::this_thread::sleep_for(std::chrono::seconds(sleep_seconds));
+                const int snapshot_seconds = elapsed_seconds + sleep_seconds;
+                client_instance.log_baseline_snapshot(
+                    startup_options.baseline_snapshot_label + ":" +
+                    std::to_string(snapshot_seconds) + "s");
+                Logger::instance().flush();
+            }
+        } else {
+            // Run UI on main thread (required for GLFW on macOS)
             Gui app(810, 555, "Jam", false, 60);
 
             // Clean lambda - just delegates to separate function

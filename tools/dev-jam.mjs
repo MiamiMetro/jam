@@ -14,6 +14,7 @@ const DEV = {
   secret: "dev-secret",
   codec: "opus",
   frames: "120",
+  latencyProfile: process.env.JAM_DEV_LATENCY_PROFILE ?? "low",
   ttlMs: 10 * 60 * 1000,
   spamPackets: 1000,
   spamIntervalMs: 1,
@@ -99,7 +100,7 @@ if (command === "server") {
     process.exit(2);
   }
 
-  run(abs(DEV.clientExe), [
+  const args = [
     "--server",
     DEV.serverHost,
     "--port",
@@ -118,7 +119,11 @@ if (command === "server") {
     DEV.codec,
     "--frames",
     DEV.frames,
-  ]);
+  ];
+  if (DEV.latencyProfile) {
+    args.push("--latency-profile", DEV.latencyProfile);
+  }
+  run(abs(DEV.clientExe), args);
 } else if (command === "spam") {
   const socket = dgram.createSocket("udp4");
   const packet = Buffer.alloc(10);
