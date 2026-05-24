@@ -3252,24 +3252,12 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Codec:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        AudioCodec current_codec = client.get_audio_codec();
-        int codec_choice = current_codec == AudioCodec::PcmInt16 ? 0 : 1;
-        if (ImGui::RadioButton("PCM LAN/exp##codec", codec_choice == 0)) {
-            client.set_audio_codec(AudioCodec::PcmInt16);
-        }
+        const AudioCodec current_codec = client.get_audio_codec();
+        ImGui::Text("%s", current_codec == AudioCodec::Opus ? "Opus" : "PCM (startup flag)");
         JamGui::ShowTooltipOnHover(
-            "Uncompressed reference/LAN mode; cross-machine PCM is still experimental");
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        if (ImGui::RadioButton("Opus##codec", codec_choice == 1)) {
-            const int previous_buffer_frames = client.get_audio_config().frames_per_buffer;
-            client.set_audio_codec(AudioCodec::Opus);
-            if (client.is_audio_stream_active() &&
-                client.get_audio_config().frames_per_buffer != previous_buffer_frames) {
-                client.swap_audio_devices(client.get_selected_input_device(),
-                                          client.get_selected_output_device());
-            }
-        }
-        JamGui::ShowTooltipOnHover("Compressed internet mode; production candidate at 120 frames");
+            current_codec == AudioCodec::Opus
+                ? "Compressed internet mode"
+                : "PCM is only available through startup flags");
 
         ImGui::Spacing();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
@@ -4317,40 +4305,45 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
 
 bool apply_startup_latency_profile(Client& client,
                                    const ClientStartupOptions& startup_options) {
-    if (startup_options.startup_latency_profile.empty() ||
-        startup_options.startup_latency_profile == "balanced" ||
-        startup_options.startup_latency_profile == "current" ||
-        startup_options.startup_latency_profile == "default") {
+    if (startup_options.startup_latency_profile.empty()) {
         return true;
     }
 
-    if (startup_options.startup_latency_profile != "low") {
+    const bool low_profile = startup_options.startup_latency_profile == "low";
+    const bool balanced_profile = startup_options.startup_latency_profile == "balanced" ||
+                                  startup_options.startup_latency_profile == "current" ||
+                                  startup_options.startup_latency_profile == "default";
+    if (!low_profile && !balanced_profile) {
         Log::error("Unknown latency profile '{}'", startup_options.startup_latency_profile);
         return false;
     }
 
-    constexpr int low_jitter_packets = 3;
-    constexpr int low_queue_limit_packets = 24;
-    constexpr int low_age_limit_ms = 120;
+    const int jitter_packets =
+        low_profile ? 3 : static_cast<int>(DEFAULT_OPUS_JITTER_PACKETS);
+    const int queue_limit_packets =
+        low_profile ? 24 : static_cast<int>(DEFAULT_OPUS_QUEUE_LIMIT_PACKETS);
+    const int age_limit_ms = low_profile ? 120 : DEFAULT_JITTER_PACKET_AGE_MS;
+    const bool auto_jitter = !low_profile;
 
     if (!startup_options.startup_codec.has_value()) {
         client.set_audio_codec(AudioCodec::Opus);
     }
     if (!startup_options.startup_jitter_packets.has_value()) {
-        client.set_opus_jitter_buffer_packets(low_jitter_packets);
+        client.set_opus_jitter_buffer_packets(jitter_packets);
     }
     if (!startup_options.startup_queue_limit_packets.has_value()) {
-        client.set_opus_queue_limit_packets(low_queue_limit_packets);
+        client.set_opus_queue_limit_packets(queue_limit_packets);
     }
     if (!startup_options.startup_age_limit_ms.has_value()) {
-        client.set_jitter_packet_age_limit_ms(low_age_limit_ms);
+        client.set_jitter_packet_age_limit_ms(age_limit_ms);
     }
     if (!startup_options.startup_auto_jitter &&
         !startup_options.startup_disable_auto_jitter) {
-        client.set_opus_auto_jitter_default(false);
+        client.set_opus_auto_jitter_default(auto_jitter);
     }
 
-    Log::info("Startup latency profile: low");
+    Log::info("Startup latency profile: {}",
+              low_profile ? "low" : "balanced");
     return true;
 }
 
