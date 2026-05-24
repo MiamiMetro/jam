@@ -125,7 +125,7 @@ function usage() {
     [
       "usage:",
       "  node tools/baseline.mjs [--seconds 30] [--frames 120] [--codec opus]",
-      "                          [--latency-profile low]",
+      "                          [--latency-profile low|balanced]",
       "                          [--jitter 4] [--queue-limit 24]",
       "                          [--age-limit-ms 120] [--auto-jitter|--no-auto-jitter]",
       "  node tools/baseline.mjs --skip-local",

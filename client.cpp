@@ -4221,7 +4221,7 @@ struct ClientStartupOptions {
     std::string server_address = "127.0.0.1";
     short server_port = 9999;
     int requested_frames = 0;
-    std::string startup_latency_profile;
+    std::string startup_latency_profile = "low";
     std::optional<int> startup_jitter_packets;
     std::optional<int> startup_queue_limit_packets;
     std::optional<int> startup_age_limit_ms;
@@ -4318,6 +4318,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
 bool apply_startup_latency_profile(Client& client,
                                    const ClientStartupOptions& startup_options) {
     if (startup_options.startup_latency_profile.empty() ||
+        startup_options.startup_latency_profile == "balanced" ||
+        startup_options.startup_latency_profile == "current" ||
         startup_options.startup_latency_profile == "default") {
         return true;
     }
