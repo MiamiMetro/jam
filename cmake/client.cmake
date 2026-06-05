@@ -35,7 +35,6 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(JUCE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(JUCE_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
-set(JUCE_ENABLE_MODULE_SOURCE_GROUPS ON CACHE BOOL "" FORCE)
 find_package(OpenGL REQUIRED)
 
 FetchContent_MakeAvailable(juce imgui glfw)
@@ -116,4 +115,3 @@ target_link_libraries(client PRIVATE
     juce::juce_core
     juce::juce_events
 )
-
