@@ -1662,6 +1662,27 @@ Verification:
 - `cmake --build build --target client`
 - `cmake --build build --target latency_probe`
 
+### 2026-06-05 JUCE Audio Backend Validation
+
+Scope:
+- JUCE is now the only active client audio backend; scoped active-code search found no `RtAudio`/`rtaudio`/`RTAUDIO` references in `audio_stream.h`, `audio_stream.cpp`, `juce_audio_backend.h`, `juce_audio_backend.cpp`, `cmake/client.cmake`, or `client.cpp`.
+
+Local Windows automated validation:
+- `cmake --build build --config Release --target client audio_backend_policy_self_test juce_audio_adapter_self_test audio_analysis_self_test client_manager_self_test recording_writer_self_test`: passed.
+- `audio_backend_policy_self_test.exe`: passed.
+- `juce_audio_adapter_self_test.exe`: passed.
+- `audio_analysis_self_test.exe`: passed with no stdout.
+- `client_manager_self_test.exe`: passed.
+- `recording_writer_self_test.exe`: passed.
+- `client.exe --list-audio-devices`: passed; enumerated Windows Audio, Windows Audio (Exclusive Mode), and Windows Audio (Low Latency Mode) devices.
+- `client.exe --audio-open-smoke --frames 240`: passed at 48000 Hz; requested 240 frames, actual buffer 480 frames / 10.000 ms.
+- `client.exe --audio-open-smoke --frames 120`: passed at 48000 Hz; requested 120 frames, actual buffer 480 frames / 10.000 ms.
+
+Manual/hardware validation:
+- Windows real ASIO driver check: pending/not run on this machine; this validation did not enumerate or open an ASIO device. Earlier Task 4 reported `JUCE ASIO support: 0` and `JUCE JACK support: 0` because headers were not found.
+- macOS CoreAudio: pending/not run; this validation was performed on Windows.
+- GUI manual regression: pending/not run.
+
 Two-minute hidden-client validation:
 - Command shape: two `client --frames 120 --codec opus` processes through local `server.exe`, stdout/stderr redirected to `validation_logs/`.
 - Logs:
