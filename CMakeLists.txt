@@ -48,3 +48,5 @@ target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)
 add_executable(audio_analysis_self_test audio_analysis_self_test.cpp)
 
 add_executable(audio_backend_policy_self_test audio_backend_policy_self_test.cpp)
+
+add_executable(juce_audio_adapter_self_test juce_audio_adapter_self_test.cpp)
