@@ -20,8 +20,8 @@ int main() {
             "Low-latency Opus network packet must be 120 frames");
     require(opus_network_clock::STABLE_FRAME_COUNT == 240,
             "Stable Opus network packet must be 240 frames");
-    require(opus_network_clock::DEFAULT_FRAME_COUNT == 120,
-            "Default Opus network packet must be 120 frames");
+    require(opus_network_clock::DEFAULT_FRAME_COUNT == 240,
+            "Default Opus network packet must be 240 frames");
     require(opus_network_clock::is_supported_frame_count(opus_network_clock::SAMPLE_RATE, 120),
             "120-frame Opus network packets must be supported");
     require(opus_network_clock::is_supported_frame_count(opus_network_clock::SAMPLE_RATE, 240),
