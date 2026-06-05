@@ -8,28 +8,47 @@
 
 namespace audio_backend {
 
+enum class Platform {
+    windows,
+    macos,
+    linux,
+};
+
+inline int rank_api_for_platform(Platform platform, const std::string& api_name) {
+    switch (platform) {
+    case Platform::windows:
+        if (api_name == "ASIO") {
+            return 0;
+        }
+        if (api_name.find("WASAPI") != std::string::npos) {
+            return 1;
+        }
+        return 100;
+    case Platform::macos:
+        if (api_name == "CoreAudio") {
+            return 0;
+        }
+        return 100;
+    case Platform::linux:
+        if (api_name == "JACK") {
+            return 0;
+        }
+        if (api_name == "ALSA") {
+            return 1;
+        }
+        return 100;
+    }
+
+    return 100;
+}
+
 inline int rank_api_for_platform(const std::string& api_name) {
 #if defined(_WIN32)
-    if (api_name == "ASIO") {
-        return 0;
-    }
-    if (api_name.find("WASAPI") != std::string::npos) {
-        return 1;
-    }
-    return 100;
+    return rank_api_for_platform(Platform::windows, api_name);
 #elif defined(__APPLE__)
-    if (api_name == "CoreAudio") {
-        return 0;
-    }
-    return 100;
+    return rank_api_for_platform(Platform::macos, api_name);
 #else
-    if (api_name == "JACK") {
-        return 0;
-    }
-    if (api_name == "ALSA") {
-        return 1;
-    }
-    return 100;
+    return rank_api_for_platform(Platform::linux, api_name);
 #endif
 }
 

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -29,6 +30,51 @@ AudioDeviceInfo device(AudioDeviceId id, std::string api, bool input, bool outpu
 }
 
 int main() {
+    require(AudioConfig::DEFAULT_SAMPLE_RATE == 48000,
+            "AudioConfig must expose DEFAULT_SAMPLE_RATE");
+    require(AudioConfig::DEFAULT_BITRATE == 96000,
+            "AudioConfig must expose DEFAULT_BITRATE");
+    require(AudioConfig::DEFAULT_COMPLEXITY == 5,
+            "AudioConfig must expose DEFAULT_COMPLEXITY");
+    require(AudioConfig::DEFAULT_FRAMES_PER_BUFFER == 240,
+            "AudioConfig must expose DEFAULT_FRAMES_PER_BUFFER");
+    require(AudioConfig::DEFAULT_INPUT_GAIN == 1.0F,
+            "AudioConfig must expose DEFAULT_INPUT_GAIN");
+    require(AudioConfig::DEFAULT_OUTPUT_GAIN == 1.0F,
+            "AudioConfig must expose DEFAULT_OUTPUT_GAIN");
+    require(std::is_same_v<decltype(AudioDeviceInfo{}.api_index), int>,
+            "AudioDeviceInfo::api_index must be int");
+    require(AudioDeviceInfo{}.api_index == -1,
+            "AudioDeviceInfo::api_index must default to -1");
+    require(std::is_same_v<decltype(AudioApiInfo{}.index), int>,
+            "AudioApiInfo::index must be int");
+    require(AudioApiInfo{}.index == -1,
+            "AudioApiInfo::index must default to -1");
+    require(std::is_same_v<decltype(AudioLatencyInfo{}.sample_rate), double>,
+            "AudioLatencyInfo::sample_rate must be double");
+    require(std::is_same_v<decltype(AudioLatencyInfo{}.requested_buffer_frames), int>,
+            "AudioLatencyInfo::requested_buffer_frames must be int");
+    require(std::is_same_v<decltype(AudioLatencyInfo{}.actual_buffer_frames), int>,
+            "AudioLatencyInfo::actual_buffer_frames must be int");
+
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "ASIO")
+                <= audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "WASAPI"),
+            "ASIO must rank no worse than WASAPI on Windows");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "ASIO") == 0,
+            "ASIO must be preferred on Windows");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "Windows WASAPI") == 1,
+            "WASAPI-containing names must be second on Windows");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::macos, "CoreAudio") == 0,
+            "CoreAudio must be preferred on macOS");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::macos, "ASIO") == 100,
+            "non-CoreAudio APIs must be fallback-ranked on macOS");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux, "JACK") == 0,
+            "JACK must be preferred on Linux");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux, "ALSA") == 1,
+            "ALSA must be second on Linux");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux, "PulseAudio") == 100,
+            "other APIs must be fallback-ranked on Linux");
+
     std::vector<AudioDeviceInfo> windows_devices{
         device(1, "WASAPI", true, false, true, false),
         device(2, "WASAPI", false, true, false, true),
@@ -37,10 +83,10 @@ int main() {
 
     require(audio_backend::rank_api_for_platform("ASIO") <= audio_backend::rank_api_for_platform("WASAPI"),
             "ASIO must rank no worse than WASAPI on Windows builds");
-    require(audio_backend::choose_default_input_device(windows_devices) != AUDIO_NO_DEVICE,
-            "input selection must find a valid device");
-    require(audio_backend::choose_default_output_device(windows_devices) != AUDIO_NO_DEVICE,
-            "output selection must find a valid device");
+    require(audio_backend::choose_default_input_device(windows_devices) == 3,
+            "input selection must prefer ASIO over WASAPI");
+    require(audio_backend::choose_default_output_device(windows_devices) == 3,
+            "output selection must prefer ASIO over WASAPI");
 
     std::vector<AudioDeviceInfo> single_api_devices{
         device(10, "WASAPI", true, false, true, false),

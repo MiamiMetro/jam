@@ -13,19 +13,26 @@ using AudioCallback = int (*)(const void* input,
                               void* user_data);
 
 struct AudioConfig {
-    int sample_rate = 48000;
-    int bitrate = 96000;
-    int complexity = 5;
-    unsigned long frames_per_buffer = 240;
-    float input_gain = 1.0F;
-    float output_gain = 1.0F;
+    static constexpr int DEFAULT_SAMPLE_RATE = 48000;
+    static constexpr int DEFAULT_BITRATE = 96000;
+    static constexpr int DEFAULT_COMPLEXITY = 5;
+    static constexpr int DEFAULT_FRAMES_PER_BUFFER = 240;
+    static constexpr float DEFAULT_INPUT_GAIN = 1.0F;
+    static constexpr float DEFAULT_OUTPUT_GAIN = 1.0F;
+
+    int sample_rate = DEFAULT_SAMPLE_RATE;
+    int bitrate = DEFAULT_BITRATE;
+    int complexity = DEFAULT_COMPLEXITY;
+    unsigned long frames_per_buffer = DEFAULT_FRAMES_PER_BUFFER;
+    float input_gain = DEFAULT_INPUT_GAIN;
+    float output_gain = DEFAULT_OUTPUT_GAIN;
 };
 
 struct AudioDeviceInfo {
     AudioDeviceId id = AUDIO_NO_DEVICE;
     std::string name;
     std::string api_name;
-    unsigned int api_index = 0;
+    int api_index = -1;
     unsigned int max_input_channels = 0;
     unsigned int max_output_channels = 0;
     double default_sample_rate = 0.0;
@@ -34,7 +41,7 @@ struct AudioDeviceInfo {
 };
 
 struct AudioApiInfo {
-    unsigned int index = 0;
+    int index = -1;
     std::string name;
     AudioDeviceId default_input_device = AUDIO_NO_DEVICE;
     AudioDeviceId default_output_device = AUDIO_NO_DEVICE;
@@ -43,9 +50,9 @@ struct AudioApiInfo {
 struct AudioLatencyInfo {
     double input_latency_ms = 0.0;
     double output_latency_ms = 0.0;
-    int sample_rate = 0;
-    unsigned long requested_buffer_frames = 0;
-    unsigned long actual_buffer_frames = 0;
+    double sample_rate = 0.0;
+    int requested_buffer_frames = 0;
+    int actual_buffer_frames = 0;
     double buffer_duration_ms = 0.0;
     bool backend_latency_available = false;
 };
