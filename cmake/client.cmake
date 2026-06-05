@@ -39,7 +39,15 @@ find_package(OpenGL REQUIRED)
 
 FetchContent_MakeAvailable(juce imgui glfw)
 
-find_path(ASIO_SDK_INCLUDE_DIR iasiodrv.h)
+find_path(ASIO_SDK_INCLUDE_DIR
+    NAMES iasiodrv.h
+    PATHS
+        "$ENV{ASIO_SDK_DIR}"
+        "$ENV{ASIOSDK_DIR}"
+        "C:/ASIOSDK"
+        "C:/ASIO SDK"
+    PATH_SUFFIXES common
+)
 find_path(JACK_INCLUDE_DIR jack/jack.h)
 
 set(JUCE_CLIENT_ENABLE_ASIO 0)
