@@ -360,6 +360,14 @@ public:
         return mic_muted_.load(std::memory_order_acquire);
     }
 
+    void set_self_monitor_enabled(bool enabled) {
+        self_monitor_enabled_.store(enabled, std::memory_order_release);
+    }
+
+    bool get_self_monitor_enabled() const {
+        return self_monitor_enabled_.load(std::memory_order_acquire);
+    }
+
     // Master input gain control (0.0 - 2.0, 1.0 = unity)
     void set_input_gain(float gain) {
         input_gain_.store(std::clamp(gain, 0.0F, 2.0F), std::memory_order_release);
@@ -2938,6 +2946,15 @@ private:
         }
 
         client->enqueue_broadcast_mix(output_buffer, input_buffer, frame_count, out_channels);
+        if (client->self_monitor_enabled_.load(std::memory_order_acquire) &&
+            input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
+            const float input_gain = client->input_gain_.load(std::memory_order_acquire);
+            audio_analysis::mix_local_monitor(output_buffer, input_buffer, frame_count,
+                                              out_channels, input_gain);
+            for (unsigned long i = 0; i < frame_count * out_channels; ++i) {
+                output_buffer[i] = std::clamp(output_buffer[i], -1.0F, 1.0F);
+            }
+        }
         client->mix_metronome_click(output_buffer, frame_count, out_channels);
         client->record_master_mix(output_buffer, frame_count, out_channels);
 
@@ -3110,6 +3127,7 @@ private:
 
     // Microphone mute (thread-safe with atomic)
     std::atomic<bool> mic_muted_{false};  // Mute mic (doesn't send to server)
+    std::atomic<bool> self_monitor_enabled_{false};
 
     // Master input gain (thread-safe with atomic) - 1.0 = unity
     std::atomic<float> input_gain_{1.0F};
@@ -3213,6 +3231,13 @@ static void draw_master_strip(Client& client, float available_height) {
         }
         JamGui::ShowTooltipOnHover("Click to toggle microphone mute");
         ImGui::PopStyleColor(2);
+
+        bool self_monitor = client.get_self_monitor_enabled();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        if (ImGui::Checkbox("Monitor##SelfMonitor", &self_monitor)) {
+            client.set_self_monitor_enabled(self_monitor);
+        }
+        JamGui::ShowTooltipOnHover("Hear your microphone in the local output");
 
         ImGui::Spacing();
 

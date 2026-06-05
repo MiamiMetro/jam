@@ -61,4 +61,16 @@ inline void mix_mono_to_stereo(float* output, const float* input, size_t frame_c
     }
 }
 
+inline void mix_local_monitor(float* output, const float* input, size_t frame_count,
+                              size_t out_channels, float gain) {
+    if (output == nullptr || input == nullptr || frame_count == 0 || out_channels == 0) {
+        return;
+    }
+    if (out_channels == 1) {
+        mix_with_gain(output, input, frame_count, gain);
+        return;
+    }
+    mix_mono_to_stereo(output, input, frame_count, out_channels, gain);
+}
+
 }  // namespace audio_analysis

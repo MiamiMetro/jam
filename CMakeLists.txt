@@ -44,3 +44,5 @@ target_link_libraries(multi_participant_jitter_probe PRIVATE asio)
 
 add_executable(recording_writer_self_test recording_writer_self_test.cpp)
 target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)
+
+add_executable(audio_analysis_self_test audio_analysis_self_test.cpp)
