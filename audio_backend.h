@@ -23,7 +23,7 @@ struct AudioConfig {
     int sample_rate = DEFAULT_SAMPLE_RATE;
     int bitrate = DEFAULT_BITRATE;
     int complexity = DEFAULT_COMPLEXITY;
-    unsigned long frames_per_buffer = DEFAULT_FRAMES_PER_BUFFER;
+    int frames_per_buffer = DEFAULT_FRAMES_PER_BUFFER;
     float input_gain = DEFAULT_INPUT_GAIN;
     float output_gain = DEFAULT_OUTPUT_GAIN;
 };
@@ -33,8 +33,8 @@ struct AudioDeviceInfo {
     std::string name;
     std::string api_name;
     int api_index = -1;
-    unsigned int max_input_channels = 0;
-    unsigned int max_output_channels = 0;
+    int max_input_channels = 0;
+    int max_output_channels = 0;
     double default_sample_rate = 0.0;
     bool is_default_input = false;
     bool is_default_output = false;
