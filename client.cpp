@@ -46,6 +46,7 @@
 #include "audio_stream.h"
 #include "gui.h"
 #include "jam_broadcast_ipc.h"
+#include "join_reliability.h"
 #include "logger.h"
 #include "message_validator.h"
 #include "opus_decoder.h"
@@ -122,6 +123,7 @@ public:
           selected_input_device_(AudioStream::NO_DEVICE),
           selected_output_device_(AudioStream::NO_DEVICE),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
+          join_retry_timer_(io_context, 1s, [this]() { join_retry_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
           cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
         Log::info("Client local port: {}", socket_.local_endpoint().port());
@@ -172,6 +174,7 @@ public:
 
         Log::info("Resolved to: {}:{}", server_endpoint_.address().to_string(),
                   server_endpoint_.port());
+        join_state_.reset();
 
         do_receive();
 
@@ -191,6 +194,7 @@ public:
         write_fixed(join.join_token, performer_join_options_.join_token);
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinHdr));
         std::memcpy(buf->data(), &join, sizeof(JoinHdr));
+        join_state_.mark_join_sent(std::chrono::steady_clock::now());
         send(buf->data(), buf->size(), buf);
         Log::info("Sent JOIN for room '{}' user '{}' token {}", performer_join_options_.room_id,
                   performer_join_options_.user_id,
@@ -1033,6 +1037,9 @@ private:
         while (pcm_sender_running_.load(std::memory_order_acquire)) {
             PcmSendFrame frame;
             if (pcm_send_queue_.try_dequeue(frame)) {
+                if (!join_state_.can_send_audio()) {
+                    continue;
+                }
                 observe_pcm_send_queue_age(frame.capture_time);
                 uint32_t seq = audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
                 auto packet = audio_packet::create_audio_packet_v2(
@@ -1045,6 +1052,9 @@ private:
 
             OpusSendFrame opus_frame;
             if (opus_send_queue_.try_dequeue(opus_frame)) {
+                if (!join_state_.can_send_audio()) {
+                    continue;
+                }
                 observe_opus_send_queue_age(opus_frame.capture_time);
                 std::vector<unsigned char> encoded_data;
                 const auto encode_start = std::chrono::steady_clock::now();
@@ -1640,6 +1650,12 @@ private:
     }
 
     void alive_timer_callback() {
+        if (!join_state_.is_join_confirmed()) {
+            send_join();
+            log_audio_diagnostics();
+            return;
+        }
+
         CtrlHdr chdr{};
         chdr.magic = CTRL_MAGIC;
         chdr.type  = CtrlHdr::Cmd::ALIVE;
@@ -1647,6 +1663,16 @@ private:
         std::memcpy(buf->data(), &chdr, sizeof(CtrlHdr));
         send(buf->data(), buf->size(), buf);
         log_audio_diagnostics();
+    }
+
+    void join_retry_timer_callback() {
+        if (server_endpoint_.port() == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (join_state_.should_send_join(now)) {
+            send_join();
+        }
     }
 
     void log_audio_diagnostics() {
@@ -1972,12 +1998,35 @@ private:
                 std::memcpy(&info, recv_buf_.data(), sizeof(ParticipantInfoHdr));
                 const auto profile_id = fixed_string(info.profile_id);
                 const auto display_name = fixed_string(info.display_name);
+                if (!join_state_.is_join_confirmed()) {
+                    join_state_.mark_join_ack(info.participant_id);
+                    Log::info("JOIN confirmed by participant metadata (participant ID: {})",
+                              info.participant_id);
+                }
                 participant_manager_.set_participant_metadata(info.participant_id, profile_id,
                                                               display_name);
                 recording_writer_.set_participant_metadata(info.participant_id, profile_id,
                                                            display_name);
                 Log::info("Participant {} metadata: user='{}' display='{}'", info.participant_id,
                           profile_id, display_name);
+                break;
+            }
+            case CtrlHdr::Cmd::JOIN_ACK: {
+                join_state_.mark_join_ack(chdr.participant_id);
+                Log::info("JOIN acknowledged by server (participant ID: {})",
+                          chdr.participant_id);
+                break;
+            }
+            case CtrlHdr::Cmd::JOIN_REQUIRED: {
+                join_state_.mark_join_required();
+                PcmSendFrame discarded_pcm;
+                while (pcm_send_queue_.try_dequeue(discarded_pcm)) {
+                }
+                OpusSendFrame discarded_opus;
+                while (opus_send_queue_.try_dequeue(discarded_opus)) {
+                }
+                Log::warn("Server requested JOIN refresh; resending JOIN");
+                send_join();
                 break;
             }
             case CtrlHdr::Cmd::METRONOME_SYNC: {
@@ -2960,7 +3009,7 @@ private:
 
         // Encode and send own audio (always send to maintain timing, even if silence)
         // Mix WAV with microphone input before encoding
-        if (client->audio_.is_stream_active()) {
+        if (client->audio_.is_stream_active() && client->join_state_.can_send_audio()) {
             if (client->audio_codec_.load(std::memory_order_acquire) == AudioCodec::PcmInt16) {
                 client->opus_tx_accumulated_frames_ = 0;
 
@@ -3044,6 +3093,7 @@ private:
     udp::socket       socket_;
     udp::endpoint     server_endpoint_;
     PerformerJoinOptions performer_join_options_;
+    join_reliability::State join_state_{1s};
 
     std::array<char, 1024>         recv_buf_;
     std::array<unsigned char, 128> sync_tx_buf_;
@@ -3177,6 +3227,7 @@ private:
     AudioStream::DeviceIndex selected_output_device_;
 
     PeriodicTimer ping_timer_;
+    PeriodicTimer join_retry_timer_;
     PeriodicTimer alive_timer_;
     PeriodicTimer cleanup_timer_;
 };

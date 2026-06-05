@@ -144,6 +144,7 @@ private:
     struct UnknownEndpointInfo {
         std::chrono::steady_clock::time_point first_seen;
         std::chrono::steady_clock::time_point last_seen;
+        std::chrono::steady_clock::time_point last_join_required_sent;
         uint64_t                              drops = 0;
         bool                                  first_log_emitted = false;
     };
@@ -200,7 +201,11 @@ private:
                 break;
             }
             case CtrlHdr::Cmd::ALIVE: {
-                client_manager_.update_alive(remote_endpoint_, now);
+                if (client_manager_.exists(remote_endpoint_)) {
+                    client_manager_.update_alive(remote_endpoint_, now);
+                } else {
+                    send_join_required(remote_endpoint_);
+                }
                 break;
             }
             case CtrlHdr::Cmd::PARTICIPANT_LEAVE:
@@ -269,6 +274,7 @@ private:
                   remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
                   profile_id, display_name, role_name, client_id,
                   token.empty() ? "insecure-dev" : "token-present");
+        send_join_ack(remote_endpoint_, client_id);
         if (role == ClientRole::Performer) {
             broadcast_participant_info(remote_endpoint_, client_id, profile_id, display_name);
         }
@@ -318,6 +324,7 @@ private:
         if (!client_manager_.exists(remote_endpoint_)) {
             Log::warn("Dropping metronome sync from unjoined endpoint {}:{}",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            send_join_required(remote_endpoint_);
             return;
         }
 
@@ -353,7 +360,7 @@ private:
         if (it == unknown_endpoints_.end()) {
             if (unknown_endpoints_.size() < server_config::MAX_UNKNOWN_ENDPOINTS) {
                 auto [inserted_it, inserted] = unknown_endpoints_.emplace(
-                    endpoint, UnknownEndpointInfo{now, now, 0, false});
+                    endpoint, UnknownEndpointInfo{now, now, {}, 0, false});
                 it = inserted_it;
                 (void)inserted;
             }
@@ -362,6 +369,12 @@ private:
         if (it != unknown_endpoints_.end()) {
             it->second.last_seen = now;
             ++it->second.drops;
+            constexpr auto JOIN_REQUIRED_INTERVAL = 1s;
+            if (it->second.last_join_required_sent.time_since_epoch().count() == 0 ||
+                now - it->second.last_join_required_sent >= JOIN_REQUIRED_INTERVAL) {
+                send_join_required(endpoint);
+                it->second.last_join_required_sent = now;
+            }
             if (!it->second.first_log_emitted) {
                 Log::warn("Dropping audio from unjoined endpoint {}:{}",
                           endpoint.address().to_string(), endpoint.port());
@@ -414,6 +427,25 @@ private:
         for (const auto& endpoint: endpoints) {
             send(buf->data(), sizeof(CtrlHdr), endpoint, buf);
         }
+    }
+
+    void send_join_ack(const udp::endpoint& endpoint, uint32_t participant_id) {
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
+        CtrlHdr ack{};
+        ack.magic = CTRL_MAGIC;
+        ack.type = CtrlHdr::Cmd::JOIN_ACK;
+        ack.participant_id = participant_id;
+        std::memcpy(buf->data(), &ack, sizeof(CtrlHdr));
+        send(buf->data(), buf->size(), endpoint, buf);
+    }
+
+    void send_join_required(const udp::endpoint& endpoint) {
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
+        CtrlHdr required{};
+        required.magic = CTRL_MAGIC;
+        required.type = CtrlHdr::Cmd::JOIN_REQUIRED;
+        std::memcpy(buf->data(), &required, sizeof(CtrlHdr));
+        send(buf->data(), buf->size(), endpoint, buf);
     }
 
     void broadcast_participant_info(const udp::endpoint& joined_endpoint, uint32_t participant_id,

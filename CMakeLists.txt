@@ -29,6 +29,8 @@ target_link_libraries(jam_broadcaster PRIVATE asio spdlog::spdlog)
 add_executable(client_manager_self_test client_manager_self_test.cpp)
 target_link_libraries(client_manager_self_test PRIVATE asio)
 
+add_executable(join_reliability_self_test join_reliability_self_test.cpp)
+
 add_executable(opus_receiver_harness opus_receiver_harness.cpp)
 add_custom_target(opus_receiver_harness_self_test
     COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test

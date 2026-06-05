@@ -52,6 +52,8 @@ struct CtrlHdr : MsgHdr {
         PARTICIPANT_LEAVE = 4,  // Server broadcasts when participant leaves
         PARTICIPANT_INFO  = 6,  // Server broadcasts room-local participant metadata
         METRONOME_SYNC    = 7,  // Server relays room-local metronome state
+        JOIN_ACK          = 8,  // Server confirms that this endpoint is registered
+        JOIN_REQUIRED     = 9,  // Server asks an unknown endpoint to re-send JOIN
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
