@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <limits>
 #include <string>
 #include <vector>
@@ -56,6 +57,7 @@ public:
         std::string name;
         std::string api_name;
         int         api_index = -1;
+        RtAudio::Api rt_api = RtAudio::UNSPECIFIED;
         int         max_input_channels = 0;
         int         max_output_channels = 0;
         double      default_sample_rate = 0.0;
@@ -252,6 +254,26 @@ public:
         }
         auto output_info = *output_info_ptr;
 
+        if (input_info.max_input_channels <= 0) {
+            last_error_ = "Selected input device has no input channels";
+            Log::error("Selected input device has no input channels: {}", input_info.name);
+            return false;
+        }
+        if (output_info.max_output_channels <= 0) {
+            last_error_ = "Selected output device has no output channels";
+            Log::error("Selected output device has no output channels: {}", output_info.name);
+            return false;
+        }
+        if (input_info.rt_api != output_info.rt_api) {
+            last_error_ = "Input and output devices must use the same audio API";
+            Log::error("Input/output API mismatch: input={} output={}", input_info.api_name,
+                       output_info.api_name);
+            return false;
+        }
+
+        stop_audio_stream();
+        stream_ = std::make_unique<RtAudio>(output_info.rt_api);
+
         input_channel_count_  = std::min(input_info.max_input_channels, 1);
         output_channel_count_ = output_info.max_output_channels >= 2 ? 2 : 1;
         current_config_       = config;
@@ -278,25 +300,25 @@ public:
         Log::info("Sample rate: {} Hz", config.sample_rate);
         Log::info("Bitrate: {} bps", config.bitrate);
 
-        RtAudioErrorType open_result = stream_.openStream(
+        RtAudioErrorType open_result = stream_->openStream(
             &output_parameters, &input_parameters, RTAUDIO_FLOAT32,
             static_cast<unsigned int>(config.sample_rate), &buffer_frames,
             &AudioStream::rt_audio_callback, this, &options);
         if (open_result != RTAUDIO_NO_ERROR) {
-            last_error_ = std::string("RtAudio open failed: ") + stream_.getErrorText();
-            Log::error("RtAudio open failed: {}", stream_.getErrorText());
-            if (stream_.isStreamOpen()) {
-                stream_.closeStream();
+            last_error_ = std::string("RtAudio open failed: ") + stream_->getErrorText();
+            Log::error("RtAudio open failed: {}", stream_->getErrorText());
+            if (stream_->isStreamOpen()) {
+                stream_->closeStream();
             }
             return false;
         }
 
-        RtAudioErrorType start_result = stream_.startStream();
+        RtAudioErrorType start_result = stream_->startStream();
         if (start_result != RTAUDIO_NO_ERROR) {
-            last_error_ = std::string("RtAudio start failed: ") + stream_.getErrorText();
-            Log::error("RtAudio start failed: {}", stream_.getErrorText());
-            if (stream_.isStreamOpen()) {
-                stream_.closeStream();
+            last_error_ = std::string("RtAudio start failed: ") + stream_->getErrorText();
+            Log::error("RtAudio start failed: {}", stream_->getErrorText());
+            if (stream_->isStreamOpen()) {
+                stream_->closeStream();
             }
             return false;
         }
@@ -317,14 +339,17 @@ public:
 
     void stop_audio_stream() {
         stream_active_.store(false, std::memory_order_relaxed);
-        if (stream_.isStreamRunning()) {
-            RtAudioErrorType result = stream_.stopStream();
+        if (stream_ == nullptr) {
+            return;
+        }
+        if (stream_->isStreamRunning()) {
+            RtAudioErrorType result = stream_->stopStream();
             if (result != RTAUDIO_NO_ERROR) {
-                Log::warn("RtAudio stop failed: {}", stream_.getErrorText());
+                Log::warn("RtAudio stop failed: {}", stream_->getErrorText());
             }
         }
-        if (stream_.isStreamOpen()) {
-            stream_.closeStream();
+        if (stream_->isStreamOpen()) {
+            stream_->closeStream();
         }
     }
 
@@ -362,8 +387,8 @@ public:
                 static_cast<double>(current_config_.sample_rate);
         }
 
-        if (stream_.isStreamOpen() && current_config_.sample_rate > 0) {
-            unsigned int latency_frames = const_cast<RtAudio&>(stream_).getStreamLatency();
+        if (stream_ != nullptr && stream_->isStreamOpen() && current_config_.sample_rate > 0) {
+            unsigned int latency_frames = stream_->getStreamLatency();
             double total_latency_ms = static_cast<double>(latency_frames) * 1000.0 /
                                       static_cast<double>(current_config_.sample_rate);
             info.input_latency_ms  = total_latency_ms * 0.5;
@@ -403,6 +428,7 @@ private:
                     info.name = rt_info.name;
                     info.api_name = api.name;
                     info.api_index = api.index;
+                    info.rt_api = api.rt_api;
                     info.max_input_channels = static_cast<int>(rt_info.inputChannels);
                     info.max_output_channels = static_cast<int>(rt_info.outputChannels);
                     info.default_sample_rate = rt_info.preferredSampleRate;
@@ -452,12 +478,12 @@ private:
         return self->callback_(input_buffer, output_buffer, n_frames, self->callback_user_data_);
     }
 
-    RtAudio           stream_;
-    std::atomic<bool> stream_active_{false};
-    AudioConfig       current_config_;
-    AudioCallback     callback_ = nullptr;
-    void*             callback_user_data_ = nullptr;
-    unsigned int      actual_buffer_frames_ = 0;
+    std::unique_ptr<RtAudio> stream_;
+    std::atomic<bool>        stream_active_{false};
+    AudioConfig              current_config_;
+    AudioCallback            callback_ = nullptr;
+    void*                    callback_user_data_ = nullptr;
+    unsigned int             actual_buffer_frames_ = 0;
 
     int input_channel_count_;
     int output_channel_count_;

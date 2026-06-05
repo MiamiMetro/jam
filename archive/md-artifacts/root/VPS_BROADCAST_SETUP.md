@@ -389,6 +389,12 @@ Show nginx logs:
 ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "docker logs jam-broadcast-nginx --tail 100"
 ```
 
+Start broadcast stack:
+
+```bat
+ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && set -a && . ./.env.broadcast && set +a && docker compose -f docker-compose.broadcast.yml -f docker-compose.broadcast.auth.yml up -d && docker ps --filter name=jam-broadcast"
+```
+
 Restart broadcast stack:
 
 ```bat
