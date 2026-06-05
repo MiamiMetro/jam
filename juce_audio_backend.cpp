@@ -137,11 +137,13 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
     stop_audio_stream();
 
     current_config_ = config;
-    callback_ = callback;
-    callback_user_data_ = user_data;
-    input_channel_count_ = 1;
-    output_channel_count_ = output_info.max_output_channels >= 2 ? 2 : 1;
-    actual_buffer_frames_ = std::max(config.frames_per_buffer, 0);
+    callback_.store(callback, std::memory_order_release);
+    callback_user_data_.store(user_data, std::memory_order_release);
+    input_channel_count_.store(1, std::memory_order_release);
+    output_channel_count_.store(output_info.max_output_channels >= 2 ? 2 : 1,
+                                std::memory_order_release);
+    actual_buffer_frames_.store(std::max(config.frames_per_buffer, 0), std::memory_order_release);
+    prepare_callback_buffers(std::max(config.frames_per_buffer, 0));
 
     juce::AudioDeviceManager::AudioDeviceSetup setup;
     setup.inputDeviceName = device_name_for_id(input_device);
@@ -152,13 +154,14 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
     setup.useDefaultOutputChannels = false;
     setup.inputChannels.clear();
     setup.outputChannels.clear();
-    setup.inputChannels.setRange(0, input_channel_count_, true);
-    setup.outputChannels.setRange(0, output_channel_count_, true);
+    setup.inputChannels.setRange(0, input_channel_count_.load(std::memory_order_acquire), true);
+    setup.outputChannels.setRange(0, output_channel_count_.load(std::memory_order_acquire), true);
 
     device_manager_.setCurrentAudioDeviceType(type->getTypeName(), true);
 
-    auto error = device_manager_.initialise(input_channel_count_, output_channel_count_, nullptr,
-                                           false, {}, &setup);
+    auto error = device_manager_.initialise(input_channel_count_.load(std::memory_order_acquire),
+                                           output_channel_count_.load(std::memory_order_acquire),
+                                           nullptr, false, {}, &setup);
     if (juce_error(error)) {
         last_error_ = "JUCE audio initialise failed: " + to_std_string(error);
         device_manager_.closeAudioDevice();
@@ -172,11 +175,13 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
         return false;
     }
 
-    device_manager_.addAudioCallback(this);
-
     if (auto* current_device = device_manager_.getCurrentAudioDevice()) {
-        actual_buffer_frames_ = current_device->getCurrentBufferSizeSamples();
+        const auto current_buffer_size = current_device->getCurrentBufferSizeSamples();
+        actual_buffer_frames_.store(current_buffer_size, std::memory_order_release);
+        prepare_callback_buffers(current_buffer_size);
     }
+
+    device_manager_.addAudioCallback(this);
 
     stream_active_.store(true, std::memory_order_relaxed);
     last_error_.clear();
@@ -187,8 +192,8 @@ void JuceAudioBackend::stop_audio_stream() {
     stream_active_.store(false, std::memory_order_relaxed);
     device_manager_.removeAudioCallback(this);
     device_manager_.closeAudioDevice();
-    callback_ = nullptr;
-    callback_user_data_ = nullptr;
+    callback_.store(nullptr, std::memory_order_release);
+    callback_user_data_.store(nullptr, std::memory_order_release);
 }
 
 bool JuceAudioBackend::is_stream_active() const {
@@ -196,11 +201,11 @@ bool JuceAudioBackend::is_stream_active() const {
 }
 
 int JuceAudioBackend::get_input_channel_count() const {
-    return input_channel_count_;
+    return input_channel_count_.load(std::memory_order_acquire);
 }
 
 int JuceAudioBackend::get_output_channel_count() const {
-    return output_channel_count_;
+    return output_channel_count_.load(std::memory_order_acquire);
 }
 
 AudioConfig JuceAudioBackend::get_config() const {
@@ -211,10 +216,10 @@ AudioLatencyInfo JuceAudioBackend::get_latency_info() const {
     AudioLatencyInfo info;
     info.sample_rate = current_config_.sample_rate;
     info.requested_buffer_frames = current_config_.frames_per_buffer;
-    info.actual_buffer_frames = actual_buffer_frames_;
-    if (info.sample_rate > 0.0 && actual_buffer_frames_ > 0) {
+    info.actual_buffer_frames = actual_buffer_frames_.load(std::memory_order_acquire);
+    if (info.sample_rate > 0.0 && info.actual_buffer_frames > 0) {
         info.buffer_duration_ms =
-            static_cast<double>(actual_buffer_frames_) * 1000.0 / info.sample_rate;
+            static_cast<double>(info.actual_buffer_frames) * 1000.0 / info.sample_rate;
     }
 
     if (auto* device = device_manager_.getCurrentAudioDevice()) {
@@ -253,32 +258,53 @@ void JuceAudioBackend::audioDeviceIOCallbackWithContext(
     const float* const* input_channel_data, int num_input_channels,
     float* const* output_channel_data, int num_output_channels, int num_samples,
     const juce::AudioIODeviceCallbackContext&) {
+    const auto input_channels = std::max(input_channel_count_.load(std::memory_order_acquire), 1);
+    const auto output_channels = std::max(output_channel_count_.load(std::memory_order_acquire), 1);
+    const auto safe_num_samples = std::max(num_samples, 0);
+    const auto frames_to_process =
+        std::min<std::size_t>(static_cast<std::size_t>(safe_num_samples),
+                              callback_frame_capacity_);
+
+    for (int channel = 0; channel < num_output_channels; ++channel) {
+        if (output_channel_data != nullptr && output_channel_data[channel] != nullptr) {
+            std::fill_n(output_channel_data[channel], static_cast<std::size_t>(safe_num_samples),
+                        0.0F);
+        }
+    }
+
+    if (frames_to_process == 0) {
+        return;
+    }
+
     juce_audio_adapter::copy_first_input_to_interleaved(
-        input_channel_data, num_input_channels, num_samples, std::max(input_channel_count_, 1),
-        interleaved_input_);
+        input_channel_data, num_input_channels, static_cast<int>(frames_to_process),
+        input_channels, interleaved_input_.data(), interleaved_input_.size());
 
-    interleaved_output_.assign(static_cast<std::size_t>(std::max(num_samples, 0)) *
-                                   static_cast<std::size_t>(std::max(output_channel_count_, 1)),
-                               0.0F);
+    std::fill_n(interleaved_output_.data(),
+                frames_to_process * static_cast<std::size_t>(output_channels), 0.0F);
 
-    if (callback_ != nullptr) {
-        callback_(interleaved_input_.data(), interleaved_output_.data(),
-                  static_cast<unsigned long>(std::max(num_samples, 0)), callback_user_data_);
+    const auto callback = callback_.load(std::memory_order_acquire);
+    if (callback != nullptr) {
+        callback(interleaved_input_.data(), interleaved_output_.data(),
+                 static_cast<unsigned long>(frames_to_process),
+                 callback_user_data_.load(std::memory_order_acquire));
     }
 
     juce_audio_adapter::copy_interleaved_to_outputs(
-        interleaved_output_, num_samples, std::max(output_channel_count_, 1), output_channel_data,
-        num_output_channels);
+        interleaved_output_, static_cast<int>(frames_to_process), output_channels,
+        output_channel_data, num_output_channels);
 }
 
 void JuceAudioBackend::audioDeviceAboutToStart(juce::AudioIODevice* device) {
     if (device != nullptr) {
-        actual_buffer_frames_ = device->getCurrentBufferSizeSamples();
+        const auto current_buffer_size = device->getCurrentBufferSizeSamples();
+        actual_buffer_frames_.store(current_buffer_size, std::memory_order_release);
+        prepare_callback_buffers(current_buffer_size);
     }
 }
 
 void JuceAudioBackend::audioDeviceStopped() {
-    actual_buffer_frames_ = 0;
+    actual_buffer_frames_.store(0, std::memory_order_release);
     stream_active_.store(false, std::memory_order_relaxed);
 }
 
@@ -364,4 +390,15 @@ juce::String JuceAudioBackend::device_name_for_id(AudioDeviceId id) {
     }
 
     return names[device_index];
+}
+
+void JuceAudioBackend::prepare_callback_buffers(int frame_count) {
+    const auto frames = static_cast<std::size_t>(std::max(frame_count, 0));
+    callback_frame_capacity_ = frames;
+    interleaved_input_.resize(frames *
+                              static_cast<std::size_t>(
+                                  std::max(input_channel_count_.load(std::memory_order_acquire), 1)));
+    interleaved_output_.resize(frames *
+                               static_cast<std::size_t>(
+                                   std::max(output_channel_count_.load(std::memory_order_acquire), 1)));
 }

@@ -42,23 +42,19 @@ FetchContent_MakeAvailable(juce imgui glfw)
 
 find_path(ASIO_SDK_INCLUDE_DIR iasiodrv.h)
 find_path(JACK_INCLUDE_DIR jack/jack.h)
-set(JUCE_AUDIO_DEVICE_NATIVE_SDK_OVERRIDES "")
-if(WIN32 AND NOT ASIO_SDK_INCLUDE_DIR)
-    list(APPEND JUCE_AUDIO_DEVICE_NATIVE_SDK_OVERRIDES
-        "$<$<CXX_COMPILER_ID:MSVC>:/DJUCE_ASIO=0>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-DJUCE_ASIO=0>"
-    )
+
+set(JUCE_CLIENT_ENABLE_ASIO 0)
+if(WIN32 AND ASIO_SDK_INCLUDE_DIR)
+    set(JUCE_CLIENT_ENABLE_ASIO 1)
 endif()
-if(NOT JACK_INCLUDE_DIR)
-    list(APPEND JUCE_AUDIO_DEVICE_NATIVE_SDK_OVERRIDES
-        "$<$<CXX_COMPILER_ID:MSVC>:/DJUCE_JACK=0>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-DJUCE_JACK=0>"
-    )
+
+set(JUCE_CLIENT_ENABLE_JACK 0)
+if(JACK_INCLUDE_DIR)
+    set(JUCE_CLIENT_ENABLE_JACK 1)
 endif()
-if(JUCE_AUDIO_DEVICE_NATIVE_SDK_OVERRIDES)
-    set_source_files_properties(${juce_SOURCE_DIR}/modules/juce_audio_devices/juce_audio_devices.cpp
-        PROPERTIES COMPILE_OPTIONS "${JUCE_AUDIO_DEVICE_NATIVE_SDK_OVERRIDES}")
-endif()
+
+message(STATUS "JUCE ASIO support: ${JUCE_CLIENT_ENABLE_ASIO}")
+message(STATUS "JUCE JACK support: ${JUCE_CLIENT_ENABLE_JACK}")
 
 # ============================================================
 # Client Wrappers
@@ -92,10 +88,10 @@ add_executable(client
 
 target_compile_definitions(client PRIVATE
     JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1
-    JUCE_ASIO=1
+    JUCE_ASIO=${JUCE_CLIENT_ENABLE_ASIO}
     JUCE_WASAPI=1
     JUCE_DIRECTSOUND=0
-    JUCE_JACK=1
+    JUCE_JACK=${JUCE_CLIENT_ENABLE_JACK}
     JUCE_ALSA=1
     JUCE_USE_ANDROID_OBOE=1
     JUCE_WEB_BROWSER=0

@@ -3,8 +3,10 @@
 #include "audio_backend.h"
 
 #include <juce_audio_devices/juce_audio_devices.h>
+#include <juce_events/juce_events.h>
 
 #include <atomic>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -49,17 +51,20 @@ private:
     std::vector<AudioDeviceInfo> scan_devices(bool input);
     juce::AudioIODeviceType* find_type(int api_index);
     juce::String device_name_for_id(AudioDeviceId id);
+    void prepare_callback_buffers(int frame_count);
 
+    juce::ScopedJuceInitialiser_GUI juce_initialiser_;
     juce::AudioDeviceManager device_manager_;
     juce::OwnedArray<juce::AudioIODeviceType> device_types_;
     std::atomic<bool> stream_active_{false};
     AudioConfig current_config_;
-    AudioCallback callback_ = nullptr;
-    void* callback_user_data_ = nullptr;
+    std::atomic<AudioCallback> callback_{nullptr};
+    std::atomic<void*> callback_user_data_{nullptr};
     std::vector<float> interleaved_input_;
     std::vector<float> interleaved_output_;
-    int input_channel_count_ = 0;
-    int output_channel_count_ = 0;
-    int actual_buffer_frames_ = 0;
+    std::atomic<int> input_channel_count_{0};
+    std::atomic<int> output_channel_count_{0};
+    std::atomic<int> actual_buffer_frames_{0};
+    std::size_t callback_frame_capacity_ = 0;
     std::string last_error_;
 };

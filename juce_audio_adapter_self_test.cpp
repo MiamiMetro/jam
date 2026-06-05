@@ -75,6 +75,19 @@ void test_null_input_leaves_zeros()
     expect_vector(interleaved, {0.0F, 0.0F, 0.0F, 0.0F});
 }
 
+void test_fixed_buffer_input_interleaving()
+{
+    const std::array<float, 3> mono{0.25F, -0.5F, 0.75F};
+    const float* inputs[] = {mono.data()};
+    std::array<float, 6> interleaved{9.0F, 9.0F, 9.0F, 9.0F, 9.0F, 9.0F};
+
+    juce_audio_adapter::copy_first_input_to_interleaved(inputs, 1, 3, 2, interleaved.data(),
+                                                        interleaved.size());
+
+    expect_array({interleaved[0], interleaved[2], interleaved[4]}, {0.25F, -0.5F, 0.75F});
+    expect_array({interleaved[1], interleaved[3], interleaved[5]}, {0.0F, 0.0F, 0.0F});
+}
+
 void test_output_clamps_to_last_interleaved_channel()
 {
     const std::vector<float> interleaved{0.1F, 0.3F, 0.5F};
@@ -106,6 +119,7 @@ int main()
     test_mono_input_interleaving();
     test_stereo_output_deinterleaving();
     test_null_input_leaves_zeros();
+    test_fixed_buffer_input_interleaving();
     test_output_clamps_to_last_interleaved_channel();
     test_zero_interleaved_channels_outputs_silence();
 
