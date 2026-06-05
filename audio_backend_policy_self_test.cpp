@@ -89,10 +89,20 @@ int main() {
 
     require(audio_backend::rank_api_for_platform("ASIO") <= audio_backend::rank_api_for_platform("WASAPI"),
             "ASIO must rank no worse than WASAPI on Windows builds");
-    require(audio_backend::choose_default_input_device(windows_devices) == 3,
-            "input selection must prefer ASIO over WASAPI");
-    require(audio_backend::choose_default_output_device(windows_devices) == 3,
-            "output selection must prefer ASIO over WASAPI");
+    require(audio_backend::choose_default_input_device_for_platform(windows_devices, audio_backend::Platform::windows) == 3,
+            "Windows input selection must prefer ASIO over WASAPI");
+    require(audio_backend::choose_default_output_device_for_platform(windows_devices, audio_backend::Platform::windows) == 3,
+            "Windows output selection must prefer ASIO over WASAPI");
+
+    auto invalid_channels_devices = windows_devices;
+    invalid_channels_devices[2].max_input_channels = -1;
+    invalid_channels_devices[2].max_output_channels = -1;
+    require(audio_backend::choose_default_input_device_for_platform(invalid_channels_devices,
+                                                                    audio_backend::Platform::windows) == 1,
+            "input selection must skip devices with negative input channels");
+    require(audio_backend::choose_default_output_device_for_platform(invalid_channels_devices,
+                                                                     audio_backend::Platform::windows) == 2,
+            "output selection must skip devices with negative output channels");
 
     std::vector<AudioDeviceInfo> single_api_devices{
         device(10, "WASAPI", true, false, true, false),
