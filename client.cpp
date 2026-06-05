@@ -4373,7 +4373,7 @@ bool apply_startup_latency_profile(Client& client,
 }
 
 void print_audio_backend_inventory() {
-    Log::info("Compiled/available RtAudio APIs:");
+    Log::info("Available audio APIs:");
     for (const auto& api: AudioStream::get_apis()) {
         Log::info("API {}: {} | default input {} | default output {}", api.index, api.name,
                   api.default_input_device, api.default_output_device);
