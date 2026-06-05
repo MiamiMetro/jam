@@ -21,11 +21,34 @@ ASIO is a Steinberg audio driver technology. JUCE can expose ASIO devices when A
 
 ASIO is a trademark and software technology of Steinberg Media Technologies GmbH.
 
+## Asio
+
+Asio is used as a standalone C++ networking library.
+
+- Source: https://github.com/chriskohlhoff/asio
+- License: Boost Software License 1.0.
+
 ## Opus
 
 Opus is used for compressed audio mode.
 
 - Project: https://opus-codec.org/
+- Source: https://github.com/xiph/opus
+- License: BSD 3-Clause.
+
+## concurrentqueue
+
+concurrentqueue is used for lock-free concurrent queue data structures.
+
+- Source: https://github.com/cameron314/concurrentqueue
+- License: Simplified BSD.
+
+## PicoSHA2
+
+PicoSHA2 is used for SHA-256 hashing.
+
+- Source: https://github.com/okdshin/PicoSHA2
+- License: MIT.
 
 ## Dear ImGui
 
