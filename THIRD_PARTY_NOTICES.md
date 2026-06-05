@@ -2,6 +2,8 @@
 
 This project uses third-party open-source components.
 
+This file is an inventory and notice summary. It is not a substitute for preserving the full upstream license and copyright texts. Release packaging must include or preserve each dependency's upstream license files and notices from fetched or vendored sources.
+
 ## JUCE
 
 JUCE is used for cross-platform audio device access.
@@ -14,12 +16,14 @@ This project uses JUCE under AGPLv3-compatible public open-source terms.
 
 ## ASIO
 
-ASIO is a Steinberg audio driver technology. JUCE can expose ASIO devices when ASIO support and user-installed ASIO drivers are available.
+ASIO is a Steinberg audio driver technology. This task does not directly bundle ASIO SDK source. JUCE may expose ASIO devices when ASIO support is configured and user-installed ASIO drivers are available.
 
 - Steinberg developer information: https://www.steinberg.net/developers/
 - ASIO open-source information: https://www.steinberg.net/developers/asiosdk-open/
 
 ASIO is a trademark and software technology of Steinberg Media Technologies GmbH.
+
+If ASIO SDK or source is bundled later, that distribution must follow Steinberg's applicable ASIO licensing path and notices.
 
 ## Asio
 
