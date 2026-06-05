@@ -52,6 +52,7 @@
 #include "opus_decoder.h"
 #include "opus_defines.h"
 #include "opus_encoder.h"
+#include "opus_network_clock.h"
 #include "packet_builder.h"
 #include "participant_info.h"
 #include "participant_manager.h"
@@ -64,18 +65,18 @@ using asio::ip::udp;
 using namespace std::chrono_literals;
 
 static int normalized_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
-#ifdef __APPLE__
-    if (codec == AudioCodec::Opus && frames_per_buffer != 128 && frames_per_buffer != 240) {
-        return 128;
+    if (codec == AudioCodec::Opus &&
+        !opus_network_clock::is_legal_frame_count(opus_network_clock::SAMPLE_RATE,
+                                                  static_cast<uint16_t>(frames_per_buffer))) {
+        return opus_network_clock::FRAME_COUNT;
     }
-#endif
     return frames_per_buffer;
 }
 
 static int normalize_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
     const int normalized = normalized_buffer_frames_for_codec(codec, frames_per_buffer);
     if (normalized != frames_per_buffer) {
-        Log::info("Normalizing buffer from {} to {} frames for macOS Opus/CoreAudio pacing",
+        Log::info("Normalizing buffer from {} to {} frames for Opus network pacing",
                   frames_per_buffer, normalized);
     }
     return normalized;
@@ -1138,12 +1139,14 @@ private:
 
     static uint16_t preferred_opus_tx_frame_count(uint32_t sample_rate,
                                                   uint16_t requested_frame_count) {
-        if (OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
-                                                    requested_frame_count)) {
-            return requested_frame_count;
+        (void)requested_frame_count;
+        if (sample_rate == opus_network_clock::SAMPLE_RATE &&
+            OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
+                                                    opus_network_clock::FRAME_COUNT)) {
+            return opus_network_clock::FRAME_COUNT;
         }
 
-        const int low_latency_frame_count = static_cast<int>(sample_rate) / 400;
+        const int low_latency_frame_count = static_cast<int>(sample_rate) / 200;
         if (OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
                                                     low_latency_frame_count)) {
             return static_cast<uint16_t>(low_latency_frame_count);
@@ -1159,21 +1162,20 @@ private:
             return;
         }
 
-        if (frame_count <= opus_tx_accumulator_.size() &&
-            OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
-                                                    static_cast<int>(frame_count)) &&
-            opus_tx_accumulated_frames_ == 0) {
-            enqueue_opus_send_frame(samples, static_cast<uint16_t>(frame_count), sample_rate,
-                                    capture_time);
-            return;
-        }
-
         const uint16_t target_frame_count = preferred_opus_tx_frame_count(
             sample_rate, static_cast<uint16_t>(audio_config_.frames_per_buffer));
         if (target_frame_count == 0 || target_frame_count > opus_tx_accumulator_.size()) {
             opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
             opus_tx_accumulated_frames_ = 0;
             opus_tx_accumulator_capture_time_ = {};
+            return;
+        }
+
+        if (frame_count <= opus_tx_accumulator_.size() &&
+            opus_network_clock::can_send_callback_direct(
+                static_cast<size_t>(frame_count), opus_tx_accumulated_frames_)) {
+            enqueue_opus_send_frame(samples, static_cast<uint16_t>(frame_count), sample_rate,
+                                    capture_time);
             return;
         }
 
