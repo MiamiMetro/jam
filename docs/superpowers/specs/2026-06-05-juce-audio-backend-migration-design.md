@@ -16,9 +16,9 @@ The cached competitor audit found these patterns:
 
 ## Decision
 
-Adopt JUCE as the production client audio backend, behind a project-owned `AudioBackend` interface.
+Adopt JUCE as the only client audio backend, behind a project-owned `AudioBackend` interface.
 
-This gives the project a mature cross-platform audio device layer while avoiding another hard dependency leak into the rest of the client. RtAudio may remain temporarily as a fallback or comparison backend during migration, but it should not remain the default production path.
+This gives the project a mature cross-platform audio device layer while avoiding another hard dependency leak into the rest of the client. RtAudio should be removed from the active client build as part of the migration, not kept as a fallback backend.
 
 ## Licensing Gate
 
@@ -42,7 +42,6 @@ The repo currently has no active `LICENSE` file. Public source availability alon
 
 - Do not rewrite the GUI in JUCE.
 - Do not copy Jamulus or SonoBus backend code.
-- Do not remove RtAudio until the JUCE path has passed hardware validation.
 - Do not solve Linux packaging in the first implementation pass.
 - Do not change codec, network, jitter buffer, or room routing behavior as part of this migration.
 
@@ -86,15 +85,6 @@ Keep `AudioStream` as the public facade initially. `client.cpp` should not need 
 - forwarding start/stop calls
 - preserving existing `AudioStream::DeviceInfo`, `AudioStream::ApiInfo`, and `AudioStream::AudioConfig` compatibility where practical
 - selecting JUCE by default
-
-### RtAudio Backend
-
-Move the current RtAudio implementation out of `audio_stream.h` into:
-
-- `rtaudio_audio_backend.h`
-- `rtaudio_audio_backend.cpp`
-
-This backend should be buildable behind a CMake option such as `JAM_ENABLE_RTAUDIO_BACKEND`, defaulting on only during the transition. It should not be the default runtime backend once JUCE works.
 
 ### JUCE Backend
 
@@ -174,11 +164,7 @@ The GUI should continue showing `AudioStream::get_last_error()`. CLI commands sh
 
 ## Build Plan
 
-CMake should gain an explicit backend switch:
-
-- `JAM_AUDIO_BACKEND=JUCE` default
-- `JAM_AUDIO_BACKEND=RTAUDIO` transitional fallback
-- optional `JAM_ENABLE_RTAUDIO_BACKEND=ON` during migration
+CMake should remove the RtAudio dependency from the client target and link JUCE audio modules directly.
 
 The first implementation should keep the client executable name and CLI unchanged.
 
@@ -224,12 +210,10 @@ Regression checks:
 
 1. Add license and notices.
 2. Introduce backend-neutral interface and tests for selection policy.
-3. Move RtAudio behind the interface without behavior change.
-4. Add JUCE dependency and compile a minimal device inventory path.
-5. Implement JUCE open/close/callback adapter.
-6. Make JUCE the default backend.
-7. Validate on real Windows ASIO and macOS CoreAudio hardware.
-8. Remove or disable RtAudio default path after JUCE passes validation.
+3. Add JUCE dependency and compile a minimal device inventory path.
+4. Implement JUCE open/close/callback adapter.
+5. Remove RtAudio from the client build.
+6. Validate on real Windows ASIO and macOS CoreAudio hardware.
 
 ## Risks
 
@@ -246,4 +230,4 @@ Regression checks:
 
 ## Approval State
 
-The user approved JUCE as acceptable for a public open-source project and approved this migration direction before implementation planning.
+The user approved JUCE as acceptable for a public open-source project, then refined the migration direction to require a full JUCE change with no RtAudio fallback.
