@@ -65,11 +65,7 @@ using asio::ip::udp;
 using namespace std::chrono_literals;
 
 static int normalized_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
-    if (codec == AudioCodec::Opus &&
-        !opus_network_clock::is_legal_frame_count(opus_network_clock::SAMPLE_RATE,
-                                                  static_cast<uint16_t>(frames_per_buffer))) {
-        return opus_network_clock::FRAME_COUNT;
-    }
+    (void)codec;
     return frames_per_buffer;
 }
 
@@ -442,6 +438,31 @@ public:
     void set_requested_frames_per_buffer(int frames_per_buffer) {
         audio_config_.frames_per_buffer =
             normalize_buffer_frames_for_codec(get_audio_codec(), frames_per_buffer);
+    }
+
+    uint16_t get_opus_network_frame_count() const {
+        return opus_network_frame_count_.load(std::memory_order_acquire);
+    }
+
+    double get_opus_network_packet_ms() const {
+        const uint32_t sample_rate =
+            static_cast<uint32_t>(std::max(1, audio_config_.sample_rate));
+        return opus_network_clock::frame_duration_ms(sample_rate, get_opus_network_frame_count());
+    }
+
+    void set_opus_network_frame_count(int frame_count) {
+        const uint32_t sample_rate =
+            static_cast<uint32_t>(std::max(1, audio_config_.sample_rate));
+        const uint16_t normalized =
+            opus_network_clock::normalize_frame_count(sample_rate, frame_count);
+        const uint16_t previous =
+            opus_network_frame_count_.exchange(normalized, std::memory_order_acq_rel);
+        if (previous != normalized) {
+            opus_tx_accumulator_reset_requested_.store(true, std::memory_order_release);
+            Log::info("Opus network packet changed from {} to {} frames ({:.1f} ms)",
+                      previous, normalized,
+                      opus_network_clock::frame_duration_ms(sample_rate, normalized));
+        }
     }
 
     size_t get_opus_jitter_buffer_packets() const {
@@ -1139,14 +1160,16 @@ private:
 
     static uint16_t preferred_opus_tx_frame_count(uint32_t sample_rate,
                                                   uint16_t requested_frame_count) {
-        (void)requested_frame_count;
-        if (sample_rate == opus_network_clock::SAMPLE_RATE &&
-            OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
-                                                    opus_network_clock::FRAME_COUNT)) {
-            return opus_network_clock::FRAME_COUNT;
+        if (sample_rate == opus_network_clock::SAMPLE_RATE) {
+            return opus_network_clock::normalize_frame_count(sample_rate, requested_frame_count);
         }
 
-        const int low_latency_frame_count = static_cast<int>(sample_rate) / 200;
+        if (OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
+                                                    requested_frame_count)) {
+            return requested_frame_count;
+        }
+
+        const int low_latency_frame_count = static_cast<int>(sample_rate) / 400;
         if (OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate),
                                                     low_latency_frame_count)) {
             return static_cast<uint16_t>(low_latency_frame_count);
@@ -1162,8 +1185,13 @@ private:
             return;
         }
 
+        if (opus_tx_accumulator_reset_requested_.exchange(false, std::memory_order_acq_rel)) {
+            opus_tx_accumulated_frames_ = 0;
+            opus_tx_accumulator_capture_time_ = {};
+        }
+
         const uint16_t target_frame_count = preferred_opus_tx_frame_count(
-            sample_rate, static_cast<uint16_t>(audio_config_.frames_per_buffer));
+            sample_rate, get_opus_network_frame_count());
         if (target_frame_count == 0 || target_frame_count > opus_tx_accumulator_.size()) {
             opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
             opus_tx_accumulated_frames_ = 0;
@@ -1173,7 +1201,8 @@ private:
 
         if (frame_count <= opus_tx_accumulator_.size() &&
             opus_network_clock::can_send_callback_direct(
-                static_cast<size_t>(frame_count), opus_tx_accumulated_frames_)) {
+                static_cast<size_t>(frame_count), opus_tx_accumulated_frames_,
+                target_frame_count)) {
             enqueue_opus_send_frame(samples, static_cast<uint16_t>(frame_count), sample_rate,
                                     capture_time);
             return;
@@ -3104,6 +3133,7 @@ private:
     OpusEncoderWrapper       audio_encoder_;
     AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
     std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
+    std::atomic<uint16_t>    opus_network_frame_count_{opus_network_clock::DEFAULT_FRAME_COUNT};
     std::atomic<size_t>      opus_jitter_buffer_packets_{DEFAULT_OPUS_JITTER_PACKETS};
     std::atomic<size_t>      opus_queue_limit_packets_{DEFAULT_OPUS_QUEUE_LIMIT_PACKETS};
     std::atomic<int>         jitter_packet_age_limit_ms_{DEFAULT_JITTER_PACKET_AGE_MS};
@@ -3114,6 +3144,7 @@ private:
     std::array<float, 960>                     opus_tx_accumulator_{};
     size_t                                     opus_tx_accumulated_frames_ = 0;
     std::chrono::steady_clock::time_point      opus_tx_accumulator_capture_time_{};
+    std::atomic<bool>                         opus_tx_accumulator_reset_requested_{false};
     std::atomic<bool>                         pcm_sender_running_{false};
     std::thread                               pcm_sender_thread_;
     std::condition_variable                   pcm_sender_cv_;
@@ -3358,9 +3389,7 @@ static void draw_master_strip(Client& client, float available_height) {
         if (!jitter_enabled) {
             ImGui::EndDisabled();
         }
-        const double packet_ms =
-            (static_cast<double>(client.get_audio_config().frames_per_buffer) * 1000.0) /
-            static_cast<double>(client.get_audio_config().sample_rate);
+        const double packet_ms = client.get_opus_network_packet_ms();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%zu pkt, %.1f ms", client.get_opus_jitter_buffer_packets(),
                     client.get_opus_jitter_buffer_packets() * packet_ms);
@@ -3917,12 +3946,14 @@ static void draw_bottom_bar(Client& client) {
     static AudioStream::DeviceIndex             pending_input       = AudioStream::NO_DEVICE;
     static AudioStream::DeviceIndex             pending_output      = AudioStream::NO_DEVICE;
     static int                                  pending_buffer_frames = 0;
+    static int                                  pending_opus_frames_per_packet = 0;
     static bool                                 devices_initialized = false;
 
     if (!devices_initialized) {
         pending_input         = client.get_selected_input_device();
         pending_output        = client.get_selected_output_device();
         pending_buffer_frames = client.get_audio_config().frames_per_buffer;
+        pending_opus_frames_per_packet = client.get_opus_network_frame_count();
         devices_initialized   = true;
     }
     pending_buffer_frames =
@@ -4092,11 +4123,46 @@ static void draw_bottom_bar(Client& client) {
 
     ImGui::SameLine();
 
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Opus:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(105);
+    const int opus_packet_options[] = {opus_network_clock::LOW_LATENCY_FRAME_COUNT,
+                                       opus_network_clock::STABLE_FRAME_COUNT};
+    char opus_packet_preview[48];
+    if (pending_opus_frames_per_packet == opus_network_clock::STABLE_FRAME_COUNT) {
+        std::snprintf(opus_packet_preview, sizeof(opus_packet_preview), "240 Safe");
+    } else {
+        std::snprintf(opus_packet_preview, sizeof(opus_packet_preview), "120 Low");
+    }
+    if (ImGui::BeginCombo("##OpusPacketFrames", opus_packet_preview)) {
+        for (int frames: opus_packet_options) {
+            char label[56];
+            if (frames == opus_network_clock::LOW_LATENCY_FRAME_COUNT) {
+                std::snprintf(label, sizeof(label), "%d Low##opus_packet_%d", frames, frames);
+            } else {
+                std::snprintf(label, sizeof(label), "%d Safe##opus_packet_%d", frames, frames);
+            }
+            if (ImGui::Selectable(label, frames == pending_opus_frames_per_packet)) {
+                pending_opus_frames_per_packet = frames;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+    JamGui::ShowTooltipOnHover("Opus network packet size; smaller is lower latency, larger is safer");
+
+    ImGui::SameLine();
+
     // Check if devices changed
     AudioStream::DeviceIndex active_input  = client.get_selected_input_device();
     AudioStream::DeviceIndex active_output = client.get_selected_output_device();
-    bool devices_changed = (pending_input != active_input) || (pending_output != active_output) ||
-                           (pending_buffer_frames != client.get_audio_config().frames_per_buffer);
+    bool stream_restart_needed =
+        (pending_input != active_input) || (pending_output != active_output) ||
+        (pending_buffer_frames != client.get_audio_config().frames_per_buffer);
+    bool opus_packet_changed =
+        (pending_opus_frames_per_packet != client.get_opus_network_frame_count());
+    bool devices_changed = stream_restart_needed || opus_packet_changed;
 
     if (devices_changed) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8F, 0.6F, 0.2F, 1.0F));
@@ -4105,7 +4171,8 @@ static void draw_bottom_bar(Client& client) {
             client.set_input_device(pending_input);
             client.set_output_device(pending_output);
             client.set_requested_frames_per_buffer(pending_buffer_frames);
-            if (client.is_audio_stream_active()) {
+            client.set_opus_network_frame_count(pending_opus_frames_per_packet);
+            if (client.is_audio_stream_active() && stream_restart_needed) {
                 client.swap_audio_devices(pending_input, pending_output);
             }
         }
@@ -4128,6 +4195,7 @@ static void draw_bottom_bar(Client& client) {
                     client.set_input_device(pending_input);
                     client.set_output_device(pending_output);
                     client.set_requested_frames_per_buffer(pending_buffer_frames);
+                    client.set_opus_network_frame_count(pending_opus_frames_per_packet);
                     AudioStream::AudioConfig config = client.get_audio_config();
                     client.start_audio_stream(pending_input, pending_output, config);
                 }
@@ -4604,10 +4672,11 @@ int main(int argc, char** argv) {
         }
         if (startup_options.startup_config_smoke) {
             Log::info(
-                "Startup config smoke: codec={} frames={} jitter={} queue_limit={} "
+                "Startup config smoke: codec={} frames={} opus_packet={} jitter={} queue_limit={} "
                 "age_limit_ms={} auto_jitter={} broadcast_ipc_port={}",
                 client_instance.get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
                 client_instance.get_audio_config().frames_per_buffer,
+                client_instance.get_opus_network_frame_count(),
                 client_instance.get_opus_jitter_buffer_packets(),
                 client_instance.get_opus_queue_limit_packets(),
                 client_instance.get_jitter_packet_age_limit_ms(),
