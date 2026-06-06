@@ -406,8 +406,10 @@ Gui::Gui(int width, int height, const char* title, bool vsync, int target_fps)
 
     // Setup GLFW
     if (glfwInit() == 0) {
+        s_instance_ = nullptr;
         return;
     }
+    glfw_initialized_ = true;
 
     // GL 3.2 + GLSL 150 (required for macOS)
     const char* glsl_version = "#version 150";
@@ -422,6 +424,8 @@ Gui::Gui(int width, int height, const char* title, bool vsync, int target_fps)
     window_ = glfwCreateWindow(width, height, title, nullptr, nullptr);
     if (window_ == nullptr) {
         glfwTerminate();
+        glfw_initialized_ = false;
+        s_instance_ = nullptr;
         return;
     }
 
@@ -449,8 +453,8 @@ Gui::Gui(int width, int height, const char* title, bool vsync, int target_fps)
 
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    // Disable viewports for better performance (re-enable if you need multi-window support)
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // Keep the app single-window. Platform viewports are unnecessary here and make shutdown
+    // ordering more fragile on macOS.
 
     ImGui::StyleColorsDark();
 
@@ -464,6 +468,7 @@ Gui::Gui(int width, int height, const char* title, bool vsync, int target_fps)
     // Setup Platform/Renderer backends
     ImGui_ImplGlfw_InitForOpenGL(window_, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
+    imgui_initialized_ = true;
 
     // Set window size callback for smooth resize
     glfwSetWindowSizeCallback(window_, window_size_callback);
@@ -472,16 +477,34 @@ Gui::Gui(int width, int height, const char* title, bool vsync, int target_fps)
 }
 
 Gui::~Gui() {
-    // Cleanup
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
+    should_stop_.store(true);
+
+    if (window_ != nullptr) {
+        glfwSetWindowSizeCallback(window_, nullptr);
+        glfwSetWindowCloseCallback(window_, nullptr);
+    }
+
+    if (s_instance_ == this) {
+        s_instance_ = nullptr;
+    }
+
+    if (imgui_initialized_) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        imgui_initialized_ = false;
+        io_ = nullptr;
+    }
 
     if (window_ != nullptr) {
         glfwDestroyWindow(window_);
+        window_ = nullptr;
     }
 
-    glfwTerminate();
+    if (glfw_initialized_) {
+        glfwTerminate();
+        glfw_initialized_ = false;
+    }
 }
 
 void Gui::run() {
@@ -518,6 +541,10 @@ void Gui::run() {
 }
 
 void Gui::render_frame() {
+    if (window_ == nullptr || !imgui_initialized_ || should_stop_.load()) {
+        return;
+    }
+
     // Start ImGui frame
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -574,8 +601,8 @@ void Gui::render_frame() {
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    // Update and render platform windows
-    if ((io_->ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
+    // Update and render platform windows if platform viewports are enabled in the future.
+    if (io_ != nullptr && (io_->ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
         GLFWwindow* backup_current_context = glfwGetCurrentContext();
         ImGui::UpdatePlatformWindows();
         ImGui::RenderPlatformWindowsDefault();
@@ -586,7 +613,7 @@ void Gui::render_frame() {
 }
 
 void Gui::window_size_callback(GLFWwindow* /*window*/, int /*width*/, int /*height*/) {
-    if (s_instance_ != nullptr) {
+    if (s_instance_ != nullptr && !s_instance_->should_stop_.load()) {
         s_instance_->render_frame();
     }
 }
