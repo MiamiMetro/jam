@@ -21,7 +21,18 @@ std::string to_std_string(const juce::String& value) {
 bool juce_error(const juce::String& error) {
     return error.isNotEmpty();
 }
+
+void ensure_juce_runtime() {
+    // JUCE shutdown is unsafe from our static backend destruction path on macOS. Keep the
+    // process-wide initializer alive until the OS reclaims it at process exit.
+    static const auto* const initializer = new juce::ScopedJuceInitialiser_GUI();
+    (void)initializer;
+}
 }  // namespace
+
+JuceAudioBackend::JuceRuntime::JuceRuntime() {
+    ensure_juce_runtime();
+}
 
 JuceAudioBackend::JuceAudioBackend() {
     device_manager_.createAudioDeviceTypes(device_types_);

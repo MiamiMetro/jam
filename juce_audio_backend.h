@@ -36,6 +36,10 @@ public:
     void set_last_error(std::string error);
 
 private:
+    struct JuceRuntime {
+        JuceRuntime();
+    };
+
     void audioDeviceIOCallbackWithContext(
         const float* const* input_channel_data, int num_input_channels,
         float* const* output_channel_data, int num_output_channels, int num_samples,
@@ -53,7 +57,7 @@ private:
     juce::String device_name_for_id(AudioDeviceId id);
     void prepare_callback_buffers(int frame_count);
 
-    juce::ScopedJuceInitialiser_GUI juce_initialiser_;
+    JuceRuntime juce_runtime_;
     juce::AudioDeviceManager device_manager_;
     juce::OwnedArray<juce::AudioIODeviceType> device_types_;
     std::atomic<bool> stream_active_{false};
