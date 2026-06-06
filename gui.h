@@ -104,6 +104,8 @@ private:
     double                target_frame_time_;
     double                last_frame_time_;
     std::atomic<bool>     should_stop_{false};  // Flag to stop drawing after close
+    bool                  glfw_initialized_ = false;
+    bool                  imgui_initialized_ = false;
 
     // Static pointer for callback
     static Gui* s_instance_;
