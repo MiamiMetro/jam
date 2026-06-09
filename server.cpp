@@ -149,6 +149,14 @@ private:
         bool                                  first_log_emitted = false;
     };
 
+    struct AudioForwardStats {
+        uint32_t next_sequence = 0;
+        bool sequence_initialized = false;
+        uint64_t forwarded = 0;
+        uint64_t sequence_gaps = 0;
+        uint64_t sequence_late_or_reordered = 0;
+    };
+
     void handle_receive_error(std::error_code error_code) {
         Log::error("receive error: {}", error_code.message());
         client_manager_.remove_client(remote_endpoint_);
@@ -294,6 +302,10 @@ private:
             return;
         }
 
+        if (!validate_complete_audio_packet(hdr, bytes)) {
+            return;
+        }
+
         if (!client_manager_.exists(remote_endpoint_)) {
             record_unknown_audio_drop(remote_endpoint_);
             return;
@@ -313,6 +325,33 @@ private:
         auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
                                                                         recv_buf_.data() + bytes);
         forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
+    }
+
+    bool validate_complete_audio_packet(const MsgHdr& hdr, std::size_t bytes) {
+        if (hdr.magic != AUDIO_V2_MAGIC) {
+            return true;
+        }
+
+        const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
+        const uint16_t payload_bytes = packet_builder::extract_v2_payload_bytes(packet_data);
+        if (!message_validator::is_encoded_bytes_valid(payload_bytes, AUDIO_BUF_SIZE)) {
+            ++invalid_audio_drops_since_log_;
+            Log::warn("Dropping invalid V2 audio from {}:{}: payload_bytes {} exceeds max {}",
+                      remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                      payload_bytes, AUDIO_BUF_SIZE);
+            return false;
+        }
+
+        const size_t expected_size = sizeof(AudioHdrV2) - AUDIO_BUF_SIZE + payload_bytes;
+        if (!message_validator::has_complete_payload(bytes, expected_size, 0)) {
+            ++invalid_audio_drops_since_log_;
+            Log::warn("Dropping incomplete V2 audio from {}:{}: got {}, expected {} (payload_bytes={})",
+                      remote_endpoint_.address().to_string(), remote_endpoint_.port(), bytes,
+                      expected_size, payload_bytes);
+            return false;
+        }
+
+        return true;
     }
 
     void handle_metronome_sync(std::size_t bytes, std::chrono::steady_clock::time_point now) {
@@ -415,6 +454,8 @@ private:
             Log::info("Client timed out (ID: {})", timed_out_id);
             broadcast_participant_leave(timed_out_id);
         }
+
+        log_audio_forward_summary();
     }
 
     void broadcast_participant_leave(uint32_t participant_id) {
@@ -483,9 +524,67 @@ private:
         // keep_alive ensures packet data remains valid during async sends
 
         auto endpoints = client_manager_.get_room_endpoints_except(sender);
+        const uint32_t sender_id = client_manager_.get_client_id(sender);
 
         for (const auto& endpoint: endpoints) {
+            record_audio_forward(sender_id, endpoint, packet_data, packet_size);
             send(packet_data, packet_size, endpoint, keep_alive);
+        }
+    }
+
+    void record_audio_forward(uint32_t sender_id, const udp::endpoint& target, void* packet_data,
+                              std::size_t packet_size) {
+        if (sender_id == 0 || packet_size < sizeof(MsgHdr)) {
+            return;
+        }
+
+        MsgHdr hdr{};
+        std::memcpy(&hdr, packet_data, sizeof(MsgHdr));
+        if (hdr.magic != AUDIO_V2_MAGIC || packet_size < sizeof(AudioHdrV2) - AUDIO_BUF_SIZE) {
+            return;
+        }
+
+        const uint32_t target_id = client_manager_.get_client_id(target);
+        if (target_id == 0) {
+            return;
+        }
+
+        AudioHdrV2 audio{};
+        std::memcpy(&audio, packet_data, sizeof(AudioHdrV2) - AUDIO_BUF_SIZE);
+        const uint64_t key = (static_cast<uint64_t>(sender_id) << 32) | target_id;
+        auto& stats = audio_forward_stats_[key];
+        ++stats.forwarded;
+        if (!stats.sequence_initialized) {
+            stats.sequence_initialized = true;
+            stats.next_sequence = audio.sequence + 1;
+        } else if (audio.sequence == stats.next_sequence) {
+            ++stats.next_sequence;
+        } else if (audio.sequence > stats.next_sequence) {
+            stats.sequence_gaps += audio.sequence - stats.next_sequence;
+            stats.next_sequence = audio.sequence + 1;
+        } else {
+            ++stats.sequence_late_or_reordered;
+        }
+    }
+
+    void log_audio_forward_summary() {
+        if (invalid_audio_drops_since_log_ > 0) {
+            Log::warn("Dropped {} invalid/incomplete audio packets in the last interval",
+                      invalid_audio_drops_since_log_);
+            invalid_audio_drops_since_log_ = 0;
+        }
+
+        for (const auto& [key, stats]: audio_forward_stats_) {
+            if (stats.forwarded == 0 && stats.sequence_gaps == 0 &&
+                stats.sequence_late_or_reordered == 0) {
+                continue;
+            }
+
+            const uint32_t sender_id = static_cast<uint32_t>(key >> 32);
+            const uint32_t target_id = static_cast<uint32_t>(key & 0xFFFFFFFFU);
+            Log::info("Forward diag sender={} target={} forwarded={} seq_gap={} seq_late={}",
+                      sender_id, target_id, stats.forwarded, stats.sequence_gaps,
+                      stats.sequence_late_or_reordered);
         }
     }
 
@@ -494,7 +593,9 @@ private:
 
     ClientManager client_manager_;
     std::unordered_map<udp::endpoint, UnknownEndpointInfo, endpoint_hash> unknown_endpoints_;
+    std::unordered_map<uint64_t, AudioForwardStats> audio_forward_stats_;
     uint64_t unknown_audio_drops_since_log_ = 0;
+    uint64_t invalid_audio_drops_since_log_ = 0;
     uint32_t metronome_sequence_ = 0;
     std::chrono::steady_clock::time_point last_unknown_audio_summary_ =
         std::chrono::steady_clock::now();
