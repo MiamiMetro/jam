@@ -18,6 +18,7 @@
 #include <asio/ip/udp.hpp>
 #include <spdlog/common.h>
 
+#include "audio_packet.h"
 #include "client_manager.h"
 #include "endpoint_hash.h"
 #include "logger.h"
@@ -81,9 +82,11 @@ public:
                              [this]() { alive_check_timer_callback(); }) {
         // Optimize UDP socket buffers for high-throughput packet forwarding
         try {
-            socket_.set_option(asio::socket_base::receive_buffer_size(131072));  // 128KB
-            socket_.set_option(asio::socket_base::send_buffer_size(131072));     // 128KB
-            Log::info("UDP socket buffers optimized for packet forwarding");
+            constexpr int SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
+            socket_.set_option(asio::socket_base::receive_buffer_size(SOCKET_BUFFER_BYTES));
+            socket_.set_option(asio::socket_base::send_buffer_size(SOCKET_BUFFER_BYTES));
+            Log::info("UDP socket buffers optimized for packet forwarding ({} bytes)",
+                      SOCKET_BUFFER_BYTES);
         } catch (const std::exception& e) {
             Log::warn("Failed to set socket buffer sizes: {}", e.what());
         }
@@ -152,9 +155,12 @@ private:
     struct AudioForwardStats {
         uint32_t next_sequence = 0;
         bool sequence_initialized = false;
-        uint64_t forwarded = 0;
-        uint64_t sequence_gaps = 0;
-        uint64_t sequence_late_or_reordered = 0;
+        uint64_t forwarded_total = 0;
+        uint64_t sequence_gaps_total = 0;
+        uint64_t sequence_late_or_reordered_total = 0;
+        uint64_t forwarded_interval = 0;
+        uint64_t sequence_gaps_interval = 0;
+        uint64_t sequence_late_or_reordered_interval = 0;
     };
 
     void handle_receive_error(std::error_code error_code) {
@@ -302,12 +308,12 @@ private:
             return;
         }
 
-        if (!validate_complete_audio_packet(hdr, bytes)) {
+        if (!client_manager_.exists(remote_endpoint_)) {
+            record_unknown_audio_drop(remote_endpoint_);
             return;
         }
 
-        if (!client_manager_.exists(remote_endpoint_)) {
-            record_unknown_audio_drop(remote_endpoint_);
+        if (!validate_complete_audio_packet(bytes)) {
             return;
         }
 
@@ -327,27 +333,28 @@ private:
         forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
     }
 
-    bool validate_complete_audio_packet(const MsgHdr& hdr, std::size_t bytes) {
+    bool validate_complete_audio_packet(std::size_t bytes) {
+        MsgHdr hdr{};
+        std::memcpy(&hdr, recv_buf_.data(), sizeof(MsgHdr));
         if (hdr.magic != AUDIO_V2_MAGIC) {
             return true;
         }
 
         const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
-        const uint16_t payload_bytes = packet_builder::extract_v2_payload_bytes(packet_data);
-        if (!message_validator::is_encoded_bytes_valid(payload_bytes, AUDIO_BUF_SIZE)) {
+        std::string reason;
+        if (!audio_packet::validate_audio_packet_v2_bytes(packet_data, bytes, &reason)) {
+            AudioHdrV2 audio{};
+            uint16_t payload_bytes = 0;
+            if (bytes >= audio_packet::v2_header_size()) {
+                std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
+                payload_bytes = audio.payload_bytes;
+            }
             ++invalid_audio_drops_since_log_;
-            Log::warn("Dropping invalid V2 audio from {}:{}: payload_bytes {} exceeds max {}",
-                      remote_endpoint_.address().to_string(), remote_endpoint_.port(),
-                      payload_bytes, AUDIO_BUF_SIZE);
-            return false;
-        }
-
-        const size_t expected_size = sizeof(AudioHdrV2) - AUDIO_BUF_SIZE + payload_bytes;
-        if (!message_validator::has_complete_payload(bytes, expected_size, 0)) {
-            ++invalid_audio_drops_since_log_;
-            Log::warn("Dropping incomplete V2 audio from {}:{}: got {}, expected {} (payload_bytes={})",
-                      remote_endpoint_.address().to_string(), remote_endpoint_.port(), bytes,
-                      expected_size, payload_bytes);
+            Log::warn(
+                "Dropping invalid V2 audio from {}:{}: reason={} got {}, expected {} "
+                "(payload_bytes={}, seq={})",
+                remote_endpoint_.address().to_string(), remote_endpoint_.port(), reason, bytes,
+                audio_packet::v2_header_size() + payload_bytes, payload_bytes, audio.sequence);
             return false;
         }
 
@@ -550,20 +557,24 @@ private:
         }
 
         AudioHdrV2 audio{};
-        std::memcpy(&audio, packet_data, sizeof(AudioHdrV2) - AUDIO_BUF_SIZE);
+        std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
         const uint64_t key = (static_cast<uint64_t>(sender_id) << 32) | target_id;
         auto& stats = audio_forward_stats_[key];
-        ++stats.forwarded;
+        ++stats.forwarded_total;
+        ++stats.forwarded_interval;
         if (!stats.sequence_initialized) {
             stats.sequence_initialized = true;
             stats.next_sequence = audio.sequence + 1;
         } else if (audio.sequence == stats.next_sequence) {
             ++stats.next_sequence;
         } else if (audio.sequence > stats.next_sequence) {
-            stats.sequence_gaps += audio.sequence - stats.next_sequence;
+            const uint32_t gap = audio.sequence - stats.next_sequence;
+            stats.sequence_gaps_total += gap;
+            stats.sequence_gaps_interval += gap;
             stats.next_sequence = audio.sequence + 1;
         } else {
-            ++stats.sequence_late_or_reordered;
+            ++stats.sequence_late_or_reordered_total;
+            ++stats.sequence_late_or_reordered_interval;
         }
     }
 
@@ -574,17 +585,23 @@ private:
             invalid_audio_drops_since_log_ = 0;
         }
 
-        for (const auto& [key, stats]: audio_forward_stats_) {
-            if (stats.forwarded == 0 && stats.sequence_gaps == 0 &&
-                stats.sequence_late_or_reordered == 0) {
+        for (auto& [key, stats]: audio_forward_stats_) {
+            if (stats.forwarded_interval == 0 && stats.sequence_gaps_interval == 0 &&
+                stats.sequence_late_or_reordered_interval == 0) {
                 continue;
             }
 
             const uint32_t sender_id = static_cast<uint32_t>(key >> 32);
             const uint32_t target_id = static_cast<uint32_t>(key & 0xFFFFFFFFU);
-            Log::info("Forward diag sender={} target={} forwarded={} seq_gap={} seq_late={}",
-                      sender_id, target_id, stats.forwarded, stats.sequence_gaps,
-                      stats.sequence_late_or_reordered);
+            Log::info(
+                "Forward diag interval sender={} target={} forwarded={} seq_gap={} seq_late={} "
+                "total forwarded={} seq_gap={} seq_late={}",
+                sender_id, target_id, stats.forwarded_interval, stats.sequence_gaps_interval,
+                stats.sequence_late_or_reordered_interval, stats.forwarded_total,
+                stats.sequence_gaps_total, stats.sequence_late_or_reordered_total);
+            stats.forwarded_interval = 0;
+            stats.sequence_gaps_interval = 0;
+            stats.sequence_late_or_reordered_interval = 0;
         }
     }
 

@@ -948,6 +948,10 @@ public:
     // Send with optional shared_ptr to keep data alive during async operation
     void send(void* data, std::size_t len,
               const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
+        if (!validate_outbound_audio_packet(data, len)) {
+            return;
+        }
+
         // Add to total bytes sent
         total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
 
@@ -963,6 +967,44 @@ public:
     }
 
 private:
+    bool validate_outbound_audio_packet(void* data, std::size_t len) {
+        if (data == nullptr || len < sizeof(MsgHdr)) {
+            return true;
+        }
+
+        MsgHdr hdr{};
+        std::memcpy(&hdr, data, sizeof(MsgHdr));
+        if (hdr.magic != AUDIO_V2_MAGIC) {
+            return true;
+        }
+
+        std::string reason;
+        const auto* packet_bytes = reinterpret_cast<const unsigned char*>(data);
+        if (audio_packet::validate_audio_packet_v2_bytes(packet_bytes, len, &reason)) {
+            return true;
+        }
+
+        outbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+
+        uint32_t sequence = 0;
+        uint16_t payload_bytes = 0;
+        AudioCodec codec = AudioCodec::Opus;
+        if (len >= audio_packet::v2_header_size()) {
+            AudioHdrV2 audio{};
+            std::memcpy(&audio, data, audio_packet::v2_header_size());
+            sequence = audio.sequence;
+            payload_bytes = audio.payload_bytes;
+            codec = audio.codec;
+        }
+
+        Log::error(
+            "BUG: refusing malformed outbound V2 audio: reason={} len={} expected={} "
+            "payload_bytes={} codec={} seq={}",
+            reason, len, audio_packet::v2_header_size() + payload_bytes, payload_bytes,
+            static_cast<int>(codec), sequence);
+        return false;
+    }
+
     template <size_t N>
     static void write_fixed(Bytes<N>& target, const std::string& value) {
         const size_t copy_bytes = std::min(value.size(), target.size() - 1);
@@ -1732,12 +1774,18 @@ private:
 
         const uint64_t pcm_send_drops = pcm_send_drops_.load(std::memory_order_relaxed);
         const uint64_t opus_send_drops = opus_send_drops_.load(std::memory_order_relaxed);
+        const uint64_t outbound_malformed_audio_drops =
+            outbound_malformed_audio_drops_.load(std::memory_order_relaxed);
         const double pcm_send_drop_rate =
             calculate_rate(pcm_send_drops, last_pcm_send_drops_, elapsed_sec);
         const double opus_send_drop_rate =
             calculate_rate(opus_send_drops, last_opus_send_drops_, elapsed_sec);
+        const double outbound_malformed_audio_drop_rate =
+            calculate_rate(outbound_malformed_audio_drops,
+                           last_outbound_malformed_audio_drops_, elapsed_sec);
         last_pcm_send_drops_ = pcm_send_drops;
         last_opus_send_drops_ = opus_send_drops;
+        last_outbound_malformed_audio_drops_ = outbound_malformed_audio_drops;
 
         const auto participants = participant_manager_.get_all_info();
         const auto ns_to_ms = [](int64_t ns) {
@@ -1746,11 +1794,14 @@ private:
 
         Log::info(
             "Audio diag: frames={} tx_packets={} tx_drops pcm/opus={}/{} "
+            "tx_malformed={} ({:.1f}/s) "
             "sendq_age_ms last/avg/max={:.2f}/{:.2f}/{:.2f} rx_bytes={} tx_bytes={}",
                   audio_config_.frames_per_buffer,
                   audio_tx_sequence_.load(std::memory_order_relaxed),
                   pcm_send_drops,
                   opus_send_drops,
+                  outbound_malformed_audio_drops,
+                  outbound_malformed_audio_drop_rate,
                   ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
                   ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
                   ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
@@ -1882,6 +1933,7 @@ public:
             "callback_count={} over_deadline={} "
             "jitter_packets={} queue_limit={} age_limit_ms={} auto_jitter={} "
             "tx_packets={} tx_drops pcm/opus={}/{} "
+            "tx_malformed={} "
             "sendq_ms pcm_last/avg/max={:.3f}/{:.3f}/{:.3f} "
             "opus_last/avg/max={:.3f}/{:.3f}/{:.3f} "
             "encode_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
@@ -1922,6 +1974,7 @@ public:
             audio_tx_sequence_.load(std::memory_order_relaxed),
             pcm_send_drops_.load(std::memory_order_relaxed),
             opus_send_drops_.load(std::memory_order_relaxed),
+            outbound_malformed_audio_drops_.load(std::memory_order_relaxed),
             ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
@@ -2149,7 +2202,7 @@ private:
                   : packet_builder::extract_encoded_bytes(packet_bytes);
 
         size_t expected_size = min_packet_size + payload_bytes;
-        if (!message_validator::has_complete_payload(bytes, expected_size)) {
+        if (!message_validator::has_complete_payload(bytes, expected_size, 0)) {
             Log::error("Incomplete audio packet: got {}, expected {} (payload_bytes={})", bytes,
                        expected_size, payload_bytes);
             return;
@@ -3152,6 +3205,7 @@ private:
     std::atomic<bool>                         pcm_sender_wake_{false};
     std::atomic<uint64_t>                     pcm_send_drops_{0};
     std::atomic<uint64_t>                     opus_send_drops_{0};
+    std::atomic<uint64_t>                     outbound_malformed_audio_drops_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_last_ns_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_avg_ns_{0};
     std::atomic<int64_t>                      pcm_send_queue_age_max_ns_{0};
@@ -3249,6 +3303,7 @@ private:
     std::chrono::steady_clock::time_point                  last_audio_health_log_time_{};
     uint64_t                                               last_pcm_send_drops_  = 0;
     uint64_t                                               last_opus_send_drops_ = 0;
+    uint64_t                                               last_outbound_malformed_audio_drops_ = 0;
     std::unordered_map<uint32_t, ParticipantDropSnapshot>  participant_drop_snapshots_;
 
     // Device and encoder info storage
