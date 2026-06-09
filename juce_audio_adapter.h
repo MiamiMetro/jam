@@ -6,12 +6,12 @@
 
 namespace juce_audio_adapter {
 
-inline void copy_first_input_to_interleaved(const float* const* input_channels,
-                                            int input_channel_count,
-                                            int frame_count,
-                                            int interleaved_channel_count,
-                                            float* interleaved,
-                                            std::size_t interleaved_size)
+inline void copy_inputs_to_interleaved(const float* const* input_channels,
+                                       int input_channel_count,
+                                       int frame_count,
+                                       int interleaved_channel_count,
+                                       float* interleaved,
+                                       std::size_t interleaved_size)
 {
     const auto safe_frame_count = std::max(frame_count, 0);
     const auto safe_channel_count = std::max(interleaved_channel_count, 1);
@@ -25,33 +25,56 @@ inline void copy_first_input_to_interleaved(const float* const* input_channels,
 
     std::fill_n(interleaved, writable_size, 0.0F);
 
-    if (input_channels == nullptr || input_channel_count <= 0 || input_channels[0] == nullptr) {
+    if (input_channels == nullptr || input_channel_count <= 0) {
         return;
     }
 
     for (int frame = 0; frame < safe_frame_count; ++frame) {
-        const auto index =
+        const auto frame_index =
             static_cast<std::size_t>(frame) * static_cast<std::size_t>(safe_channel_count);
-        if (index >= writable_size) {
+        if (frame_index >= writable_size) {
             break;
         }
-        interleaved[index] = input_channels[0][frame];
+
+        if (safe_channel_count == 1) {
+            float mixed = 0.0F;
+            int mixed_channels = 0;
+            for (int input_channel = 0; input_channel < input_channel_count; ++input_channel) {
+                if (input_channels[input_channel] == nullptr) {
+                    continue;
+                }
+                mixed += input_channels[input_channel][frame];
+                ++mixed_channels;
+            }
+            interleaved[frame_index] =
+                mixed_channels > 0 ? mixed / static_cast<float>(mixed_channels) : 0.0F;
+            continue;
+        }
+
+        for (int output_channel = 0; output_channel < safe_channel_count; ++output_channel) {
+            const auto index = frame_index + static_cast<std::size_t>(output_channel);
+            if (index >= writable_size) {
+                break;
+            }
+            if (output_channel < input_channel_count && input_channels[output_channel] != nullptr) {
+                interleaved[index] = input_channels[output_channel][frame];
+            }
+        }
     }
 }
 
-inline void copy_first_input_to_interleaved(const float* const* input_channels,
-                                            int input_channel_count,
-                                            int frame_count,
-                                            int interleaved_channel_count,
-                                            std::vector<float>& interleaved)
+inline void copy_inputs_to_interleaved(const float* const* input_channels,
+                                       int input_channel_count,
+                                       int frame_count,
+                                       int interleaved_channel_count,
+                                       std::vector<float>& interleaved)
 {
     const auto safe_frame_count = std::max(frame_count, 0);
     const auto safe_channel_count = std::max(interleaved_channel_count, 1);
     interleaved.resize(static_cast<std::size_t>(safe_frame_count) *
                        static_cast<std::size_t>(safe_channel_count));
-    copy_first_input_to_interleaved(input_channels, input_channel_count, frame_count,
-                                    interleaved_channel_count, interleaved.data(),
-                                    interleaved.size());
+    copy_inputs_to_interleaved(input_channels, input_channel_count, frame_count,
+                               interleaved_channel_count, interleaved.data(), interleaved.size());
 }
 
 inline void copy_interleaved_to_outputs(const std::vector<float>& interleaved,

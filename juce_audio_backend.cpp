@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -150,29 +151,38 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
     current_config_ = config;
     callback_.store(callback, std::memory_order_release);
     callback_user_data_.store(user_data, std::memory_order_release);
+    const auto input_device_name = device_name_for_id(input_device);
+    const auto output_device_name = device_name_for_id(output_device);
+    const auto physical_input_channels =
+        physical_channel_count_for_device(*type, input_device_name, true);
+
     input_channel_count_.store(1, std::memory_order_release);
+    opened_input_channel_count_.store(std::clamp(physical_input_channels, 1, 2),
+                                      std::memory_order_release);
     output_channel_count_.store(output_info.max_output_channels >= 2 ? 2 : 1,
                                 std::memory_order_release);
     actual_buffer_frames_.store(std::max(config.frames_per_buffer, 0), std::memory_order_release);
     prepare_callback_buffers(std::max(config.frames_per_buffer, 0));
 
     juce::AudioDeviceManager::AudioDeviceSetup setup;
-    setup.inputDeviceName = device_name_for_id(input_device);
-    setup.outputDeviceName = device_name_for_id(output_device);
+    setup.inputDeviceName = input_device_name;
+    setup.outputDeviceName = output_device_name;
     setup.sampleRate = static_cast<double>(config.sample_rate);
     setup.bufferSize = config.frames_per_buffer;
     setup.useDefaultInputChannels = false;
     setup.useDefaultOutputChannels = false;
     setup.inputChannels.clear();
     setup.outputChannels.clear();
-    setup.inputChannels.setRange(0, input_channel_count_.load(std::memory_order_acquire), true);
+    setup.inputChannels.setRange(0, opened_input_channel_count_.load(std::memory_order_acquire),
+                                 true);
     setup.outputChannels.setRange(0, output_channel_count_.load(std::memory_order_acquire), true);
 
     device_manager_.setCurrentAudioDeviceType(type->getTypeName(), true);
 
-    auto error = device_manager_.initialise(input_channel_count_.load(std::memory_order_acquire),
-                                           output_channel_count_.load(std::memory_order_acquire),
-                                           nullptr, false, {}, &setup);
+    auto error =
+        device_manager_.initialise(opened_input_channel_count_.load(std::memory_order_acquire),
+                                   output_channel_count_.load(std::memory_order_acquire), nullptr,
+                                   false, {}, &setup);
     if (juce_error(error)) {
         last_error_ = "JUCE audio initialise failed: " + to_std_string(error);
         device_manager_.closeAudioDevice();
@@ -205,6 +215,7 @@ void JuceAudioBackend::stop_audio_stream() {
     device_manager_.closeAudioDevice();
     callback_.store(nullptr, std::memory_order_release);
     callback_user_data_.store(nullptr, std::memory_order_release);
+    opened_input_channel_count_.store(0, std::memory_order_release);
 }
 
 bool JuceAudioBackend::is_stream_active() const {
@@ -287,7 +298,7 @@ void JuceAudioBackend::audioDeviceIOCallbackWithContext(
         return;
     }
 
-    juce_audio_adapter::copy_first_input_to_interleaved(
+    juce_audio_adapter::copy_inputs_to_interleaved(
         input_channel_data, num_input_channels, static_cast<int>(frames_to_process),
         input_channels, interleaved_input_.data(), interleaved_input_.size());
 
@@ -368,7 +379,7 @@ std::vector<AudioDeviceInfo> JuceAudioBackend::scan_devices(bool input) {
             info.name = to_std_string(names[device_index]);
             info.api_name = to_std_string(type->getTypeName());
             info.api_index = api_index;
-            info.max_input_channels = input ? 1 : 0;
+            info.max_input_channels = input ? 2 : 0;
             info.max_output_channels = input ? 0 : 2;
             info.default_sample_rate = FALLBACK_SAMPLE_RATE;
             info.is_default_input = input && device_index == default_index;
@@ -401,6 +412,23 @@ juce::String JuceAudioBackend::device_name_for_id(AudioDeviceId id) {
     }
 
     return names[device_index];
+}
+
+int JuceAudioBackend::physical_channel_count_for_device(juce::AudioIODeviceType& type,
+                                                        const juce::String& device_name,
+                                                        bool input) {
+    std::unique_ptr<juce::AudioIODevice> device(
+        input ? type.createDevice({}, device_name) : type.createDevice(device_name, {}));
+    if (device == nullptr) {
+        return input ? 1 : 2;
+    }
+
+    const auto channels =
+        input ? device->getInputChannelNames().size() : device->getOutputChannelNames().size();
+    if (channels <= 0) {
+        return input ? 1 : 2;
+    }
+    return channels;
 }
 
 void JuceAudioBackend::prepare_callback_buffers(int frame_count) {

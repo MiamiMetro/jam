@@ -48,7 +48,7 @@ void test_mono_input_interleaving()
     const float* inputs[] = {mono.data()};
     std::vector<float> interleaved;
 
-    juce_audio_adapter::copy_first_input_to_interleaved(inputs, 1, 3, 1, interleaved);
+    juce_audio_adapter::copy_inputs_to_interleaved(inputs, 1, 3, 1, interleaved);
 
     expect_vector(interleaved, {0.25F, -0.5F, 0.75F});
 }
@@ -70,22 +70,35 @@ void test_null_input_leaves_zeros()
 {
     std::vector<float> interleaved{1.0F};
 
-    juce_audio_adapter::copy_first_input_to_interleaved(nullptr, 1, 2, 2, interleaved);
+    juce_audio_adapter::copy_inputs_to_interleaved(nullptr, 1, 2, 2, interleaved);
 
     expect_vector(interleaved, {0.0F, 0.0F, 0.0F, 0.0F});
 }
 
+void test_multichannel_input_downmixes_to_mono()
+{
+    const std::array<float, 3> first{0.2F, 0.4F, 0.6F};
+    const std::array<float, 3> second{0.8F, 0.6F, 0.4F};
+    const float* inputs[] = {first.data(), second.data()};
+    std::vector<float> interleaved;
+
+    juce_audio_adapter::copy_inputs_to_interleaved(inputs, 2, 3, 1, interleaved);
+
+    expect_vector(interleaved, {0.5F, 0.5F, 0.5F});
+}
+
 void test_fixed_buffer_input_interleaving()
 {
-    const std::array<float, 3> mono{0.25F, -0.5F, 0.75F};
-    const float* inputs[] = {mono.data()};
+    const std::array<float, 3> left{0.25F, -0.5F, 0.75F};
+    const std::array<float, 3> right{1.0F, 0.5F, -1.0F};
+    const float* inputs[] = {left.data(), right.data()};
     std::array<float, 6> interleaved{9.0F, 9.0F, 9.0F, 9.0F, 9.0F, 9.0F};
 
-    juce_audio_adapter::copy_first_input_to_interleaved(inputs, 1, 3, 2, interleaved.data(),
-                                                        interleaved.size());
+    juce_audio_adapter::copy_inputs_to_interleaved(inputs, 2, 3, 2, interleaved.data(),
+                                                   interleaved.size());
 
     expect_array({interleaved[0], interleaved[2], interleaved[4]}, {0.25F, -0.5F, 0.75F});
-    expect_array({interleaved[1], interleaved[3], interleaved[5]}, {0.0F, 0.0F, 0.0F});
+    expect_array({interleaved[1], interleaved[3], interleaved[5]}, {1.0F, 0.5F, -1.0F});
 }
 
 void test_output_clamps_to_last_interleaved_channel()
@@ -119,6 +132,7 @@ int main()
     test_mono_input_interleaving();
     test_stereo_output_deinterleaving();
     test_null_input_leaves_zeros();
+    test_multichannel_input_downmixes_to_mono();
     test_fixed_buffer_input_interleaving();
     test_output_clamps_to_last_interleaved_channel();
     test_zero_interleaved_channels_outputs_silence();

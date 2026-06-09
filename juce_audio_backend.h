@@ -55,6 +55,9 @@ private:
     std::vector<AudioDeviceInfo> scan_devices(bool input);
     juce::AudioIODeviceType* find_type(int api_index);
     juce::String device_name_for_id(AudioDeviceId id);
+    int physical_channel_count_for_device(juce::AudioIODeviceType& type,
+                                          const juce::String& device_name,
+                                          bool input);
     void prepare_callback_buffers(int frame_count);
 
     JuceRuntime juce_runtime_;
@@ -67,6 +70,7 @@ private:
     std::vector<float> interleaved_input_;
     std::vector<float> interleaved_output_;
     std::atomic<int> input_channel_count_{0};
+    std::atomic<int> opened_input_channel_count_{0};
     std::atomic<int> output_channel_count_{0};
     std::atomic<int> actual_buffer_frames_{0};
     std::size_t callback_frame_capacity_ = 0;
