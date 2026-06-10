@@ -107,6 +107,11 @@ static const char* runtime_arch_name() {
 constexpr uint32_t AUDIO_PATH_FEEDBACK_MIN_PACKETS = 20;
 constexpr double AUDIO_PATH_FEEDBACK_UNSTABLE_GAP_RATE = 0.05;
 constexpr double AUDIO_PATH_FEEDBACK_SEVERE_GAP_RATE = 0.25;
+constexpr uint32_t PING_PATH_FEEDBACK_MIN_PACKETS = 8;
+constexpr uint32_t PING_PATH_TIMEOUT_PROMOTE_REPLIES = 10;
+constexpr double PING_PATH_FEEDBACK_UNSTABLE_GAP_RATE = 0.10;
+constexpr double PING_PATH_FEEDBACK_SEVERE_GAP_RATE = 0.25;
+constexpr double PING_PATH_HIGH_RTT_MS = 250.0;
 
 struct PerformerJoinOptions {
     std::string room_id;
@@ -1952,16 +1957,16 @@ private:
     }
 
     void ping_timer_callback() {
-        static uint32_t seq = 0;
         SyncHdr         shdr{};
         shdr.magic = PING_MAGIC;
-        shdr.seq   = seq++;
+        shdr.seq   = ping_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
         auto now   = std::chrono::steady_clock::now();
         shdr.t1_client_send =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(SyncHdr));
         std::memcpy(buf->data(), &shdr, sizeof(SyncHdr));
         send(buf->data(), buf->size(), buf);
+        observe_ping_path_timeout(shdr.seq);
     }
 
     void alive_timer_callback() {
@@ -2187,6 +2192,32 @@ public:
         return current_frame_count;
     }
 
+    static uint16_t opus_packet_frames_after_ping_path_feedback(
+        uint16_t current_frame_count, uint32_t received_replies, uint32_t missing_replies,
+        double rtt_ms) {
+        const uint64_t observed_replies =
+            static_cast<uint64_t>(received_replies) + static_cast<uint64_t>(missing_replies);
+        if (observed_replies >= PING_PATH_FEEDBACK_MIN_PACKETS && missing_replies > 0) {
+            const double gap_rate =
+                audio_path_feedback_gap_rate(received_replies, missing_replies);
+            if (gap_rate >= PING_PATH_FEEDBACK_SEVERE_GAP_RATE &&
+                current_frame_count < opus_network_clock::STABLE_FRAME_COUNT) {
+                return opus_network_clock::STABLE_FRAME_COUNT;
+            }
+            if (gap_rate >= PING_PATH_FEEDBACK_UNSTABLE_GAP_RATE &&
+                current_frame_count < opus_network_clock::BALANCED_FRAME_COUNT) {
+                return opus_network_clock::BALANCED_FRAME_COUNT;
+            }
+        }
+
+        if (rtt_ms >= PING_PATH_HIGH_RTT_MS &&
+            current_frame_count < opus_network_clock::BALANCED_FRAME_COUNT) {
+            return opus_network_clock::BALANCED_FRAME_COUNT;
+        }
+
+        return current_frame_count;
+    }
+
     static bool run_opus_audio_path_feedback_smoke(std::string& failure) {
         auto expect = [&](uint16_t current, uint32_t received, uint32_t gaps,
                           uint16_t expected, const char* label) {
@@ -2213,6 +2244,32 @@ public:
                       opus_network_clock::BALANCED_FRAME_COUNT, "balanced moderate") &&
                expect(opus_network_clock::BALANCED_FRAME_COUNT, 75, 25,
                       opus_network_clock::STABLE_FRAME_COUNT, "severe balanced");
+    }
+
+    static bool run_opus_ping_path_feedback_smoke(std::string& failure) {
+        auto expect = [&](uint16_t current, uint32_t received, uint32_t gaps,
+                          double rtt_ms, uint16_t expected, const char* label) {
+            const uint16_t actual =
+                opus_packet_frames_after_ping_path_feedback(current, received, gaps, rtt_ms);
+            if (actual != expected) {
+                failure = std::string(label) + ": expected " +
+                          std::to_string(expected) + ", got " +
+                          std::to_string(actual);
+                return false;
+            }
+            return true;
+        };
+
+        return expect(opus_network_clock::BALANCED_FRAME_COUNT, 8, 0, 30.0,
+                      opus_network_clock::BALANCED_FRAME_COUNT, "clean default") &&
+               expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 0, 275.0,
+                      opus_network_clock::BALANCED_FRAME_COUNT, "high rtt low") &&
+               expect(opus_network_clock::BALANCED_FRAME_COUNT, 6, 2, 80.0,
+                      opus_network_clock::STABLE_FRAME_COUNT, "severe default") &&
+               expect(opus_network_clock::FAST_FRAME_COUNT, 7, 1, 80.0,
+                      opus_network_clock::BALANCED_FRAME_COUNT, "unstable fast") &&
+               expect(opus_network_clock::STABLE_FRAME_COUNT, 1, 99, 500.0,
+                      opus_network_clock::STABLE_FRAME_COUNT, "already stable");
     }
 
     static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
@@ -2555,6 +2612,85 @@ private:
         recent_opus_audio_packets_.clear();
     }
 
+    void observe_ping_path_timeout(uint32_t sent_sequence) {
+        if (!join_state_.is_join_confirmed()) {
+            return;
+        }
+
+        const uint16_t current_frame_count = get_opus_network_frame_count();
+        if (current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT) {
+            return;
+        }
+
+        uint32_t missing_replies = 0;
+        if (have_ping_reply_sequence_.load(std::memory_order_acquire)) {
+            const uint32_t last_reply =
+                last_ping_reply_sequence_.load(std::memory_order_acquire);
+            if (sent_sequence > last_reply) {
+                missing_replies = sent_sequence - last_reply;
+            }
+        } else if (sent_sequence >= PING_PATH_TIMEOUT_PROMOTE_REPLIES) {
+            missing_replies = sent_sequence;
+        }
+
+        if (missing_replies < PING_PATH_TIMEOUT_PROMOTE_REPLIES) {
+            return;
+        }
+
+        Log::warn(
+            "Server ping replies are missing for {} consecutive sends; promoting Opus packet "
+            "from {} to {} frames",
+            missing_replies, current_frame_count, opus_network_clock::STABLE_FRAME_COUNT);
+        set_opus_network_frame_count(opus_network_clock::STABLE_FRAME_COUNT);
+        recent_opus_audio_packets_.clear();
+    }
+
+    void observe_ping_path_feedback(uint32_t reply_sequence, double rtt_ms) {
+        uint32_t missing_replies = 0;
+        if (have_ping_reply_sequence_.exchange(true, std::memory_order_acq_rel)) {
+            const uint32_t previous =
+                last_ping_reply_sequence_.load(std::memory_order_acquire);
+            if (reply_sequence > previous + 1U) {
+                missing_replies = reply_sequence - previous - 1U;
+            }
+        }
+
+        last_ping_reply_sequence_.store(reply_sequence, std::memory_order_release);
+        ping_path_interval_received_.fetch_add(1, std::memory_order_relaxed);
+        if (missing_replies > 0) {
+            ping_path_interval_missing_.fetch_add(missing_replies,
+                                                  std::memory_order_relaxed);
+        }
+
+        const uint32_t received =
+            ping_path_interval_received_.load(std::memory_order_relaxed);
+        const uint32_t missing =
+            ping_path_interval_missing_.load(std::memory_order_relaxed);
+        if (received + missing < PING_PATH_FEEDBACK_MIN_PACKETS) {
+            return;
+        }
+
+        const uint16_t current_frame_count = get_opus_network_frame_count();
+        const uint16_t adapted_frame_count =
+            opus_packet_frames_after_ping_path_feedback(current_frame_count, received,
+                                                        missing, rtt_ms);
+        ping_path_interval_received_.store(0, std::memory_order_relaxed);
+        ping_path_interval_missing_.store(0, std::memory_order_relaxed);
+        if (adapted_frame_count <= current_frame_count) {
+            return;
+        }
+
+        const double gap_rate_percent =
+            audio_path_feedback_gap_rate(received, missing) * 100.0;
+        Log::warn(
+            "Server ping path is unstable: replies={} missing={} gap_rate={:.1f}% "
+            "rtt_ms={:.1f}; promoting Opus packet from {} to {} frames",
+            received, missing, gap_rate_percent, rtt_ms, current_frame_count,
+            adapted_frame_count);
+        set_opus_network_frame_count(adapted_frame_count);
+        recent_opus_audio_packets_.clear();
+    }
+
     void handle_ping_message(std::size_t bytes, const char* recv_data) {
         // Add to total bytes received
         total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
@@ -2574,6 +2710,7 @@ private:
 
         // Store RTT for GUI display (thread-safe atomic update)
         rtt_ms_.store(rtt_ms, std::memory_order_relaxed);
+        observe_ping_path_feedback(hdr.seq, rtt_ms);
         if (!server_clock_ready_.exchange(true, std::memory_order_acq_rel)) {
             server_clock_offset_ns_.store(offset, std::memory_order_release);
         } else {
@@ -3836,6 +3973,11 @@ private:
     std::atomic<double> rtt_ms_{0.0};
     std::atomic<int64_t> server_clock_offset_ns_{0};
     std::atomic<bool>    server_clock_ready_{false};
+    std::atomic<uint32_t> ping_tx_sequence_{0};
+    std::atomic<uint32_t> last_ping_reply_sequence_{0};
+    std::atomic<bool>     have_ping_reply_sequence_{false};
+    std::atomic<uint32_t> ping_path_interval_received_{0};
+    std::atomic<uint32_t> ping_path_interval_missing_{0};
 
     // Total bytes sent/received (cumulative counters)
     std::atomic<uint64_t> total_bytes_rx_{0};
@@ -5590,6 +5732,11 @@ int main(int argc, char** argv) {
             std::string failure;
             if (!Client::run_opus_audio_path_feedback_smoke(failure)) {
                 Log::error("Opus audio path feedback smoke failed: {}", failure);
+                log.flush();
+                return 2;
+            }
+            if (!Client::run_opus_ping_path_feedback_smoke(failure)) {
+                Log::error("Opus ping path feedback smoke failed: {}", failure);
                 log.flush();
                 return 2;
             }
