@@ -117,6 +117,22 @@ if(JAM_BUILD_TESTS)
                          --server-exe $<TARGET_FILE:server>
                          --proxy-exe $<TARGET_FILE:udp_impair_proxy>
                          --probe-exe $<TARGET_FILE:latency_probe>)
+        add_test(NAME latency_probe_large_gap_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/latency-burst-smoke.mjs
+                         --server-exe $<TARGET_FILE:server>
+                         --proxy-exe $<TARGET_FILE:udp_impair_proxy>
+                         --probe-exe $<TARGET_FILE:latency_probe>
+                         --frames 480
+                         --jitter 14
+                         --packets 600
+                         --burst-every 1000
+                         --burst-count 80
+                         --burst-offset 120
+                         --drop-direction server-to-client
+                         --allow-loss
+                         --max-gap-plc-run 6
+                         --min-decoder-resets 1)
     endif()
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke

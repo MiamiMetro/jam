@@ -8,7 +8,7 @@ function usage(message) {
     console.error(message);
   }
   console.error(
-    "Usage: latency-burst-smoke.mjs --server-exe <path> --proxy-exe <path> --probe-exe <path>",
+    "Usage: latency-burst-smoke.mjs --server-exe <path> --proxy-exe <path> --probe-exe <path> [options]",
   );
   process.exit(message ? 2 : 0);
 }
@@ -19,6 +19,10 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
       usage();
+    }
+    if (arg === "--allow-loss" || arg === "--require-clean") {
+      args[arg.slice(2)] = "true";
+      continue;
     }
     if (!arg.startsWith("--") || i + 1 >= argv.length) {
       usage(`unknown or incomplete argument: ${arg}`);
@@ -31,6 +35,10 @@ function parseArgs(argv) {
     }
   }
   return args;
+}
+
+function argValue(args, name, fallback) {
+  return args[name] ?? fallback;
 }
 
 function delay(ms) {
@@ -138,13 +146,13 @@ try {
     "--server-port",
     String(serverPort),
     "--burst-every",
-    "100",
+    argValue(args, "burst-every", "100"),
     "--burst-count",
-    "10",
+    argValue(args, "burst-count", "10"),
     "--burst-offset",
-    "30",
+    argValue(args, "burst-offset", "30"),
     "--drop-direction",
-    "server-to-client",
+    argValue(args, "drop-direction", "server-to-client"),
   ]);
   await delay(500);
   if (proxy.exitCode !== null || proxy.signalCode !== null) {
@@ -153,19 +161,29 @@ try {
     );
   }
 
-  await runChecked("latency_probe", args["probe-exe"], [
+  const probeArgs = [
     "--server",
     "127.0.0.1",
     "--port",
     String(proxyPort),
     "--frames",
-    "240",
+    argValue(args, "frames", "240"),
     "--jitter",
-    "14",
+    argValue(args, "jitter", "14"),
     "--packets",
-    "1000",
-    "--require-clean",
-  ]);
+    argValue(args, "packets", "1000"),
+  ];
+  if (args["allow-loss"] !== "true") {
+    probeArgs.push("--require-clean");
+  }
+  if (args["max-gap-plc-run"]) {
+    probeArgs.push("--max-gap-plc-run", args["max-gap-plc-run"]);
+  }
+  if (args["min-decoder-resets"]) {
+    probeArgs.push("--min-decoder-resets", args["min-decoder-resets"]);
+  }
+
+  await runChecked("latency_probe", args["probe-exe"], probeArgs);
 } finally {
   stopChild(proxy);
   stopChild(server);

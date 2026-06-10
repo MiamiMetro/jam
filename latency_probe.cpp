@@ -79,6 +79,8 @@ struct Args {
     std::string sender_join_token;
     std::string receiver_join_token;
     bool require_clean = false;
+    int max_allowed_gap_plc_run = -1;
+    int min_decoder_resets = 0;
     bool sweep = false;
     int invalid_flood_packets = 0;
     int invalid_flood_interval_us = 0;
@@ -100,6 +102,8 @@ struct ProbeMetrics {
     int plc_frames = 0;
     int gap_plc_frames = 0;
     int empty_plc_frames = 0;
+    int max_gap_plc_run = 0;
+    int decoder_resets = 0;
     int underruns = 0;
     int gap_waits = 0;
     int sequence_gaps = 0;
@@ -618,6 +622,15 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
         }
         decoded_pcm_fifo.insert(decoded_pcm_fifo.end(), samples, samples + sample_count);
     };
+    int current_gap_plc_run = 0;
+    auto note_gap_plc = [&]() {
+        ++current_gap_plc_run;
+        metrics.max_gap_plc_run =
+            std::max(metrics.max_gap_plc_run, current_gap_plc_run);
+    };
+    auto note_real_audio = [&]() {
+        current_gap_plc_run = 0;
+    };
 
     for (int tick = 0; tick < config.total_packets + 80; ++tick) {
         std::this_thread::sleep_until(start_time + frame_duration * tick);
@@ -659,12 +672,15 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             if (packet.reset_decoder && packet.codec == AudioCodec::Opus) {
                 decoder.reset();
                 decoded_pcm_fifo.clear();
+                metrics.decoder_resets++;
+                note_real_audio();
             }
             if (packet.loss_concealment && packet.codec == AudioCodec::Opus) {
                 decoded_samples = decoder.decode_plc(pcm.data(), config.frame_size);
                 if (decoded_samples > 0) {
                     metrics.plc_frames++;
                     metrics.gap_plc_frames++;
+                    note_gap_plc();
                 }
             } else if (packet.codec == AudioCodec::Opus) {
                 if (config.codec != ProbeCodec::Opus) {
@@ -678,8 +694,10 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
                     metrics.decode_failures++;
                     continue;
                 }
+                note_real_audio();
             } else if (decode_pcm_int16_packet(packet, config, pcm)) {
                 decoded_samples = config.frame_size;
+                note_real_audio();
             } else {
                 metrics.decode_failures++;
                 continue;
@@ -900,6 +918,8 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "plc_frames: " << m.plc_frames << "\n";
     std::cout << "gap_plc_frames: " << m.gap_plc_frames << "\n";
     std::cout << "empty_plc_frames: " << m.empty_plc_frames << "\n";
+    std::cout << "max_gap_plc_run: " << m.max_gap_plc_run << "\n";
+    std::cout << "decoder_resets: " << m.decoder_resets << "\n";
     std::cout << "gap_waits: " << m.gap_waits << "\n";
     std::cout << "sequence_gaps: " << m.sequence_gaps << "\n";
     std::cout << "sequence_gap_recoveries: " << m.sequence_gap_recoveries << "\n";
@@ -922,7 +942,8 @@ void print_result(const Args& args, const ProbeResult& result) {
 void print_sweep_header() {
     std::cout << "codec,frames,jitter,playout_ppm,latency_ms,latency_samples,sent,received,decoded,max_queue,"
                  "avg_queue,queue_drift,min_queue,final_queue,raw_audio,redundant_audio,"
-                 "v2_audio,encode_failures,underruns,plc,gap_plc,empty_plc,gap_waits,"
+                 "v2_audio,encode_failures,underruns,plc,gap_plc,empty_plc,max_gap_plc_run,"
+                 "decoder_resets,gap_waits,"
                  "seq_gaps,seq_recoveries,seq_late,seq_unresolved,decode_failures,"
                  "size_mismatch,non_finite,out_of_range,repeated_blocks,max_discontinuity,"
                  "status\n";
@@ -946,7 +967,8 @@ void print_sweep_row(const Args& args, const ProbeResult& result) {
               << min_queue << ',' << m.final_queue_depth << ',' << m.raw_audio_packets << ','
               << m.redundant_audio_packets << ',' << m.v2_audio_packets << ','
               << m.encode_failures << ',' << m.underruns << ',' << m.plc_frames << ','
-              << m.gap_plc_frames << ',' << m.empty_plc_frames << ',' << m.gap_waits << ','
+              << m.gap_plc_frames << ',' << m.empty_plc_frames << ','
+              << m.max_gap_plc_run << ',' << m.decoder_resets << ',' << m.gap_waits << ','
               << m.sequence_gaps << ',' << m.sequence_gap_recoveries << ','
               << m.sequence_late_or_duplicate << ',' << m.sequence_unresolved_gaps << ','
               << m.decode_failures << ',' << m.decoded_size_mismatches << ','
@@ -976,6 +998,10 @@ Args parse_args(int argc, char** argv) {
             args.receiver_join_token = argv[++i];
         } else if (arg == "--require-clean" || arg == "--fail-on-warning") {
             args.require_clean = true;
+        } else if (arg == "--max-gap-plc-run" && i + 1 < argc) {
+            args.max_allowed_gap_plc_run = std::stoi(argv[++i]);
+        } else if (arg == "--min-decoder-resets" && i + 1 < argc) {
+            args.min_decoder_resets = std::stoi(argv[++i]);
         } else if (arg == "--room" && i + 1 < argc) {
             args.room = argv[++i];
         } else if (arg == "--sender-user" && i + 1 < argc) {
@@ -1048,6 +1074,13 @@ int main(int argc, char** argv) {
         print_result(args, result);
         if (args.require_clean && has_clean_failure_indicators(result)) {
             return 3;
+        }
+        if (args.max_allowed_gap_plc_run >= 0 &&
+            result.metrics.max_gap_plc_run > args.max_allowed_gap_plc_run) {
+            return 4;
+        }
+        if (result.metrics.decoder_resets < args.min_decoder_resets) {
+            return 5;
         }
         return result.metrics.detected_output_sample >= 0 ? 0 : 2;
     } catch (const std::exception& e) {
