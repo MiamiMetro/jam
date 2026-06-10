@@ -54,7 +54,21 @@ void test_duplicate_is_not_recovery() {
     const auto delta = tracker.record(20);
     require(delta.late_or_duplicate, "duplicate should be marked late/duplicate");
     require(delta.gaps_recovered == 0, "duplicate should not recover a gap");
+    require(!sequence_arrival_should_enqueue(delta),
+            "duplicate with no recovered gap should not be enqueued");
     require(tracker.unresolved_gaps() == 0, "duplicate should not create unresolved gaps");
+}
+
+void test_reordered_recovery_should_enqueue() {
+    SequenceArrivalTracker tracker;
+
+    tracker.record(30);
+    tracker.record(32);
+    const auto delta = tracker.record(31);
+    require(delta.late_or_duplicate, "gap recovery should be a late arrival");
+    require(delta.gaps_recovered == 1, "gap recovery should report recovered gap");
+    require(sequence_arrival_should_enqueue(delta),
+            "late arrival that recovers a gap should still be enqueued");
 }
 
 void test_wraparound_ordering() {
@@ -171,6 +185,7 @@ int main() {
     test_sequence_number_comparison_handles_wrap();
     test_real_loss_stays_unresolved();
     test_duplicate_is_not_recovery();
+    test_reordered_recovery_should_enqueue();
     test_wraparound_ordering();
     test_large_gap_recovery_beyond_small_packet_window();
     test_untracked_overflow_gap_does_not_stick_unresolved();

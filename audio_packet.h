@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include "opus_network_clock.h"
 #include "protocol.h"
@@ -13,6 +15,10 @@ namespace audio_packet {
 
 inline constexpr size_t v2_header_size() {
     return sizeof(AudioHdrV2) - AUDIO_BUF_SIZE;
+}
+
+inline constexpr size_t redundant_header_size() {
+    return sizeof(AudioRedundantHdr);
 }
 
 inline bool validate_audio_packet_v2_shape(const AudioHdrV2& hdr,
@@ -97,6 +103,197 @@ inline bool validate_audio_packet_v2_bytes(const unsigned char* data, size_t len
         return false;
     }
     return validate_audio_packet_v2_shape(hdr, reason);
+}
+
+inline bool next_redundant_child(const unsigned char* data, size_t len, size_t& offset,
+                                 const unsigned char*& child, size_t& child_len,
+                                 std::string* reason = nullptr) {
+    if (offset + v2_header_size() > len) {
+        if (reason != nullptr) {
+            *reason = "short redundant child header";
+        }
+        return false;
+    }
+
+    child = data + offset;
+    AudioHdrV2 child_hdr{};
+    std::memcpy(&child_hdr, child, v2_header_size());
+    if (child_hdr.magic != AUDIO_V2_MAGIC) {
+        if (reason != nullptr) {
+            *reason = "redundant child wrong magic";
+        }
+        return false;
+    }
+    if (child_hdr.payload_bytes > AUDIO_BUF_SIZE) {
+        if (reason != nullptr) {
+            *reason = "redundant child payload too large";
+        }
+        return false;
+    }
+
+    child_len = v2_header_size() + child_hdr.payload_bytes;
+    if (offset + child_len > len) {
+        if (reason != nullptr) {
+            *reason = "truncated redundant child";
+        }
+        return false;
+    }
+    if (!validate_audio_packet_v2_bytes(child, child_len, reason)) {
+        return false;
+    }
+
+    offset += child_len;
+    return true;
+}
+
+inline bool validate_redundant_audio_packet_bytes(const unsigned char* data, size_t len,
+                                                  std::string* reason = nullptr) {
+    if (data == nullptr) {
+        if (reason != nullptr) {
+            *reason = "null redundant packet";
+        }
+        return false;
+    }
+    if (len < redundant_header_size()) {
+        if (reason != nullptr) {
+            *reason = "short redundant header";
+        }
+        return false;
+    }
+
+    AudioRedundantHdr hdr{};
+    std::memcpy(&hdr, data, redundant_header_size());
+    if (hdr.magic != AUDIO_REDUNDANT_MAGIC) {
+        if (reason != nullptr) {
+            *reason = "wrong redundant magic";
+        }
+        return false;
+    }
+    if (hdr.packet_count == 0 || hdr.packet_count > MAX_AUDIO_REDUNDANT_PACKETS) {
+        if (reason != nullptr) {
+            *reason = "invalid redundant packet count";
+        }
+        return false;
+    }
+
+    size_t offset = redundant_header_size();
+    for (uint8_t i = 0; i < hdr.packet_count; ++i) {
+        const unsigned char* child = nullptr;
+        size_t child_len = 0;
+        if (!next_redundant_child(data, len, offset, child, child_len, reason)) {
+            return false;
+        }
+    }
+
+    if (offset != len) {
+        if (reason != nullptr) {
+            *reason = "redundant trailing bytes";
+        }
+        return false;
+    }
+    return true;
+}
+
+template <typename Func>
+inline bool for_each_redundant_audio_child(const unsigned char* data, size_t len, Func&& func,
+                                           std::string* reason = nullptr) {
+    if (!validate_redundant_audio_packet_bytes(data, len, reason)) {
+        return false;
+    }
+
+    AudioRedundantHdr hdr{};
+    std::memcpy(&hdr, data, redundant_header_size());
+    size_t offset = redundant_header_size();
+    for (uint8_t i = 0; i < hdr.packet_count; ++i) {
+        const unsigned char* child = nullptr;
+        size_t child_len = 0;
+        if (!next_redundant_child(data, len, offset, child, child_len, reason)) {
+            return false;
+        }
+        func(child, child_len, i);
+    }
+    return true;
+}
+
+template <typename Func>
+inline bool for_each_redundant_audio_child_reverse(const unsigned char* data, size_t len,
+                                                   Func&& func,
+                                                   std::string* reason = nullptr) {
+    if (!validate_redundant_audio_packet_bytes(data, len, reason)) {
+        return false;
+    }
+
+    AudioRedundantHdr hdr{};
+    std::memcpy(&hdr, data, redundant_header_size());
+    std::array<std::pair<const unsigned char*, size_t>, MAX_AUDIO_REDUNDANT_PACKETS>
+        children{};
+    size_t offset = redundant_header_size();
+    for (uint8_t i = 0; i < hdr.packet_count; ++i) {
+        const unsigned char* child = nullptr;
+        size_t child_len = 0;
+        if (!next_redundant_child(data, len, offset, child, child_len, reason)) {
+            return false;
+        }
+        children[i] = {child, child_len};
+    }
+
+    for (uint8_t i = hdr.packet_count; i > 0; --i) {
+        const auto& [child, child_len] = children[i - 1];
+        func(child, child_len, static_cast<uint8_t>(i - 1));
+    }
+    return true;
+}
+
+template <typename Func>
+inline bool for_each_redundant_audio_child(unsigned char* data, size_t len, Func&& func,
+                                           std::string* reason = nullptr) {
+    return for_each_redundant_audio_child(
+        static_cast<const unsigned char*>(data), len,
+        [&](const unsigned char* child, size_t child_len, uint8_t index) {
+            func(const_cast<unsigned char*>(child), child_len, index);
+        },
+        reason);
+}
+
+inline bool embed_sender_id_in_redundant_audio_packet(unsigned char* data, size_t len,
+                                                      uint32_t sender_id,
+                                                      std::string* reason = nullptr) {
+    return for_each_redundant_audio_child(
+        data, len,
+        [sender_id](unsigned char* child, size_t, uint8_t) {
+            std::memcpy(child + sizeof(MsgHdr), &sender_id, sizeof(sender_id));
+        },
+        reason);
+}
+
+inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet(
+    const std::vector<const std::vector<unsigned char>*>& packets) {
+    if (packets.empty() || packets.size() > MAX_AUDIO_REDUNDANT_PACKETS) {
+        return nullptr;
+    }
+
+    size_t total_bytes = redundant_header_size();
+    for (const auto* packet: packets) {
+        if (packet == nullptr ||
+            !validate_audio_packet_v2_bytes(packet->data(), packet->size())) {
+            return nullptr;
+        }
+        total_bytes += packet->size();
+    }
+
+    auto redundant = std::make_shared<std::vector<unsigned char>>();
+    redundant->resize(total_bytes);
+    AudioRedundantHdr hdr{};
+    hdr.magic = AUDIO_REDUNDANT_MAGIC;
+    hdr.packet_count = static_cast<uint8_t>(packets.size());
+    std::memcpy(redundant->data(), &hdr, redundant_header_size());
+
+    size_t offset = redundant_header_size();
+    for (const auto* packet: packets) {
+        std::memcpy(redundant->data() + offset, packet->data(), packet->size());
+        offset += packet->size();
+    }
+    return redundant;
 }
 
 // Create audio packet with encoded data

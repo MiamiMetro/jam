@@ -9,9 +9,11 @@ constexpr uint32_t PING_MAGIC  = 0x50494E47;  // 'PING'
 constexpr uint32_t CTRL_MAGIC  = 0x4354524C;  // 'CTRL'
 constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
 constexpr uint32_t AUDIO_V2_MAGIC = 0x41553249;  // 'AU2I'
+constexpr uint32_t AUDIO_REDUNDANT_MAGIC = 0x41555244;  // 'AURD'
 
 // Buffer sizes
 constexpr size_t AUDIO_BUF_SIZE = 512;
+constexpr int UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
 
 // Jitter buffer configuration (CLIENT/LISTENER ONLY - server just relays packets)
 constexpr size_t MAX_OPUS_QUEUE_SIZE       = 128; // Hard safety cap for Opus receive queue
@@ -26,6 +28,10 @@ constexpr size_t MAX_OPUS_QUEUE_LIMIT_PACKETS = 128; // User-facing Opus queue l
 constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 180; // Default age limit at playout
 constexpr int    MIN_JITTER_PACKET_AGE_MS = 0;        // Manual testing can disable age drops
 constexpr int    MAX_JITTER_PACKET_AGE_MS = 250;      // User-facing age limit
+constexpr uint8_t MAX_AUDIO_REDUNDANT_PACKETS = 2; // Current packet + one previous packet
+
+// Endpoint capabilities negotiated in extended JOIN/JOIN_ACK packets.
+constexpr uint32_t AUDIO_CAP_REDUNDANCY = 1U << 0;
 
 // Type aliases
 template <size_t N>
@@ -72,6 +78,11 @@ struct JoinHdr : CtrlHdr {
     Bytes<64>  display_name;
     Bytes<512> join_token;
     ClientRole role = ClientRole::Performer;
+    uint32_t   capabilities = 0;
+};
+
+struct JoinAckHdr : CtrlHdr {
+    uint32_t capabilities = 0;
 };
 
 struct ParticipantInfoHdr : CtrlHdr {
@@ -110,6 +121,11 @@ struct AudioHdrV2 : MsgHdr {
     uint8_t               channels;       // Channel count in payload
     AudioCodec            codec;          // Payload codec
     Bytes<AUDIO_BUF_SIZE> buf;
+};
+
+struct AudioRedundantHdr : MsgHdr {
+    uint8_t packet_count = 0;
+    uint8_t reserved[3] = {};
 };
 
 #pragma pack(pop)

@@ -127,9 +127,10 @@ public:
 
         // Optimize UDP socket buffers for low-latency audio streaming
         try {
-            socket_.set_option(asio::socket_base::receive_buffer_size(65536));
-            socket_.set_option(asio::socket_base::send_buffer_size(65536));
-            Log::info("UDP socket buffers optimized for low latency");
+            socket_.set_option(asio::socket_base::receive_buffer_size(UDP_SOCKET_BUFFER_BYTES));
+            socket_.set_option(asio::socket_base::send_buffer_size(UDP_SOCKET_BUFFER_BYTES));
+            Log::info("UDP socket buffers optimized for low latency ({} bytes)",
+                      UDP_SOCKET_BUFFER_BYTES);
         } catch (const std::exception& e) {
             Log::warn("Failed to set socket buffer sizes: {}", e.what());
         }
@@ -206,6 +207,7 @@ public:
         write_fixed(join.profile_id, performer_join_options_.user_id);
         write_fixed(join.display_name, performer_join_options_.display_name);
         write_fixed(join.join_token, performer_join_options_.join_token);
+        join.capabilities = AUDIO_CAP_REDUNDANCY;
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinHdr));
         std::memcpy(buf->data(), &join, sizeof(JoinHdr));
         join_state_.mark_join_sent(std::chrono::steady_clock::now());
@@ -1045,6 +1047,9 @@ public:
             handle_ping_message(bytes, state->buffer.data());
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
             handle_ctrl_message(bytes, state->buffer.data());
+        } else if (hdr.magic == AUDIO_REDUNDANT_MAGIC &&
+                   bytes >= sizeof(AudioRedundantHdr)) {
+            handle_audio_message(bytes, state->buffer.data());
         } else if ((hdr.magic == AUDIO_MAGIC &&
                     bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) ||
                    (hdr.magic == AUDIO_V2_MAGIC && bytes >= sizeof(AudioHdrV2) - AUDIO_BUF_SIZE)) {
@@ -1294,8 +1299,9 @@ private:
                     auto packet = audio_packet::create_audio_packet_v2(
                         AudioCodec::Opus, seq, opus_frame.sample_rate, opus_frame.frame_count, 1,
                         encoded_data.data(), static_cast<uint16_t>(encoded_data.size()));
+                    auto send_packet = maybe_wrap_opus_packet_with_redundancy(packet);
                     observe_audio_packet_send_pacing();
-                    send(packet->data(), packet->size(), packet);
+                    send(send_packet->data(), send_packet->size(), send_packet);
                 } else {
                     observe_tx_encode_time(std::chrono::steady_clock::now() - encode_start);
                 }
@@ -1308,6 +1314,22 @@ private:
                        pcm_sender_wake_.exchange(false, std::memory_order_acq_rel);
             });
         }
+    }
+
+    std::shared_ptr<std::vector<unsigned char>> maybe_wrap_opus_packet_with_redundancy(
+        const std::shared_ptr<std::vector<unsigned char>>& packet) {
+        if (packet == nullptr || !join_state_.server_supports(AUDIO_CAP_REDUNDANCY)) {
+            previous_opus_audio_packet_ = packet;
+            return packet;
+        }
+
+        std::vector<const std::vector<unsigned char>*> packets{packet.get()};
+        if (previous_opus_audio_packet_ != nullptr) {
+            packets.push_back(previous_opus_audio_packet_.get());
+        }
+        auto redundant_packet = audio_packet::create_redundant_audio_packet(packets);
+        previous_opus_audio_packet_ = packet;
+        return redundant_packet != nullptr ? redundant_packet : packet;
     }
 
     static size_t max_send_queue_frames(uint16_t frame_count) {
@@ -2296,9 +2318,15 @@ private:
                 break;
             }
             case CtrlHdr::Cmd::JOIN_ACK: {
-                join_state_.mark_join_ack(chdr.participant_id);
-                Log::info("JOIN acknowledged by server (participant ID: {})",
-                          chdr.participant_id);
+                uint32_t server_capabilities = 0;
+                if (bytes >= sizeof(JoinAckHdr)) {
+                    JoinAckHdr ack{};
+                    std::memcpy(&ack, recv_data, sizeof(JoinAckHdr));
+                    server_capabilities = ack.capabilities;
+                }
+                join_state_.mark_join_ack(chdr.participant_id, server_capabilities);
+                Log::info("JOIN acknowledged by server (participant ID: {}, capabilities=0x{:08x})",
+                          chdr.participant_id, server_capabilities);
                 break;
             }
             case CtrlHdr::Cmd::JOIN_REQUIRED: {
@@ -2309,6 +2337,7 @@ private:
                 OpusSendFrame discarded_opus;
                 while (opus_send_queue_.try_dequeue(discarded_opus)) {
                 }
+                previous_opus_audio_packet_.reset();
                 Log::warn("Server requested JOIN refresh; resending JOIN");
                 send_join();
                 break;
@@ -2386,6 +2415,11 @@ private:
     void handle_audio_message(std::size_t bytes, const char* recv_data) {
         MsgHdr msg_hdr{};
         std::memcpy(&msg_hdr, recv_data, sizeof(MsgHdr));
+        if (msg_hdr.magic == AUDIO_REDUNDANT_MAGIC) {
+            handle_redundant_audio_message(bytes, recv_data);
+            return;
+        }
+
         const bool is_v2 = msg_hdr.magic == AUDIO_V2_MAGIC;
         const size_t min_packet_size =
             is_v2 ? sizeof(AudioHdrV2) - AUDIO_BUF_SIZE
@@ -2509,6 +2543,9 @@ private:
                         participant.sequence_late_or_reordered.fetch_add(
                             1, std::memory_order_relaxed);
                     }
+                    if (!sequence_arrival_should_enqueue(sequence_delta)) {
+                        return;
+                    }
                 } else {
                     packet.codec       = AudioCodec::Opus;
                     packet.sample_rate = static_cast<uint32_t>(current_audio_sample_rate());
@@ -2557,6 +2594,26 @@ private:
                           queue_after_enqueue);
             }
         });
+    }
+
+    void handle_redundant_audio_message(std::size_t bytes, const char* recv_data) {
+        const auto* packet_bytes = reinterpret_cast<const unsigned char*>(recv_data);
+        std::string reason;
+        if (!audio_packet::validate_redundant_audio_packet_bytes(packet_bytes, bytes, &reason)) {
+            const uint64_t count =
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count % 100 == 0) {
+                Log::warn("Dropping invalid inbound redundant audio: reason={} bytes={} drops={}",
+                          reason, bytes, count);
+            }
+            return;
+        }
+
+        audio_packet::for_each_redundant_audio_child_reverse(
+            packet_bytes, bytes,
+            [&](const unsigned char* child, size_t child_len, uint8_t) {
+                handle_audio_message(child_len, reinterpret_cast<const char*>(child));
+            });
     }
 
     void schedule_metronome_sync(const MetronomeSyncHdr& sync) {
@@ -3504,6 +3561,7 @@ private:
     std::array<float, 960>                     opus_tx_accumulator_{};
     size_t                                     opus_tx_accumulated_frames_ = 0;
     std::chrono::steady_clock::time_point      opus_tx_accumulator_capture_time_{};
+    std::shared_ptr<std::vector<unsigned char>> previous_opus_audio_packet_;
     std::atomic<bool>                         opus_tx_accumulator_reset_requested_{false};
     std::atomic<bool>                         pcm_sender_running_{false};
     std::thread                               pcm_sender_thread_;

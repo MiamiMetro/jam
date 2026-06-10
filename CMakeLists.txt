@@ -20,6 +20,9 @@ endif()
 add_executable(latency_probe latency_probe.cpp)
 target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog opus token_crypto)
 
+add_executable(udp_path_probe udp_path_probe.cpp)
+target_link_libraries(udp_path_probe PRIVATE asio token_crypto)
+
 add_executable(room_routing_probe room_routing_probe.cpp)
 target_link_libraries(room_routing_probe PRIVATE asio spdlog::spdlog opus token_crypto)
 
@@ -46,6 +49,9 @@ if(JAM_BUILD_TESTS)
     target_link_libraries(participant_packet_queue_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 
     add_executable(sequence_tracker_self_test sequence_tracker_self_test.cpp)
+
+    add_executable(redundant_receive_policy_self_test redundant_receive_policy_self_test.cpp)
+    target_link_libraries(redundant_receive_policy_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 endif()
 
 add_executable(opus_receiver_harness opus_receiver_harness.cpp)
@@ -87,6 +93,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(audio_packet_self_test)
     jam_add_executable_test(participant_packet_queue_self_test)
     jam_add_executable_test(sequence_tracker_self_test)
+    jam_add_executable_test(redundant_receive_policy_self_test)
     jam_add_executable_test(recording_writer_self_test)
     jam_add_executable_test(audio_analysis_self_test)
     jam_add_executable_test(audio_backend_policy_self_test)
@@ -94,6 +101,8 @@ if(JAM_BUILD_TESTS)
 
     add_test(NAME opus_receiver_harness_self_test
              COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test)
+    add_test(NAME server_redundancy_relay_smoke
+             COMMAND $<TARGET_FILE:server> --redundancy-relay-smoke)
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
                  COMMAND $<TARGET_FILE:client> --udp-endpoint-guard-smoke)

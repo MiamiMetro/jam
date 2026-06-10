@@ -10,6 +10,10 @@ struct SequenceArrivalDelta {
     bool late_or_duplicate = false;
 };
 
+inline bool sequence_arrival_should_enqueue(const SequenceArrivalDelta& delta) {
+    return !delta.late_or_duplicate || delta.gaps_recovered > 0;
+}
+
 inline bool sequence_number_before(uint32_t lhs, uint32_t rhs) {
     if (lhs == rhs) {
         return false;

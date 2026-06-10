@@ -14,6 +14,7 @@ public:
     void reset() {
         join_confirmed_.store(false, std::memory_order_release);
         participant_id_.store(0, std::memory_order_release);
+        server_capabilities_.store(0, std::memory_order_release);
         last_join_sent_ = {};
     }
 
@@ -29,14 +30,16 @@ public:
         last_join_sent_ = now;
     }
 
-    void mark_join_ack(uint32_t participant_id) {
+    void mark_join_ack(uint32_t participant_id, uint32_t server_capabilities = 0) {
         participant_id_.store(participant_id, std::memory_order_release);
+        server_capabilities_.store(server_capabilities, std::memory_order_release);
         join_confirmed_.store(true, std::memory_order_release);
     }
 
     void mark_join_required() {
         join_confirmed_.store(false, std::memory_order_release);
         participant_id_.store(0, std::memory_order_release);
+        server_capabilities_.store(0, std::memory_order_release);
         last_join_sent_ = {};
     }
 
@@ -52,11 +55,20 @@ public:
         return participant_id_.load(std::memory_order_acquire);
     }
 
+    uint32_t server_capabilities() const {
+        return server_capabilities_.load(std::memory_order_acquire);
+    }
+
+    bool server_supports(uint32_t capability) const {
+        return (server_capabilities() & capability) != 0;
+    }
+
 private:
     std::chrono::steady_clock::duration     retry_interval_;
     std::chrono::steady_clock::time_point   last_join_sent_{};
     std::atomic<bool>                       join_confirmed_{false};
     std::atomic<uint32_t>                   participant_id_{0};
+    std::atomic<uint32_t>                   server_capabilities_{0};
 };
 
 }  // namespace join_reliability

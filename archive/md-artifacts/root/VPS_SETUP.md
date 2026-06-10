@@ -266,6 +266,19 @@ sudo systemctl restart jam-server
 sudo systemctl status jam-server --no-pager
 ```
 
+If `git pull` refuses because `CMakeLists.txt` has local VPS changes from an
+older manual `sed` workaround, discard that VPS-only edit and use the
+server-only CMake option instead:
+
+```bash
+git restore CMakeLists.txt
+git pull --ff-only
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJAM_BUILD_CLIENT=OFF -DJAM_BUILD_TESTS=OFF
+cmake --build build --target server
+sudo systemctl restart jam-server
+sudo systemctl status jam-server --no-pager
+```
+
 If using `rsync`, upload again, then rebuild and restart:
 
 ```bash
@@ -363,6 +376,15 @@ Deploy latest code and restart:
 ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git pull && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJAM_BUILD_CLIENT=OFF -DJAM_BUILD_TESTS=OFF && cmake --build build --target server && sudo systemctl restart jam-server && sudo systemctl status jam-server --no-pager"
 ```
 
+If that fails with `Your local changes to the following files would be
+overwritten by merge: CMakeLists.txt`, use this recovery one-liner. Do not use
+`sed` to comment out `cmake/client.cmake`; the server-only build flag is the
+supported path.
+
+```bat
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git restore CMakeLists.txt && git pull --ff-only && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJAM_BUILD_CLIENT=OFF -DJAM_BUILD_TESTS=OFF && cmake --build build --target server && sudo systemctl restart jam-server && sudo systemctl status jam-server --no-pager"
+```
+
 The commands with `sudo` use `-t` because they may need the `jam` password.
 
 Verify the deployed production-auth UDP path from your Windows machine:
@@ -388,6 +410,94 @@ nonzero if any of those checks fail. The malformed-packet flood checks that
 random public UDP noise does not corrupt the server receive loop. If either
 probe fails while server/client logs show `seq_recovered`, the remaining
 problem is real packet loss/backlog rather than reordering.
+
+If the Windows-to-VPS probe is intermittent, split the path before changing
+server/client code again:
+
+1. Run the probe on the VPS against loopback. This proves the deployed server
+   binary and Linux UDP socket path:
+
+   ```bash
+   cd /home/jam/jam
+   set -a
+   . /etc/jam/server.env
+   set +a
+   cmake --build build --target latency_probe
+   ./build/latency_probe --server 127.0.0.1 --port 9999 --server-id "$SERVER_ID" --join-secret "$JOIN_SECRET" --room vps-loopback --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
+   ```
+
+2. Run the probe on the VPS against its own public IP. This proves provider
+   public-IP routing/firewall without your home ISP/router:
+
+   ```bash
+   VPS_HOST=your.vps.ip.or.dns
+   ./build/latency_probe --server "$VPS_HOST" --port 9999 --server-id "$SERVER_ID" --join-secret "$JOIN_SECRET" --room vps-public-self --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
+   ```
+
+3. Run the Windows public probe and compare it with the server log:
+
+   ```bat
+   build\Release\latency_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room room1 --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
+   ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "journalctl -u jam-server -n 80 --no-pager"
+   ```
+
+4. Run the single-endpoint UDP path probe. This avoids the two-local-client
+   relay shape and tests one joined UDP socket with audio-rate PING round trips
+   while sending normal `ALIVE` keepalives:
+
+   ```bat
+   cmake --build build --config Release --target udp_path_probe
+   build\Release\udp_path_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room path-probe --seconds 20 --rate-pps 200 --payload-bytes 240 --require-clean
+   ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "journalctl -u jam-server -n 120 --no-pager | grep 'Ping diag interval'"
+   ```
+
+5. Optional server binary smoke before restarting the service:
+
+   ```bash
+   ./build/server --redundancy-relay-smoke
+   ```
+
+   This starts an ephemeral local server in-process and verifies that a current
+   server relays `AURD` redundant audio to current clients while falling back to
+   plain V2 audio for legacy clients.
+
+Interpretation:
+
+- If `udp_path_probe` prints `joined: 0`, the JOIN/JOIN_ACK handshake itself
+  failed. Check `SERVER_ID`, `JOIN_SECRET`, firewall rules, and the server log
+  before interpreting packet-rate loss.
+- If VPS loopback and VPS public-self pass but Windows public fails, the server
+  code is not the failing component.
+- If Windows `raw_audio_packets` is far below `sent_packets` and the server log
+  also shows sender `seq_gap`, packets are being lost before they reach the VPS.
+- If the server log shows clean ingress/forward counts but Windows
+  `raw_audio_packets` is low, packets are being lost on the VPS-to-client return
+  path or at the client/router receive path.
+- If `raw_audio_packets == sent_packets` but `receiver_queue_drops > 0`, the
+  receiver queue is the bottleneck.
+- If `raw_audio_packets == sent_packets`, `receiver_queue_drops == 0`, but
+  `gap_plc_frames > 0`, the path delivered all packets but with reordering/jitter
+  beyond the configured jitter wait.
+- If `udp_path_probe` loses replies and the server `Ping diag interval` line
+  also shows `seq_gap`, packets are being lost before they reach the VPS.
+- If `udp_path_probe` loses replies but the server `Ping diag interval` line
+  shows `received` and `reply_queued` near the sent count with no `seq_gap`,
+  packets reached the VPS and were queued back out; the loss is on the
+  VPS-to-client return path or at the client/router receive path.
+
+## Audio redundancy
+
+Current clients advertise `AUDIO_CAP_REDUNDANCY` in JOIN. Current servers reply
+with the same capability in JOIN_ACK. After that handshake, Opus audio is sent
+as `AURD` datagrams containing the current V2 packet and the previous V2 packet.
+This mirrors the packet redundancy strategy used by mature UDP jamming tools:
+if one media datagram is lost but the next arrives, the receiver can recover the
+missing sequence from the redundant copy. Servers still forward plain V2 audio
+to clients that did not advertise redundancy support.
+
+This does not make a path with extreme loss usable. If public probes show high
+loss in the raw UDP path, change provider/route/network rather than increasing
+buffers.
 
 ## Notes
 

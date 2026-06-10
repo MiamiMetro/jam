@@ -14,6 +14,7 @@ struct ClientInfo {
     std::string                           room_id;
     std::string                           profile_id;
     std::string                           display_name;
+    uint32_t                              capabilities = 0;
     ClientRole                            role = ClientRole::Performer;
     bool                                  joined_with_metadata = false;
 };

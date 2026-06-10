@@ -28,7 +28,7 @@ public:
 
     RegistrationResult register_client(const endpoint& ep, time_point now, std::string room_id,
                                        std::string profile_id, std::string display_name,
-                                       ClientRole role) {
+                                       ClientRole role, uint32_t capabilities = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
 
         RegistrationResult result;
@@ -42,6 +42,7 @@ public:
             client.last_alive           = now;
             client.display_name         = std::move(display_name);
             client.role                 = role;
+            client.capabilities         = capabilities;
             client.joined_with_metadata = true;
             result.client_id            = client.client_id;
         } else {
@@ -59,6 +60,7 @@ public:
             client.room_id = room_id;
             client.profile_id = profile_id;
             client.display_name = std::move(display_name);
+            client.capabilities = capabilities;
             client.role = role;
             client.joined_with_metadata = true;
             result.client_id = client.client_id;
@@ -136,6 +138,16 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = clients_.find(ep);
         return it != clients_.end() ? it->second.role : ClientRole::Performer;
+    }
+
+    uint32_t get_client_capabilities(const endpoint& ep) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        return it != clients_.end() ? it->second.capabilities : 0;
+    }
+
+    bool client_supports(const endpoint& ep, uint32_t capability) const {
+        return (get_client_capabilities(ep) & capability) != 0;
     }
 
     // Check if any clients exist

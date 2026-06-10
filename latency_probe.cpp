@@ -52,6 +52,12 @@ enum class ProbeCodec {
     PcmInt16,
 };
 
+void configure_probe_socket(udp::socket& socket) {
+    std::error_code ec;
+    socket.set_option(asio::socket_base::receive_buffer_size(UDP_SOCKET_BUFFER_BYTES), ec);
+    socket.set_option(asio::socket_base::send_buffer_size(UDP_SOCKET_BUFFER_BYTES), ec);
+}
+
 struct ProbeConfig {
     int frame_size = 240;
     int jitter_min_packets = 3;
@@ -82,10 +88,16 @@ struct Args {
 struct ProbeMetrics {
     int sent_packets = 0;
     int encode_failures = 0;
+    int raw_audio_packets = 0;
+    int receiver_queue_drops = 0;
+    int invalid_audio_packets = 0;
     int received_packets = 0;
     int decoded_packets = 0;
     int plc_frames = 0;
+    int gap_plc_frames = 0;
+    int empty_plc_frames = 0;
     int underruns = 0;
+    int gap_waits = 0;
     int decode_failures = 0;
     int decoded_size_mismatches = 0;
     int non_finite_samples = 0;
@@ -113,7 +125,9 @@ public:
                   const std::string& room, const std::string& user,
                   const std::string& join_token)
         : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
-          room_(room), user_(user), join_token_(join_token) {}
+          room_(room), user_(user), join_token_(join_token) {
+        configure_probe_socket(socket_);
+    }
 
     void start() {
         do_receive();
@@ -141,6 +155,18 @@ public:
 
     int received_count() const {
         return received_count_.load(std::memory_order_relaxed);
+    }
+
+    int raw_audio_count() const {
+        return raw_audio_count_.load(std::memory_order_relaxed);
+    }
+
+    int queue_drop_count() const {
+        return queue_drop_count_.load(std::memory_order_relaxed);
+    }
+
+    int invalid_audio_count() const {
+        return invalid_audio_count_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -181,9 +207,11 @@ private:
         MsgHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(hdr));
         if (hdr.magic == AUDIO_V2_MAGIC) {
+            raw_audio_count_.fetch_add(1, std::memory_order_relaxed);
             std::string reason;
             const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
             if (!audio_packet::validate_audio_packet_v2_bytes(packet_data, bytes, &reason)) {
+                invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
 
@@ -204,6 +232,8 @@ private:
 
             if (queue_.enqueue(packet)) {
                 received_count_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                queue_drop_count_.fetch_add(1, std::memory_order_relaxed);
             }
             return;
         }
@@ -228,6 +258,7 @@ private:
         }
 
         OpusPacket packet;
+        raw_audio_count_.fetch_add(1, std::memory_order_relaxed);
         if (audio_data[0] == PROBE_CODEC_OPUS) {
             packet.codec = AudioCodec::Opus;
         } else if (audio_data[0] == PROBE_CODEC_PCM_INT16) {
@@ -246,6 +277,8 @@ private:
 
         if (queue_.enqueue(packet)) {
             received_count_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            queue_drop_count_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -258,6 +291,9 @@ private:
     std::array<char, 1024> recv_buf_{};
     ParticipantOpusPacketQueue queue_;
     std::atomic<int> received_count_{0};
+    std::atomic<int> raw_audio_count_{0};
+    std::atomic<int> queue_drop_count_{0};
+    std::atomic<int> invalid_audio_count_{0};
 };
 
 class ProbeSender {
@@ -266,7 +302,9 @@ public:
                 const std::string& room, const std::string& user,
                 const std::string& join_token)
         : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
-          room_(room), user_(user), join_token_(join_token) {}
+          room_(room), user_(user), join_token_(join_token) {
+        configure_probe_socket(socket_);
+    }
 
     void send_join() {
         send_join_packet(room_, user_);
@@ -491,6 +529,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
                 decoded_samples = decoder.decode_plc(pcm.data(), config.frame_size);
                 if (decoded_samples > 0) {
                     metrics.plc_frames++;
+                    metrics.gap_plc_frames++;
                 }
             } else if (packet.codec == AudioCodec::Opus) {
                 if (config.codec != ProbeCodec::Opus) {
@@ -517,6 +556,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             inspect_samples(pcm, decoded_samples, output_base_sample, config, metrics,
                             previous_block, have_previous_block);
         } else if (dequeue_status == ParticipantOpusDequeueStatus::WaitingForGap) {
+            metrics.gap_waits++;
             continue;
         } else if (receiver.received_count() < config.total_packets) {
             metrics.underruns++;
@@ -524,6 +564,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
                 int plc_samples = decoder.decode_plc(pcm.data(), config.frame_size);
                 if (plc_samples > 0) {
                     metrics.plc_frames++;
+                    metrics.empty_plc_frames++;
                     inspect_samples(pcm, plc_samples, output_base_sample, config, metrics,
                                     previous_block, have_previous_block);
                 }
@@ -637,6 +678,9 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
         io_thread.join();
     }
 
+    metrics.raw_audio_packets = receiver.raw_audio_count();
+    metrics.receiver_queue_drops = receiver.queue_drop_count();
+    metrics.invalid_audio_packets = receiver.invalid_audio_count();
     metrics.received_packets = receiver.received_count();
 
     ProbeResult result;
@@ -693,6 +737,9 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "impulse_packet: " << IMPULSE_PACKET << "\n";
     std::cout << "sent_packets: " << m.sent_packets << "\n";
     std::cout << "encode_failures: " << m.encode_failures << "\n";
+    std::cout << "raw_audio_packets: " << m.raw_audio_packets << "\n";
+    std::cout << "receiver_queue_drops: " << m.receiver_queue_drops << "\n";
+    std::cout << "invalid_audio_packets: " << m.invalid_audio_packets << "\n";
     std::cout << "received_packets: " << m.received_packets << "\n";
     std::cout << "decoded_packets: " << m.decoded_packets << "\n";
     std::cout << "missing_packets: " << (m.sent_packets - m.received_packets) << "\n";
@@ -708,6 +755,9 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "final_queue_depth: " << m.final_queue_depth << "\n";
     std::cout << "underruns: " << m.underruns << "\n";
     std::cout << "plc_frames: " << m.plc_frames << "\n";
+    std::cout << "gap_plc_frames: " << m.gap_plc_frames << "\n";
+    std::cout << "empty_plc_frames: " << m.empty_plc_frames << "\n";
+    std::cout << "gap_waits: " << m.gap_waits << "\n";
     std::cout << "decode_failures: " << m.decode_failures << "\n";
     std::cout << "decoded_size_mismatches: " << m.decoded_size_mismatches << "\n";
     std::cout << "non_finite_samples: " << m.non_finite_samples << "\n";
