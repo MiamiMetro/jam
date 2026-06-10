@@ -10,7 +10,7 @@ inline constexpr uint16_t LOW_LATENCY_FRAME_COUNT = 120;
 inline constexpr uint16_t FAST_FRAME_COUNT = 240;
 inline constexpr uint16_t BALANCED_FRAME_COUNT = 480;
 inline constexpr uint16_t STABLE_FRAME_COUNT = 960;
-inline constexpr uint16_t DEFAULT_FRAME_COUNT = FAST_FRAME_COUNT;
+inline constexpr uint16_t DEFAULT_FRAME_COUNT = BALANCED_FRAME_COUNT;
 
 inline bool is_legal_frame_count(uint32_t sample_rate, uint16_t frame_count) {
     constexpr int durations_per_400_ms[] = {1, 2, 4, 8, 16, 24};

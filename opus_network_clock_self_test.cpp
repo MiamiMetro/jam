@@ -24,8 +24,8 @@ int main() {
             "Balanced Opus network packet must be 480 frames");
     require(opus_network_clock::STABLE_FRAME_COUNT == 960,
             "Stable Opus network packet must be 960 frames");
-    require(opus_network_clock::DEFAULT_FRAME_COUNT == opus_network_clock::FAST_FRAME_COUNT,
-            "Default Opus network packet must be fast");
+    require(opus_network_clock::DEFAULT_FRAME_COUNT == opus_network_clock::BALANCED_FRAME_COUNT,
+            "Default Opus network packet must be balanced");
     require(opus_network_clock::is_supported_frame_count(opus_network_clock::SAMPLE_RATE, 120),
             "120-frame Opus network packets must be supported");
     require(opus_network_clock::is_supported_frame_count(opus_network_clock::SAMPLE_RATE, 240),

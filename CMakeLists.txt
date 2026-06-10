@@ -127,7 +127,7 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "Startup config smoke:.*opus_packet=240.*jitter_floor=6.*auto_start_jitter=14.*auto_jitter=true")
+                "Startup config smoke:.*opus_packet=480.*jitter_floor=6.*auto_start_jitter=14.*auto_jitter=true")
         add_test(NAME client_startup_config_low_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke --latency-profile low)
         set_tests_properties(client_startup_config_low_smoke PROPERTIES
