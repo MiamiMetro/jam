@@ -10,6 +10,8 @@
 #include <cstring>
 #include <cctype>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -121,13 +123,127 @@ struct PerformerJoinOptions {
     std::string join_token;
 };
 
+struct AudioDevicePreferences {
+    bool loaded = false;
+    std::string audio_api = "All";
+    std::string input_device;
+    std::string input_api;
+    std::string output_device;
+    std::string output_api;
+};
+
+static std::string trim_copy(const std::string& value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    });
+    if (first == value.end()) {
+        return {};
+    }
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    }).base();
+    return std::string(first, last);
+}
+
+static std::filesystem::path client_config_path_for_executable(const char* executable_path) {
+    std::error_code ec;
+    std::filesystem::path exe =
+        executable_path != nullptr && executable_path[0] != '\0'
+            ? std::filesystem::absolute(std::filesystem::path(executable_path), ec)
+            : std::filesystem::current_path(ec);
+    if (ec) {
+        exe = std::filesystem::current_path();
+    }
+    const std::filesystem::path folder =
+        exe.has_parent_path() ? exe.parent_path() : std::filesystem::current_path();
+    return folder / "jam_client.ini";
+}
+
+static AudioDevicePreferences load_audio_device_preferences(
+    const std::filesystem::path& path) {
+    AudioDevicePreferences preferences;
+    std::ifstream input(path);
+    if (!input) {
+        return preferences;
+    }
+
+    preferences.loaded = true;
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim_copy(line);
+        if (line.empty() || line.front() == '#' || line.front() == ';') {
+            continue;
+        }
+        const auto equals = line.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        const std::string key = trim_copy(line.substr(0, equals));
+        const std::string value = trim_copy(line.substr(equals + 1));
+        if (key == "audio_api") {
+            preferences.audio_api = value.empty() ? "All" : value;
+        } else if (key == "input_device") {
+            preferences.input_device = value;
+        } else if (key == "input_api") {
+            preferences.input_api = value;
+        } else if (key == "output_device") {
+            preferences.output_device = value;
+        } else if (key == "output_api") {
+            preferences.output_api = value;
+        }
+    }
+    return preferences;
+}
+
+static AudioStream::DeviceIndex find_preferred_audio_device(
+    const std::vector<AudioStream::DeviceInfo>& devices,
+    const std::string& preferred_device,
+    const std::string& preferred_device_api,
+    const std::string& preferred_filter_api) {
+    if (preferred_device.empty()) {
+        return AudioStream::NO_DEVICE;
+    }
+
+    auto matches_name = [&](const AudioStream::DeviceInfo& device) {
+        return device.name == preferred_device;
+    };
+    auto matches_api = [](const AudioStream::DeviceInfo& device, const std::string& api_name) {
+        return api_name.empty() || api_name == "All" || device.api_name == api_name;
+    };
+
+    if (!preferred_device_api.empty() && preferred_device_api != "All") {
+        auto it = std::find_if(devices.begin(), devices.end(), [&](const auto& device) {
+            return matches_name(device) && matches_api(device, preferred_device_api);
+        });
+        if (it != devices.end()) {
+            return it->index;
+        }
+    }
+
+    auto it = std::find_if(devices.begin(), devices.end(), [&](const auto& device) {
+        return matches_name(device) && matches_api(device, preferred_filter_api);
+    });
+    if (it != devices.end()) {
+        return it->index;
+    }
+
+    it = std::find_if(devices.begin(), devices.end(), matches_name);
+    return it != devices.end() ? it->index : AudioStream::NO_DEVICE;
+}
+
 class Client {
 public:
     Client(asio::io_context& io_context, const std::string& server_address, uint16_t server_port,
-           PerformerJoinOptions performer_join_options = {})
+           PerformerJoinOptions performer_join_options = {},
+           std::filesystem::path audio_preferences_path = {},
+           AudioDevicePreferences audio_preferences = {})
         : io_context_(io_context),
           socket_(io_context, udp::endpoint(udp::v4(), 0)),
           performer_join_options_(std::move(performer_join_options)),
+          audio_preferences_path_(std::move(audio_preferences_path)),
+          selected_audio_api_filter_(audio_preferences.audio_api.empty()
+                                         ? "All"
+                                         : audio_preferences.audio_api),
           selected_input_device_(AudioStream::NO_DEVICE),
           selected_output_device_(AudioStream::NO_DEVICE),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
@@ -159,6 +275,10 @@ public:
         // Set default devices
         selected_input_device_  = AudioStream::get_default_input_device();
         selected_output_device_ = AudioStream::get_default_output_device();
+
+        if (audio_preferences.loaded) {
+            apply_audio_device_preferences(audio_preferences);
+        }
 
         // Initialize device info with default devices
         if (selected_input_device_ != AudioStream::NO_DEVICE) {
@@ -899,6 +1019,42 @@ public:
         return selected_output_device_;
     }
 
+    std::string get_audio_api_filter() const {
+        return selected_audio_api_filter_;
+    }
+
+    void set_audio_api_filter(std::string api_filter) {
+        selected_audio_api_filter_ = api_filter.empty() ? "All" : std::move(api_filter);
+    }
+
+    bool save_audio_device_preferences() const {
+        if (audio_preferences_path_.empty()) {
+            return false;
+        }
+
+        const auto* input_info = AudioStream::get_device_info(selected_input_device_);
+        const auto* output_info = AudioStream::get_device_info(selected_output_device_);
+        if (input_info == nullptr || output_info == nullptr) {
+            return false;
+        }
+
+        std::ofstream output(audio_preferences_path_, std::ios::trunc);
+        if (!output) {
+            Log::warn("Could not write audio device preferences: {}",
+                      audio_preferences_path_.string());
+            return false;
+        }
+
+        output << "audio_api=" << selected_audio_api_filter_ << '\n'
+               << "input_device=" << input_info->name << '\n'
+               << "input_api=" << input_info->api_name << '\n'
+               << "output_device=" << output_info->name << '\n'
+               << "output_api=" << output_info->api_name << '\n';
+        Log::info("Saved audio device preferences: {}",
+                  audio_preferences_path_.string());
+        return true;
+    }
+
     bool set_input_device(AudioStream::DeviceIndex device_index) {
         if (!AudioStream::is_device_valid(device_index)) {
             Log::error("Invalid input device index: {}", device_index);
@@ -1148,6 +1304,32 @@ public:
     }
 
 private:
+    void apply_audio_device_preferences(const AudioDevicePreferences& preferences) {
+        const auto input_devices = AudioStream::get_input_devices();
+        const auto output_devices = AudioStream::get_output_devices();
+
+        const auto preferred_input =
+            find_preferred_audio_device(input_devices, preferences.input_device,
+                                        preferences.input_api, preferences.audio_api);
+        const auto preferred_output =
+            find_preferred_audio_device(output_devices, preferences.output_device,
+                                        preferences.output_api, preferences.audio_api);
+
+        if (preferred_input != AudioStream::NO_DEVICE) {
+            selected_input_device_ = preferred_input;
+        } else if (!preferences.input_device.empty()) {
+            Log::warn("Saved input device is unavailable; using default: {}",
+                      preferences.input_device);
+        }
+
+        if (preferred_output != AudioStream::NO_DEVICE) {
+            selected_output_device_ = preferred_output;
+        } else if (!preferences.output_device.empty()) {
+            Log::warn("Saved output device is unavailable; using default: {}",
+                      preferences.output_device);
+        }
+    }
+
     udp::endpoint current_server_endpoint() const {
         std::lock_guard<std::mutex> lock(server_endpoint_mutex_);
         return server_endpoint_;
@@ -3864,6 +4046,8 @@ private:
     mutable std::mutex server_endpoint_mutex_;
     udp::endpoint      server_endpoint_;
     PerformerJoinOptions performer_join_options_;
+    std::filesystem::path audio_preferences_path_;
+    std::string           selected_audio_api_filter_ = "All";
     join_reliability::State join_state_{1s};
 
     AudioStream              audio_;
@@ -4724,21 +4908,46 @@ static void draw_bottom_bar(Client& client) {
     static int                                  pending_opus_frames_per_packet = 0;
     static bool                                 devices_initialized = false;
 
+    if (refresh_counter++ % 60 == 0 || !devices_initialized) {
+        input_devices  = AudioStream::get_input_devices();
+        output_devices = AudioStream::get_output_devices();
+        available_apis = AudioStream::get_apis();
+    }
+
+    auto selected_api_name = [&]() -> std::string {
+        if (selected_api < 0) {
+            return "All";
+        }
+        for (const auto& api: available_apis) {
+            if (api.index == selected_api) {
+                return api.name;
+            }
+        }
+        return "All";
+    };
+
+    auto api_index_for_name = [&](const std::string& api_name) {
+        if (api_name.empty() || api_name == "All") {
+            return -1;
+        }
+        for (const auto& api: available_apis) {
+            if (api.name == api_name) {
+                return api.index;
+            }
+        }
+        return -1;
+    };
+
     if (!devices_initialized) {
         pending_input         = client.get_selected_input_device();
         pending_output        = client.get_selected_output_device();
         pending_buffer_frames = client.get_audio_config().frames_per_buffer;
         pending_opus_frames_per_packet = client.get_opus_network_frame_count();
+        selected_api = api_index_for_name(client.get_audio_api_filter());
         devices_initialized   = true;
     }
     pending_buffer_frames =
         normalize_buffer_frames_for_codec(client.get_audio_codec(), pending_buffer_frames);
-
-    if (refresh_counter++ % 60 == 0) {
-        input_devices  = AudioStream::get_input_devices();
-        output_devices = AudioStream::get_output_devices();
-        available_apis = AudioStream::get_apis();
-    }
 
     // API selector
     ImGui::AlignTextToFramePadding();
@@ -4822,7 +5031,8 @@ static void draw_bottom_bar(Client& client) {
     }
     if (ImGui::BeginCombo("##InputDev", input_preview.c_str())) {
         for (const auto& dev: input_devices) {
-            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name) {
+            const std::string api_filter = selected_api_name();
+            if (api_filter != "All" && dev.api_name != api_filter) {
                 continue;
             }
             char dev_label[256];
@@ -4850,7 +5060,8 @@ static void draw_bottom_bar(Client& client) {
     }
     if (ImGui::BeginCombo("##OutputDev", output_preview.c_str())) {
         for (const auto& dev: output_devices) {
-            if (selected_api >= 0 && dev.api_name != available_apis[selected_api].name) {
+            const std::string api_filter = selected_api_name();
+            if (api_filter != "All" && dev.api_name != api_filter) {
                 continue;
             }
             char dev_label[256];
@@ -4952,10 +5163,12 @@ static void draw_bottom_bar(Client& client) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8F, 0.6F, 0.2F, 1.0F));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9F, 0.7F, 0.3F, 1.0F));
         if (ImGui::Button("APPLY")) {
+            client.set_audio_api_filter(selected_api_name());
             client.set_input_device(pending_input);
             client.set_output_device(pending_output);
             client.set_requested_frames_per_buffer(pending_buffer_frames);
             client.set_opus_network_frame_count(pending_opus_frames_per_packet);
+            client.save_audio_device_preferences();
             if (client.is_audio_stream_active() && stream_restart_needed) {
                 client.swap_audio_devices(pending_input, pending_output);
             }
@@ -4976,10 +5189,12 @@ static void draw_bottom_bar(Client& client) {
             if (ImGui::Button("START")) {
                 if (pending_input != AudioStream::NO_DEVICE &&
                     pending_output != AudioStream::NO_DEVICE) {
+                    client.set_audio_api_filter(selected_api_name());
                     client.set_input_device(pending_input);
                     client.set_output_device(pending_output);
                     client.set_requested_frames_per_buffer(pending_buffer_frames);
                     client.set_opus_network_frame_count(pending_opus_frames_per_packet);
+                    client.save_audio_device_preferences();
                     AudioStream::AudioConfig config = client.get_audio_config();
                     client.start_audio_stream(pending_input, pending_output, config);
                 }
@@ -5138,6 +5353,7 @@ void draw_client_ui(Client& client) {
 struct ClientStartupOptions {
     std::string server_address = "127.0.0.1";
     uint16_t server_port = 9999;
+    std::string app_version;
     int requested_frames = 0;
     std::string startup_latency_profile = "adaptive";
     std::optional<int> startup_opus_packet_frames;
@@ -5180,6 +5396,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.server_address = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             options.server_port = parse_udp_port(argv[++i], "--port");
+        } else if (arg == "--app-version" && i + 1 < argc) {
+            options.app_version = argv[++i];
         } else if (arg == "--room" && i + 1 < argc) {
             options.performer_join.room_id = argv[++i];
         } else if (arg == "--room-handle" && i + 1 < argc) {
@@ -5746,9 +5964,13 @@ int main(int argc, char** argv) {
         }
 
         asio::io_context io_context;
+        const auto audio_preferences_path = client_config_path_for_executable(argv[0]);
+        const auto audio_preferences =
+            load_audio_device_preferences(audio_preferences_path);
 
         Client client_instance(io_context, startup_options.server_address,
-                               startup_options.server_port, startup_options.performer_join);
+                               startup_options.server_port, startup_options.performer_join,
+                               audio_preferences_path, audio_preferences);
         if (!startup_options.required_audio_api.empty()) {
             const auto input_dev =
                 find_device_for_api(startup_options.required_audio_api, true);
@@ -5756,6 +5978,7 @@ int main(int argc, char** argv) {
                 find_device_for_api(startup_options.required_audio_api, false);
             client_instance.set_input_device(input_dev);
             client_instance.set_output_device(output_dev);
+            client_instance.set_audio_api_filter(startup_options.required_audio_api);
             Log::info("Startup required audio API: {}", startup_options.required_audio_api);
         }
         if (startup_options.requested_frames > 0) {
@@ -5807,7 +6030,7 @@ int main(int argc, char** argv) {
             Log::info(
                 "Startup config smoke: codec={} frames={} opus_packet={} jitter_floor={} "
                 "auto_start_jitter={} queue_limit={} age_limit_ms={} auto_jitter={} "
-                "broadcast_ipc_port={}",
+                "broadcast_ipc_port={} app_version={}",
                 client_instance.get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
                 client_instance.get_audio_config().frames_per_buffer,
                 client_instance.get_opus_network_frame_count(),
@@ -5820,7 +6043,8 @@ int main(int argc, char** argv) {
                 client_instance.get_opus_auto_jitter_default() ? "true" : "false",
                 startup_options.broadcast_ipc_port.has_value()
                     ? std::to_string(*startup_options.broadcast_ipc_port)
-                    : "disabled");
+                    : "disabled",
+                startup_options.app_version.empty() ? "none" : startup_options.app_version);
             client_instance.stop_connection();
             log.flush();
             return 0;
@@ -5875,7 +6099,11 @@ int main(int argc, char** argv) {
             }
         } else {
             // Run UI on main thread (required for GLFW on macOS)
-            Gui app(810, 555, "Jam", false, 60);
+            const std::string window_title =
+                startup_options.app_version.empty()
+                    ? "Jam"
+                    : "Jam " + startup_options.app_version;
+            Gui app(810, 555, window_title.c_str(), false, 60);
 
             // Clean lambda - just delegates to separate function
             app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });
