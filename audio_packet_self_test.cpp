@@ -71,22 +71,31 @@ void test_length_mismatch_still_rejected() {
 void test_redundant_audio_packet_validates_children() {
     std::vector<unsigned char> first_payload(8, 0x11);
     std::vector<unsigned char> second_payload(8, 0x22);
+    std::vector<unsigned char> third_payload(8, 0x33);
+    std::vector<unsigned char> fourth_payload(8, 0x44);
     auto first = audio_packet::create_audio_packet_v2(
         AudioCodec::Opus, 10, 48000, 240, 1, first_payload.data(),
         static_cast<uint16_t>(first_payload.size()));
     auto second = audio_packet::create_audio_packet_v2(
         AudioCodec::Opus, 9, 48000, 240, 1, second_payload.data(),
         static_cast<uint16_t>(second_payload.size()));
+    auto third = audio_packet::create_audio_packet_v2(
+        AudioCodec::Opus, 8, 48000, 240, 1, third_payload.data(),
+        static_cast<uint16_t>(third_payload.size()));
+    auto fourth = audio_packet::create_audio_packet_v2(
+        AudioCodec::Opus, 7, 48000, 240, 1, fourth_payload.data(),
+        static_cast<uint16_t>(fourth_payload.size()));
 
     auto redundant =
-        audio_packet::create_redundant_audio_packet({first.get(), second.get()});
+        audio_packet::create_redundant_audio_packet(
+            {first.get(), second.get(), third.get(), fourth.get()});
     require(redundant != nullptr, "valid v2 packets should build redundant audio packet");
     require(audio_packet::validate_redundant_audio_packet_bytes(redundant->data(),
                                                                 redundant->size()),
             "valid redundant audio packet should validate");
 
     int child_count = 0;
-    uint32_t sequences[2] = {};
+    uint32_t sequences[4] = {};
     audio_packet::for_each_redundant_audio_child(
         redundant->data(), redundant->size(),
         [&](const unsigned char* child, size_t child_len, uint8_t index) {
@@ -96,9 +105,39 @@ void test_redundant_audio_packet_validates_children() {
             sequences[index] = child_hdr.sequence;
             ++child_count;
         });
-    require(child_count == 2, "redundant packet should expose both children");
-    require(sequences[0] == 10 && sequences[1] == 9,
+    require(child_count == 4, "redundant packet should expose all protected children");
+    require(sequences[0] == 10 && sequences[1] == 9 && sequences[2] == 8 &&
+                sequences[3] == 7,
             "redundant packet should keep current packet first");
+}
+
+void test_redundant_audio_packet_respects_target_size() {
+    std::vector<unsigned char> payload(100, 0x55);
+    auto current = audio_packet::create_audio_packet_v2(
+        AudioCodec::Opus, 10, 48000, 240, 1, payload.data(),
+        static_cast<uint16_t>(payload.size()));
+    auto previous = audio_packet::create_audio_packet_v2(
+        AudioCodec::Opus, 9, 48000, 240, 1, payload.data(),
+        static_cast<uint16_t>(payload.size()));
+    auto older = audio_packet::create_audio_packet_v2(
+        AudioCodec::Opus, 8, 48000, 240, 1, payload.data(),
+        static_cast<uint16_t>(payload.size()));
+
+    const size_t target_size =
+        audio_packet::redundant_header_size() + current->size() + previous->size();
+    auto redundant = audio_packet::create_redundant_audio_packet(
+        {current.get(), previous.get(), older.get()}, target_size);
+    require(redundant != nullptr, "target-sized redundant packet should build");
+    require(redundant->size() == target_size,
+            "redundant packet should omit older children that exceed target size");
+
+    int child_count = 0;
+    audio_packet::for_each_redundant_audio_child(
+        redundant->data(), redundant->size(),
+        [&](const unsigned char*, size_t, uint8_t) {
+            ++child_count;
+        });
+    require(child_count == 2, "target cap should keep only fitting children");
 }
 
 void test_redundant_audio_packet_reverse_iteration_is_oldest_first() {
@@ -182,6 +221,7 @@ int main() {
     test_pcm_payload_must_match_shape();
     test_length_mismatch_still_rejected();
     test_redundant_audio_packet_validates_children();
+    test_redundant_audio_packet_respects_target_size();
     test_redundant_audio_packet_reverse_iteration_is_oldest_first();
     test_redundant_audio_packet_rejects_bad_children();
     test_redundant_audio_sender_id_stamping();

@@ -32,6 +32,7 @@
 #include "protocol.h"
 #include "sequence_tracker.h"
 #include "server_config.h"
+#include "udp_port.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -64,7 +65,7 @@ static const char* runtime_arch_name() {
 }
 
 struct ServerOptions {
-    short       port = 9999;
+    uint16_t    port = 9999;
     bool        allow_insecure_dev_joins = false;
     std::string server_id = "local-dev";
     std::string join_secret;
@@ -1115,7 +1116,7 @@ ServerOptions parse_server_options(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
-            options.port = static_cast<short>(std::stoi(argv[++i]));
+            options.port = parse_udp_port(argv[++i], "--port");
         } else if (arg == "--server-id" && i + 1 < argc) {
             options.server_id = argv[++i];
         } else if (arg == "--join-secret" && i + 1 < argc) {

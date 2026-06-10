@@ -11,6 +11,7 @@
 #include "audio_packet.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "udp_port.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -173,7 +174,7 @@ bool receive_participant_info_for_profile(udp::socket& socket, const std::string
 
 int main(int argc, char** argv) {
     std::string server_address = "127.0.0.1";
-    short       server_port    = 9999;
+    uint16_t    server_port    = 9999;
     std::string server_id      = "local-dev";
     std::string secret;
     std::string token_room_override;
@@ -186,7 +187,7 @@ int main(int argc, char** argv) {
         if (arg == "--server" && i + 1 < argc) {
             server_address = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
-            server_port = static_cast<short>(std::stoi(argv[++i]));
+            server_port = parse_udp_port(argv[++i], "--port");
         } else if (arg == "--server-id" && i + 1 < argc) {
             server_id = argv[++i];
         } else if (arg == "--secret" && i + 1 < argc) {

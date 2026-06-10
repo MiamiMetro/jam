@@ -14,6 +14,7 @@
 #include "packet_builder.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "udp_port.h"
 
 using asio::ip::udp;
 using clock_type = std::chrono::steady_clock;
@@ -23,7 +24,7 @@ namespace {
 
 struct Args {
     std::string host = "127.0.0.1";
-    unsigned short port = 9999;
+    uint16_t port = 9999;
     std::string server_id = "local-dev";
     std::string join_secret;
     std::string room = "udp-path-probe";
@@ -287,7 +288,7 @@ Args parse_args(int argc, char** argv) {
         if ((arg == "--server" || arg == "--host") && i + 1 < argc) {
             args.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
-            args.port = static_cast<unsigned short>(std::stoi(argv[++i]));
+            args.port = parse_udp_port(argv[++i], "--port");
         } else if (arg == "--server-id" && i + 1 < argc) {
             args.server_id = argv[++i];
         } else if (arg == "--join-secret" && i + 1 < argc) {

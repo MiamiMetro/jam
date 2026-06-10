@@ -27,6 +27,7 @@
 #include "participant_info.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "udp_port.h"
 
 using asio::ip::udp;
 using clock_type = std::chrono::steady_clock;
@@ -44,6 +45,7 @@ constexpr int   CLICK_SAMPLES = 32;
 constexpr float CLICK_AMPLITUDE = 0.8F;
 constexpr float DETECTION_THRESHOLD = 0.05F;
 constexpr int   MAX_FRAME_SAMPLES = 960;
+constexpr size_t PROBE_RECV_BUF_SIZE = 2048;
 constexpr uint8_t PROBE_CODEC_OPUS = 0;
 constexpr uint8_t PROBE_CODEC_PCM_INT16 = 1;
 
@@ -67,7 +69,7 @@ struct ProbeConfig {
 
 struct Args {
     std::string host = "127.0.0.1";
-    unsigned short port = 9999;
+    uint16_t port = 9999;
     std::string server_id = "local-dev";
     std::string join_secret;
     int64_t join_token_ttl_ms = 120000;
@@ -89,6 +91,8 @@ struct ProbeMetrics {
     int sent_packets = 0;
     int encode_failures = 0;
     int raw_audio_packets = 0;
+    int redundant_audio_packets = 0;
+    int v2_audio_packets = 0;
     int receiver_queue_drops = 0;
     int invalid_audio_packets = 0;
     int received_packets = 0;
@@ -98,6 +102,10 @@ struct ProbeMetrics {
     int empty_plc_frames = 0;
     int underruns = 0;
     int gap_waits = 0;
+    int sequence_gaps = 0;
+    int sequence_gap_recoveries = 0;
+    int sequence_late_or_duplicate = 0;
+    int sequence_unresolved_gaps = 0;
     int decode_failures = 0;
     int decoded_size_mismatches = 0;
     int non_finite_samples = 0;
@@ -161,12 +169,36 @@ public:
         return raw_audio_count_.load(std::memory_order_relaxed);
     }
 
+    int redundant_audio_count() const {
+        return redundant_audio_count_.load(std::memory_order_relaxed);
+    }
+
+    int v2_audio_count() const {
+        return v2_audio_count_.load(std::memory_order_relaxed);
+    }
+
     int queue_drop_count() const {
         return queue_drop_count_.load(std::memory_order_relaxed);
     }
 
     int invalid_audio_count() const {
         return invalid_audio_count_.load(std::memory_order_relaxed);
+    }
+
+    int sequence_gap_count() const {
+        return sequence_gap_count_.load(std::memory_order_relaxed);
+    }
+
+    int sequence_gap_recovery_count() const {
+        return sequence_gap_recovery_count_.load(std::memory_order_relaxed);
+    }
+
+    int sequence_late_or_duplicate_count() const {
+        return sequence_late_or_duplicate_count_.load(std::memory_order_relaxed);
+    }
+
+    int sequence_unresolved_gap_count() const {
+        return sequence_unresolved_gap_count_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -181,6 +213,7 @@ private:
         JoinHdr hdr{};
         hdr.magic = CTRL_MAGIC;
         hdr.type = CtrlHdr::Cmd::JOIN;
+        hdr.capabilities = AUDIO_CAP_REDUNDANCY;
         packet_builder::write_fixed(hdr.room_id, room);
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
@@ -206,35 +239,29 @@ private:
 
         MsgHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(hdr));
-        if (hdr.magic == AUDIO_V2_MAGIC) {
+        if (hdr.magic == AUDIO_REDUNDANT_MAGIC) {
             raw_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            redundant_audio_count_.fetch_add(1, std::memory_order_relaxed);
             std::string reason;
             const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
-            if (!audio_packet::validate_audio_packet_v2_bytes(packet_data, bytes, &reason)) {
+            if (!audio_packet::validate_redundant_audio_packet_bytes(packet_data, bytes, &reason)) {
                 invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
 
-            AudioHdrV2 audio{};
-            std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
+            audio_packet::for_each_redundant_audio_child_reverse(
+                packet_data, bytes,
+                [this](const unsigned char* child, size_t child_len, uint8_t) {
+                    handle_v2_audio_packet(child, child_len);
+                });
+            return;
+        }
 
-            OpusPacket packet;
-            std::memcpy(packet.data.data(), packet_builder::audio_v2_payload(packet_data),
-                        audio.payload_bytes);
-            packet.size = audio.payload_bytes;
-            packet.timestamp = clock_type::now();
-            packet.codec = audio.codec;
-            packet.sequence = audio.sequence;
-            packet.sequence_valid = true;
-            packet.sample_rate = audio.sample_rate;
-            packet.frame_count = audio.frame_count;
-            packet.channels = audio.channels;
-
-            if (queue_.enqueue(packet)) {
-                received_count_.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                queue_drop_count_.fetch_add(1, std::memory_order_relaxed);
-            }
+        if (hdr.magic == AUDIO_V2_MAGIC) {
+            raw_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            v2_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
+            handle_v2_audio_packet(packet_data, bytes);
             return;
         }
 
@@ -282,18 +309,71 @@ private:
         }
     }
 
+    void handle_v2_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
+        std::string reason;
+        if (!audio_packet::validate_audio_packet_v2_bytes(packet_data, bytes, &reason)) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        AudioHdrV2 audio{};
+        std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
+        const auto sequence_delta = sequence_tracker_.record(audio.sequence);
+        if (sequence_delta.gaps_detected > 0) {
+            sequence_gap_count_.fetch_add(static_cast<int>(sequence_delta.gaps_detected),
+                                          std::memory_order_relaxed);
+        }
+        if (sequence_delta.gaps_recovered > 0) {
+            sequence_gap_recovery_count_.fetch_add(
+                static_cast<int>(sequence_delta.gaps_recovered), std::memory_order_relaxed);
+        }
+        if (sequence_delta.late_or_duplicate) {
+            sequence_late_or_duplicate_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+        sequence_unresolved_gap_count_.store(
+            static_cast<int>(sequence_tracker_.unresolved_gaps()), std::memory_order_relaxed);
+        if (!sequence_arrival_should_enqueue(sequence_delta)) {
+            return;
+        }
+
+        OpusPacket packet;
+        std::memcpy(packet.data.data(), packet_builder::audio_v2_payload(packet_data),
+                    audio.payload_bytes);
+        packet.size = audio.payload_bytes;
+        packet.timestamp = clock_type::now();
+        packet.codec = audio.codec;
+        packet.sequence = audio.sequence;
+        packet.sequence_valid = true;
+        packet.sample_rate = audio.sample_rate;
+        packet.frame_count = audio.frame_count;
+        packet.channels = audio.channels;
+
+        if (queue_.enqueue(packet)) {
+            received_count_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            queue_drop_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     udp::socket socket_;
     udp::endpoint server_endpoint_;
     udp::endpoint remote_endpoint_;
     std::string room_;
     std::string user_;
     std::string join_token_;
-    std::array<char, 1024> recv_buf_{};
+    std::array<char, PROBE_RECV_BUF_SIZE> recv_buf_{};
     ParticipantOpusPacketQueue queue_;
+    SequenceArrivalTracker sequence_tracker_;
     std::atomic<int> received_count_{0};
     std::atomic<int> raw_audio_count_{0};
+    std::atomic<int> redundant_audio_count_{0};
+    std::atomic<int> v2_audio_count_{0};
     std::atomic<int> queue_drop_count_{0};
     std::atomic<int> invalid_audio_count_{0};
+    std::atomic<int> sequence_gap_count_{0};
+    std::atomic<int> sequence_gap_recovery_count_{0};
+    std::atomic<int> sequence_late_or_duplicate_count_{0};
+    std::atomic<int> sequence_unresolved_gap_count_{0};
 };
 
 class ProbeSender {
@@ -329,12 +409,35 @@ public:
         auto packet = audio_packet::create_audio_packet_v2(
             audio_codec, sequence, SAMPLE_RATE, static_cast<uint16_t>(frame_count),
             CHANNELS, payload, static_cast<uint16_t>(payload_bytes));
+        std::vector<const std::vector<unsigned char>*> children{packet.get()};
+        for (const auto& previous_packet: recent_audio_packets_) {
+            if (previous_packet != nullptr) {
+                children.push_back(previous_packet.get());
+            }
+        }
+        auto redundant_packet = audio_packet::create_redundant_audio_packet(
+            children, AUDIO_REDUNDANT_TARGET_BYTES);
+        auto wire_packet = redundant_packet != nullptr ? redundant_packet : packet;
+        remember_recent_audio_packet(packet);
+
         std::error_code ec;
-        socket_.send_to(asio::buffer(packet->data(), packet->size()), server_endpoint_, 0, ec);
+        socket_.send_to(asio::buffer(wire_packet->data(), wire_packet->size()), server_endpoint_,
+                        0, ec);
         return !ec;
     }
 
 private:
+    void remember_recent_audio_packet(
+        const std::shared_ptr<std::vector<unsigned char>>& packet) {
+        if (packet == nullptr) {
+            return;
+        }
+        recent_audio_packets_.insert(recent_audio_packets_.begin(), packet);
+        if (recent_audio_packets_.size() >= MAX_AUDIO_REDUNDANT_PACKETS) {
+            recent_audio_packets_.resize(MAX_AUDIO_REDUNDANT_PACKETS - 1);
+        }
+    }
+
     void send_ctrl(CtrlHdr::Cmd cmd) {
         CtrlHdr hdr{};
         hdr.magic = CTRL_MAGIC;
@@ -346,6 +449,7 @@ private:
         JoinHdr hdr{};
         hdr.magic = CTRL_MAGIC;
         hdr.type = CtrlHdr::Cmd::JOIN;
+        hdr.capabilities = AUDIO_CAP_REDUNDANCY;
         packet_builder::write_fixed(hdr.room_id, room);
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
@@ -359,6 +463,7 @@ private:
     std::string room_;
     std::string user_;
     std::string join_token_;
+    std::vector<std::shared_ptr<std::vector<unsigned char>>> recent_audio_packets_;
 };
 
 void fill_probe_frame(int packet_index, const ProbeConfig& config, std::vector<float>& frame) {
@@ -679,9 +784,15 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     }
 
     metrics.raw_audio_packets = receiver.raw_audio_count();
+    metrics.redundant_audio_packets = receiver.redundant_audio_count();
+    metrics.v2_audio_packets = receiver.v2_audio_count();
     metrics.receiver_queue_drops = receiver.queue_drop_count();
     metrics.invalid_audio_packets = receiver.invalid_audio_count();
     metrics.received_packets = receiver.received_count();
+    metrics.sequence_gaps = receiver.sequence_gap_count();
+    metrics.sequence_gap_recoveries = receiver.sequence_gap_recovery_count();
+    metrics.sequence_late_or_duplicate = receiver.sequence_late_or_duplicate_count();
+    metrics.sequence_unresolved_gaps = receiver.sequence_unresolved_gap_count();
 
     ProbeResult result;
     result.config = config;
@@ -738,6 +849,8 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "sent_packets: " << m.sent_packets << "\n";
     std::cout << "encode_failures: " << m.encode_failures << "\n";
     std::cout << "raw_audio_packets: " << m.raw_audio_packets << "\n";
+    std::cout << "redundant_audio_packets: " << m.redundant_audio_packets << "\n";
+    std::cout << "v2_audio_packets: " << m.v2_audio_packets << "\n";
     std::cout << "receiver_queue_drops: " << m.receiver_queue_drops << "\n";
     std::cout << "invalid_audio_packets: " << m.invalid_audio_packets << "\n";
     std::cout << "received_packets: " << m.received_packets << "\n";
@@ -758,6 +871,10 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "gap_plc_frames: " << m.gap_plc_frames << "\n";
     std::cout << "empty_plc_frames: " << m.empty_plc_frames << "\n";
     std::cout << "gap_waits: " << m.gap_waits << "\n";
+    std::cout << "sequence_gaps: " << m.sequence_gaps << "\n";
+    std::cout << "sequence_gap_recoveries: " << m.sequence_gap_recoveries << "\n";
+    std::cout << "sequence_late_or_duplicate: " << m.sequence_late_or_duplicate << "\n";
+    std::cout << "sequence_unresolved_gaps: " << m.sequence_unresolved_gaps << "\n";
     std::cout << "decode_failures: " << m.decode_failures << "\n";
     std::cout << "decoded_size_mismatches: " << m.decoded_size_mismatches << "\n";
     std::cout << "non_finite_samples: " << m.non_finite_samples << "\n";
@@ -774,9 +891,11 @@ void print_result(const Args& args, const ProbeResult& result) {
 
 void print_sweep_header() {
     std::cout << "codec,frames,jitter,playout_ppm,latency_ms,latency_samples,sent,received,decoded,max_queue,"
-                 "avg_queue,queue_drift,min_queue,final_queue,encode_failures,underruns,plc,"
-                 "decode_failures,size_mismatch,non_finite,out_of_range,repeated_blocks,"
-                 "max_discontinuity,status\n";
+                 "avg_queue,queue_drift,min_queue,final_queue,raw_audio,redundant_audio,"
+                 "v2_audio,encode_failures,underruns,plc,gap_plc,empty_plc,gap_waits,"
+                 "seq_gaps,seq_recoveries,seq_late,seq_unresolved,decode_failures,"
+                 "size_mismatch,non_finite,out_of_range,repeated_blocks,max_discontinuity,"
+                 "status\n";
 }
 
 void print_sweep_row(const Args& args, const ProbeResult& result) {
@@ -793,12 +912,16 @@ void print_sweep_row(const Args& args, const ProbeResult& result) {
     std::cout << codec_name(c.codec) << ',' << c.frame_size << ',' << c.jitter_min_packets << ','
               << args.playout_ppm << ',' << result.latency_ms << ',' << result.latency_samples << ',' << m.sent_packets << ','
               << m.received_packets << ',' << m.decoded_packets << ',' << m.max_queue_depth << ','
-              << avg_queue << ',' << (avg_queue - static_cast<double>(c.jitter_min_packets)) << ','
-              << min_queue << ',' << m.final_queue_depth << ',' << m.encode_failures << ','
-              << m.underruns << ',' << m.plc_frames << ',' << m.decode_failures << ','
-              << m.decoded_size_mismatches << ',' << m.non_finite_samples << ','
-              << m.out_of_range_samples << ',' << m.repeated_blocks << ','
-              << m.max_discontinuity << ','
+               << avg_queue << ',' << (avg_queue - static_cast<double>(c.jitter_min_packets)) << ','
+              << min_queue << ',' << m.final_queue_depth << ',' << m.raw_audio_packets << ','
+              << m.redundant_audio_packets << ',' << m.v2_audio_packets << ','
+              << m.encode_failures << ',' << m.underruns << ',' << m.plc_frames << ','
+              << m.gap_plc_frames << ',' << m.empty_plc_frames << ',' << m.gap_waits << ','
+              << m.sequence_gaps << ',' << m.sequence_gap_recoveries << ','
+              << m.sequence_late_or_duplicate << ',' << m.sequence_unresolved_gaps << ','
+              << m.decode_failures << ',' << m.decoded_size_mismatches << ','
+              << m.non_finite_samples << ',' << m.out_of_range_samples << ','
+              << m.repeated_blocks << ',' << m.max_discontinuity << ','
               << (has_clean_failure_indicators(result) ? "warn" : "ok")
               << "\n";
 }
@@ -810,7 +933,7 @@ Args parse_args(int argc, char** argv) {
         if ((arg == "--server" || arg == "--host") && i + 1 < argc) {
             args.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
-            args.port = static_cast<unsigned short>(std::stoi(argv[++i]));
+            args.port = parse_udp_port(argv[++i], "--port");
         } else if (arg == "--server-id" && i + 1 < argc) {
             args.server_id = argv[++i];
         } else if (arg == "--join-secret" && i + 1 < argc) {

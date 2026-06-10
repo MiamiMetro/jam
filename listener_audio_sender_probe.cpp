@@ -18,6 +18,7 @@
 #include "packet_builder.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "udp_port.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -73,7 +74,7 @@ void send_leave(udp::socket& socket, const udp::endpoint& server) {
 int main(int argc, char** argv) {
     try {
         std::string server_address = "127.0.0.1";
-        short       server_port = 9999;
+        uint16_t    server_port = 9999;
         std::string server_id = "local-dev";
         std::string secret;
         std::string room = "room-a";
@@ -93,7 +94,7 @@ int main(int argc, char** argv) {
             if (arg == "--server") {
                 server_address = require_value(arg);
             } else if (arg == "--port") {
-                server_port = static_cast<short>(std::stoi(require_value(arg)));
+                server_port = parse_udp_port(require_value(arg), "--port");
             } else if (arg == "--server-id") {
                 server_id = require_value(arg);
             } else if (arg == "--secret") {

@@ -15,6 +15,7 @@
 #include "audio_packet.h"
 #include "packet_builder.h"
 #include "protocol.h"
+#include "udp_port.h"
 
 using asio::ip::udp;
 using clock_type = std::chrono::steady_clock;
@@ -30,7 +31,7 @@ constexpr uint8_t UNSTABLE_MARKER = 2;
 
 struct Config {
     std::string host = "127.0.0.1";
-    unsigned short port = 9999;
+    uint16_t port = 9999;
     int frames = DEFAULT_FRAMES;
     int packets = DEFAULT_PACKETS;
     int stable_target = 3;
@@ -212,7 +213,7 @@ Config parse_args(int argc, char** argv) {
         if ((arg == "--server" || arg == "--host") && i + 1 < argc) {
             config.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
-            config.port = static_cast<unsigned short>(std::stoi(argv[++i]));
+            config.port = parse_udp_port(argv[++i], "--port");
         } else if (arg == "--frames" && i + 1 < argc) {
             config.frames = std::stoi(argv[++i]);
         } else if (arg == "--packets" && i + 1 < argc) {

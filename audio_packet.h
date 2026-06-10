@@ -267,17 +267,28 @@ inline bool embed_sender_id_in_redundant_audio_packet(unsigned char* data, size_
 }
 
 inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet(
-    const std::vector<const std::vector<unsigned char>*>& packets) {
+    const std::vector<const std::vector<unsigned char>*>& packets,
+    size_t max_packet_bytes = 0) {
     if (packets.empty() || packets.size() > MAX_AUDIO_REDUNDANT_PACKETS) {
         return nullptr;
     }
 
     size_t total_bytes = redundant_header_size();
+    std::vector<const std::vector<unsigned char>*> selected_packets;
+    selected_packets.reserve(packets.size());
     for (const auto* packet: packets) {
         if (packet == nullptr ||
             !validate_audio_packet_v2_bytes(packet->data(), packet->size())) {
             return nullptr;
         }
+        if (max_packet_bytes > 0 &&
+            total_bytes + packet->size() > max_packet_bytes) {
+            if (selected_packets.empty()) {
+                return nullptr;
+            }
+            break;
+        }
+        selected_packets.push_back(packet);
         total_bytes += packet->size();
     }
 
@@ -285,11 +296,11 @@ inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet
     redundant->resize(total_bytes);
     AudioRedundantHdr hdr{};
     hdr.magic = AUDIO_REDUNDANT_MAGIC;
-    hdr.packet_count = static_cast<uint8_t>(packets.size());
+    hdr.packet_count = static_cast<uint8_t>(selected_packets.size());
     std::memcpy(redundant->data(), &hdr, redundant_header_size());
 
     size_t offset = redundant_header_size();
-    for (const auto* packet: packets) {
+    for (const auto* packet: selected_packets) {
         std::memcpy(redundant->data() + offset, packet->data(), packet->size());
         offset += packet->size();
     }

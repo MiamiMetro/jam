@@ -18,6 +18,7 @@
 #include "ffmpeg_srt_publisher.h"
 #include "jam_broadcast_ipc.h"
 #include "logger.h"
+#include "udp_port.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -32,7 +33,7 @@ void signal_handler(int) {
 
 struct Options {
     bool test_tone = false;
-    int ipc_port = 0;
+    uint16_t ipc_port = 0;
     std::string srt_url;
     std::string ffmpeg_path = "ffmpeg";
     int duration_ms = 0;
@@ -71,7 +72,7 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--test-tone") {
             options.test_tone = true;
         } else if (arg == "--ipc-port") {
-            options.ipc_port = std::stoi(require_value(arg));
+            options.ipc_port = parse_udp_port(require_value(arg), "--ipc-port");
         } else if (arg == "--srt-url") {
             options.srt_url = require_value(arg);
         } else if (arg == "--ffmpeg") {
@@ -186,7 +187,7 @@ void run_ipc(const Options& options) {
     start_publisher(publisher, options);
 
     asio::io_context io;
-    udp::socket socket(io, udp::endpoint(udp::v4(), static_cast<unsigned short>(options.ipc_port)));
+    udp::socket socket(io, udp::endpoint(udp::v4(), options.ipc_port));
     socket.non_blocking(true);
 
     std::array<unsigned char, 8192> buffer{};

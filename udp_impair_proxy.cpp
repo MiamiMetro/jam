@@ -16,6 +16,8 @@
 #include <asio/ip/udp.hpp>
 #include <asio/steady_timer.hpp>
 
+#include "udp_port.h"
+
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
@@ -33,8 +35,11 @@ struct Config {
     int loss_percent = 0;
     uint64_t burst_every = 0;
     uint64_t burst_count = 0;
+    uint64_t burst_offset = 0;
     uint64_t reorder_every = 0;
     int reorder_delay_ms = 0;
+    bool impair_client_to_server = true;
+    bool impair_server_to_client = true;
     bool help = false;
 };
 
@@ -55,11 +60,11 @@ Config parse_args(int argc, char** argv) {
         } else if (arg == "--listen-host" && i + 1 < argc) {
             config.listen_host = argv[++i];
         } else if (arg == "--listen-port" && i + 1 < argc) {
-            config.listen_port = static_cast<uint16_t>(parse_int_arg(argv, i));
+            config.listen_port = parse_udp_port(argv[++i], "--listen-port");
         } else if (arg == "--server" && i + 1 < argc) {
             config.server_host = argv[++i];
         } else if (arg == "--server-port" && i + 1 < argc) {
-            config.server_port = static_cast<uint16_t>(parse_int_arg(argv, i));
+            config.server_port = parse_udp_port(argv[++i], "--server-port");
         } else if (arg == "--delay-ms" && i + 1 < argc) {
             config.delay_ms = parse_int_arg(argv, i);
         } else if (arg == "--jitter-ms" && i + 1 < argc) {
@@ -70,6 +75,22 @@ Config parse_args(int argc, char** argv) {
             config.burst_every = static_cast<uint64_t>(parse_int_arg(argv, i));
         } else if (arg == "--burst-count" && i + 1 < argc) {
             config.burst_count = static_cast<uint64_t>(parse_int_arg(argv, i));
+        } else if (arg == "--burst-offset" && i + 1 < argc) {
+            config.burst_offset = static_cast<uint64_t>(parse_int_arg(argv, i));
+        } else if (arg == "--drop-direction" && i + 1 < argc) {
+            const std::string direction = argv[++i];
+            if (direction == "both") {
+                config.impair_client_to_server = true;
+                config.impair_server_to_client = true;
+            } else if (direction == "client-to-server") {
+                config.impair_client_to_server = true;
+                config.impair_server_to_client = false;
+            } else if (direction == "server-to-client") {
+                config.impair_client_to_server = false;
+                config.impair_server_to_client = true;
+            } else {
+                throw std::runtime_error("unknown --drop-direction: " + direction);
+            }
         } else if (arg == "--reorder-every" && i + 1 < argc) {
             config.reorder_every = static_cast<uint64_t>(parse_int_arg(argv, i));
         } else if (arg == "--reorder-delay-ms" && i + 1 < argc) {
@@ -99,6 +120,8 @@ void print_usage() {
         << "  --loss-percent <0-100>     Deterministic packet drop percentage\n"
         << "  --burst-every <packets>    Start a drop burst every N packets\n"
         << "  --burst-count <packets>    Packets dropped at each burst start\n"
+        << "  --burst-offset <packets>   Pass this many packets before first burst\n"
+        << "  --drop-direction <dir>     both, client-to-server, or server-to-client\n"
         << "  --reorder-every <packets>  Delay every Nth packet to force reordering\n"
         << "  --reorder-delay-ms <ms>    Extra delay for reordered packets\n";
 }
@@ -141,6 +164,9 @@ public:
                   << " loss_percent=" << config_.loss_percent
                   << " burst_every=" << config_.burst_every
                   << " burst_count=" << config_.burst_count
+                  << " burst_offset=" << config_.burst_offset
+                  << " drop_client_to_server=" << config_.impair_client_to_server
+                  << " drop_server_to_client=" << config_.impair_server_to_client
                   << " reorder_every=" << config_.reorder_every
                   << " reorder_delay_ms=" << config_.reorder_delay_ms << "\n";
         receive_from_client();
@@ -190,7 +216,11 @@ private:
             return true;
         }
         if (config_.burst_every > 0 && config_.burst_count > 0) {
-            const uint64_t phase = (counter - 1) % config_.burst_every;
+            if (counter <= config_.burst_offset) {
+                return false;
+            }
+            const uint64_t phase =
+                (counter - config_.burst_offset - 1) % config_.burst_every;
             if (phase < config_.burst_count) {
                 return true;
             }
@@ -213,7 +243,7 @@ private:
     void schedule_send_to_server(const std::shared_ptr<Session>& session, const uint8_t* data,
                                  std::size_t bytes) {
         const uint64_t counter = ++client_to_server_count_;
-        if (should_drop(counter)) {
+        if (config_.impair_client_to_server && should_drop(counter)) {
             return;
         }
         auto packet = std::make_shared<std::vector<uint8_t>>(data, data + bytes);
@@ -227,7 +257,7 @@ private:
     void schedule_send_to_client(const std::shared_ptr<Session>& session, const uint8_t* data,
                                  std::size_t bytes) {
         const uint64_t counter = ++server_to_client_count_;
-        if (should_drop(counter)) {
+        if (config_.impair_server_to_client && should_drop(counter)) {
             return;
         }
         auto packet = std::make_shared<std::vector<uint8_t>>(data, data + bytes);

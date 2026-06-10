@@ -50,6 +50,10 @@ if(JAM_BUILD_TESTS)
 
     add_executable(sequence_tracker_self_test sequence_tracker_self_test.cpp)
 
+    add_executable(udp_port_self_test udp_port_self_test.cpp)
+
+    add_executable(jitter_policy_self_test jitter_policy_self_test.cpp)
+
     add_executable(redundant_receive_policy_self_test redundant_receive_policy_self_test.cpp)
     target_link_libraries(redundant_receive_policy_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 endif()
@@ -82,6 +86,7 @@ endif()
 
 if(JAM_BUILD_TESTS)
     enable_testing()
+    find_program(NODE_EXECUTABLE node)
 
     function(jam_add_executable_test target_name)
         add_test(NAME ${target_name} COMMAND $<TARGET_FILE:${target_name}>)
@@ -93,6 +98,8 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(audio_packet_self_test)
     jam_add_executable_test(participant_packet_queue_self_test)
     jam_add_executable_test(sequence_tracker_self_test)
+    jam_add_executable_test(udp_port_self_test)
+    jam_add_executable_test(jitter_policy_self_test)
     jam_add_executable_test(redundant_receive_policy_self_test)
     jam_add_executable_test(recording_writer_self_test)
     jam_add_executable_test(audio_analysis_self_test)
@@ -103,8 +110,31 @@ if(JAM_BUILD_TESTS)
              COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test)
     add_test(NAME server_redundancy_relay_smoke
              COMMAND $<TARGET_FILE:server> --redundancy-relay-smoke)
+    if(NODE_EXECUTABLE)
+        add_test(NAME latency_probe_return_burst_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/latency-burst-smoke.mjs
+                         --server-exe $<TARGET_FILE:server>
+                         --proxy-exe $<TARGET_FILE:udp_impair_proxy>
+                         --probe-exe $<TARGET_FILE:latency_probe>)
+    endif()
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
                  COMMAND $<TARGET_FILE:client> --udp-endpoint-guard-smoke)
+        add_test(NAME client_startup_config_adaptive_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke)
+        set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "Startup config smoke:.*opus_packet=240.*jitter_floor=6.*auto_start_jitter=14.*auto_jitter=true")
+        add_test(NAME client_startup_config_low_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke --latency-profile low)
+        set_tests_properties(client_startup_config_low_smoke PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "Startup config smoke:.*opus_packet=120.*jitter_floor=3.*auto_start_jitter=disabled.*auto_jitter=false")
+        add_test(NAME client_startup_config_stable_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke --latency-profile stable)
+        set_tests_properties(client_startup_config_stable_smoke PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "Startup config smoke:.*opus_packet=960.*jitter_floor=8.*auto_start_jitter=14.*auto_jitter=true")
     endif()
 endif()
