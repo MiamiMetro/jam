@@ -114,6 +114,9 @@ constexpr uint32_t PING_PATH_TIMEOUT_PROMOTE_REPLIES = 10;
 constexpr double PING_PATH_FEEDBACK_UNSTABLE_GAP_RATE = 0.10;
 constexpr double PING_PATH_FEEDBACK_SEVERE_GAP_RATE = 0.25;
 constexpr double PING_PATH_HIGH_RTT_MS = 250.0;
+constexpr uint32_t UDP_PATH_REBIND_MIN_OBSERVED_PACKETS = 8;
+constexpr double UDP_PATH_REBIND_SEVERE_GAP_RATE = 0.25;
+constexpr auto UDP_PATH_REBIND_COOLDOWN = 15s;
 
 struct PerformerJoinOptions {
     std::string room_id;
@@ -261,13 +264,9 @@ public:
         Log::info("Client local port: {}", socket_.local_endpoint().port());
 
         // Optimize UDP socket buffers for low-latency audio streaming
-        try {
-            socket_.set_option(asio::socket_base::receive_buffer_size(UDP_SOCKET_BUFFER_BYTES));
-            socket_.set_option(asio::socket_base::send_buffer_size(UDP_SOCKET_BUFFER_BYTES));
-            Log::info("UDP socket buffers optimized for low latency ({} bytes)",
-                      UDP_SOCKET_BUFFER_BYTES);
-        } catch (const std::exception& e) {
-            Log::warn("Failed to set socket buffer sizes: {}", e.what());
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            configure_udp_socket_locked();
         }
 
         // Initialize audio config with defaults (but don't start stream yet)
@@ -1327,6 +1326,119 @@ public:
     }
 
 private:
+    static void configure_udp_socket(udp::socket& socket) {
+        try {
+            socket.set_option(asio::socket_base::receive_buffer_size(UDP_SOCKET_BUFFER_BYTES));
+            socket.set_option(asio::socket_base::send_buffer_size(UDP_SOCKET_BUFFER_BYTES));
+            Log::info("UDP socket buffers optimized for low latency ({} bytes)",
+                      UDP_SOCKET_BUFFER_BYTES);
+        } catch (const std::exception& e) {
+            Log::warn("Failed to set socket buffer sizes: {}", e.what());
+        }
+    }
+
+    void configure_udp_socket_locked() {
+        configure_udp_socket(socket_);
+    }
+
+    void request_udp_path_rebind(std::string reason) {
+        if (!join_state_.is_join_confirmed()) {
+            return;
+        }
+
+        const int64_t now_ns = steady_now_ns();
+        int64_t       next_allowed =
+            next_udp_path_rebind_allowed_ns_.load(std::memory_order_acquire);
+        if (now_ns < next_allowed) {
+            return;
+        }
+
+        const int64_t cooldown_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                UDP_PATH_REBIND_COOLDOWN)
+                .count();
+        while (!next_udp_path_rebind_allowed_ns_.compare_exchange_weak(
+            next_allowed, now_ns + cooldown_ns, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+            if (now_ns < next_allowed) {
+                return;
+            }
+        }
+
+        if (udp_path_rebind_pending_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        asio::post(io_context_, [this, reason = std::move(reason)]() mutable {
+            udp_path_rebind_pending_.store(false, std::memory_order_release);
+            rebind_udp_socket_and_rejoin(reason);
+        });
+    }
+
+    void rebind_udp_socket_and_rejoin(const std::string& reason) {
+        const auto target = current_server_endpoint();
+        if (target.port() == 0 || !outbound_enabled_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        std::error_code ec;
+        std::error_code ignored;
+        udp::socket     replacement(io_context_);
+        replacement.open(udp::v4(), ec);
+        if (!ec) {
+            replacement.bind(udp::endpoint(udp::v4(), 0), ec);
+        }
+        if (ec) {
+            Log::error("UDP path rebind failed after '{}': {}", reason, ec.message());
+            return;
+        }
+        configure_udp_socket(replacement);
+        const uint16_t new_port = replacement.local_endpoint(ignored).port();
+
+        receiving_enabled_.store(false, std::memory_order_release);
+        outbound_enabled_.store(false, std::memory_order_release);
+        receive_generation_.fetch_add(1, std::memory_order_acq_rel);
+        outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
+
+        uint16_t old_port = 0;
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+
+            old_port = socket_.local_endpoint(ignored).port();
+
+            CtrlHdr leave{};
+            leave.magic = CTRL_MAGIC;
+            leave.type  = CtrlHdr::Cmd::LEAVE;
+            socket_.send_to(asio::buffer(&leave, sizeof(leave)), target, 0, ignored);
+
+            socket_.cancel(ignored);
+            socket_.close(ignored);
+            socket_ = std::move(replacement);
+        }
+
+        join_state_.reset();
+        have_ping_reply_sequence_.store(false, std::memory_order_release);
+        ping_path_interval_received_.store(0, std::memory_order_relaxed);
+        ping_path_interval_missing_.store(0, std::memory_order_relaxed);
+        server_clock_ready_.store(false, std::memory_order_release);
+        rtt_ms_.store(0.0, std::memory_order_relaxed);
+        recent_opus_audio_packets_.clear();
+
+        receive_generation_.fetch_add(1, std::memory_order_acq_rel);
+        outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
+        receiving_enabled_.store(true, std::memory_order_release);
+        outbound_enabled_.store(true, std::memory_order_release);
+
+        const uint32_t rebind_count =
+            udp_path_rebind_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        Log::warn(
+            "UDP path rebind #{} after '{}': local port {} -> {}; rejoining room '{}'",
+            rebind_count, reason, old_port, new_port, performer_join_options_.room_id);
+
+        do_receive();
+        send_join();
+    }
+
     void apply_audio_device_preferences(const AudioDevicePreferences& preferences) {
         const auto input_devices = AudioStream::get_input_devices();
         const auto output_devices = AudioStream::get_output_devices();
@@ -2376,6 +2488,17 @@ public:
         return static_cast<double>(sequence_gaps) / static_cast<double>(denominator);
     }
 
+    static bool should_rebind_udp_path_after_feedback(uint16_t current_frame_count,
+                                                      uint32_t received_packets,
+                                                      uint32_t sequence_gaps) {
+        const uint64_t observed_packets =
+            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
+        return current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT &&
+               observed_packets >= UDP_PATH_REBIND_MIN_OBSERVED_PACKETS &&
+               audio_path_feedback_gap_rate(received_packets, sequence_gaps) >=
+                   UDP_PATH_REBIND_SEVERE_GAP_RATE;
+    }
+
     static uint16_t opus_packet_frames_after_audio_path_feedback(
         uint16_t current_frame_count, uint32_t received_packets, uint32_t sequence_gaps) {
         const uint64_t observed_packets =
@@ -2448,7 +2571,13 @@ public:
                expect(opus_network_clock::BALANCED_FRAME_COUNT, 90, 10,
                       opus_network_clock::BALANCED_FRAME_COUNT, "balanced moderate") &&
                expect(opus_network_clock::BALANCED_FRAME_COUNT, 75, 25,
-                      opus_network_clock::STABLE_FRAME_COUNT, "severe balanced");
+                      opus_network_clock::STABLE_FRAME_COUNT, "severe balanced") &&
+               !should_rebind_udp_path_after_feedback(
+                   opus_network_clock::BALANCED_FRAME_COUNT, 5, 95) &&
+               !should_rebind_udp_path_after_feedback(
+                   opus_network_clock::STABLE_FRAME_COUNT, 6, 1) &&
+               should_rebind_udp_path_after_feedback(
+                   opus_network_clock::STABLE_FRAME_COUNT, 5, 5);
     }
 
     static bool run_opus_ping_path_feedback_smoke(std::string& failure) {
@@ -2474,7 +2603,9 @@ public:
                expect(opus_network_clock::FAST_FRAME_COUNT, 7, 1, 80.0,
                       opus_network_clock::BALANCED_FRAME_COUNT, "unstable fast") &&
                expect(opus_network_clock::STABLE_FRAME_COUNT, 1, 99, 500.0,
-                      opus_network_clock::STABLE_FRAME_COUNT, "already stable");
+                      opus_network_clock::STABLE_FRAME_COUNT, "already stable") &&
+               should_rebind_udp_path_after_feedback(
+                   opus_network_clock::STABLE_FRAME_COUNT, 1, 99);
     }
 
     static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
@@ -2798,14 +2929,21 @@ private:
             opus_packet_frames_after_audio_path_feedback(
                 current_frame_count, stats.interval_received,
                 stats.interval_sequence_gaps);
-        if (adapted_frame_count <= current_frame_count) {
-            return;
-        }
-
         const double gap_rate_percent =
             audio_path_feedback_gap_rate(stats.interval_received,
                                          stats.interval_sequence_gaps) *
             100.0;
+        const bool should_rebind =
+            should_rebind_udp_path_after_feedback(current_frame_count,
+                                                  stats.interval_received,
+                                                  stats.interval_sequence_gaps);
+        if (adapted_frame_count <= current_frame_count) {
+            if (should_rebind) {
+                request_udp_path_rebind("severe server audio ingress loss");
+            }
+            return;
+        }
+
         Log::warn(
             "Server reports sender audio ingress loss: received={} seq_gap={} "
             "gap_rate={:.1f}% observed_packet={} total_received={} total_gap={}; "
@@ -2822,11 +2960,6 @@ private:
             return;
         }
 
-        const uint16_t current_frame_count = get_opus_network_frame_count();
-        if (current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT) {
-            return;
-        }
-
         uint32_t missing_replies = 0;
         if (have_ping_reply_sequence_.load(std::memory_order_acquire)) {
             const uint32_t last_reply =
@@ -2839,6 +2972,12 @@ private:
         }
 
         if (missing_replies < PING_PATH_TIMEOUT_PROMOTE_REPLIES) {
+            return;
+        }
+
+        const uint16_t current_frame_count = get_opus_network_frame_count();
+        if (current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT) {
+            request_udp_path_rebind("server ping replies timed out");
             return;
         }
 
@@ -2881,12 +3020,17 @@ private:
                                                         missing, rtt_ms);
         ping_path_interval_received_.store(0, std::memory_order_relaxed);
         ping_path_interval_missing_.store(0, std::memory_order_relaxed);
+        const double gap_rate_percent =
+            audio_path_feedback_gap_rate(received, missing) * 100.0;
+        const bool should_rebind =
+            should_rebind_udp_path_after_feedback(current_frame_count, received, missing);
         if (adapted_frame_count <= current_frame_count) {
+            if (should_rebind) {
+                request_udp_path_rebind("severe server ping loss");
+            }
             return;
         }
 
-        const double gap_rate_percent =
-            audio_path_feedback_gap_rate(received, missing) * 100.0;
         Log::warn(
             "Server ping path is unstable: replies={} missing={} gap_rate={:.1f}% "
             "rtt_ms={:.1f}; promoting Opus packet from {} to {} frames",
@@ -4185,6 +4329,9 @@ private:
     std::atomic<bool>     have_ping_reply_sequence_{false};
     std::atomic<uint32_t> ping_path_interval_received_{0};
     std::atomic<uint32_t> ping_path_interval_missing_{0};
+    std::atomic<int64_t>  next_udp_path_rebind_allowed_ns_{0};
+    std::atomic<bool>     udp_path_rebind_pending_{false};
+    std::atomic<uint32_t> udp_path_rebind_count_{0};
 
     // Total bytes sent/received (cumulative counters)
     std::atomic<uint64_t> total_bytes_rx_{0};
