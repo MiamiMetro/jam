@@ -3362,6 +3362,7 @@ private:
                             participant_gain);
                     }
                     participant.plc_count.fetch_add(1, std::memory_order_relaxed);
+                    observe_auto_jitter_instability(participant);
                 }
 
                 // PCM has no PLC fallback. A transient empty queue should produce one silent

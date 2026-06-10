@@ -591,12 +591,33 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
 
     bool buffer_ready = false;
     std::array<float, MAX_FRAME_SAMPLES> pcm{};
+    std::vector<float> decoded_pcm_fifo;
     std::vector<float> previous_block(static_cast<size_t>(config.frame_size), 0.0F);
     bool have_previous_block = false;
     const double playout_rate =
         static_cast<double>(SAMPLE_RATE) * (1.0 + (playout_ppm / 1'000'000.0));
     auto frame_duration = std::chrono::duration_cast<clock_type::duration>(
         std::chrono::duration<double>(static_cast<double>(config.frame_size) / playout_rate));
+
+    auto output_decoded_fifo = [&](int output_base_sample) {
+        if (decoded_pcm_fifo.size() < static_cast<size_t>(config.frame_size)) {
+            return false;
+        }
+        std::copy_n(decoded_pcm_fifo.begin(), static_cast<size_t>(config.frame_size),
+                    pcm.begin());
+        decoded_pcm_fifo.erase(decoded_pcm_fifo.begin(),
+                               decoded_pcm_fifo.begin() + config.frame_size);
+        inspect_samples(pcm, config.frame_size, output_base_sample, config, metrics,
+                        previous_block, have_previous_block);
+        return true;
+    };
+
+    auto append_decoded_fifo = [&](const float* samples, int sample_count) {
+        if (sample_count <= 0) {
+            return;
+        }
+        decoded_pcm_fifo.insert(decoded_pcm_fifo.end(), samples, samples + sample_count);
+    };
 
     for (int tick = 0; tick < config.total_packets + 80; ++tick) {
         std::this_thread::sleep_until(start_time + frame_duration * tick);
@@ -616,7 +637,8 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             continue;
         }
 
-        if (current_queue_depth == 0 && receiver.received_count() >= config.total_packets) {
+        if (current_queue_depth == 0 && decoded_pcm_fifo.empty() &&
+            receiver.received_count() >= config.total_packets) {
             break;
         }
 
@@ -624,6 +646,10 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
         metrics.queue_depth_sum += current_queue_depth;
         metrics.min_queue_depth_after_ready =
             std::min(metrics.min_queue_depth_after_ready, current_queue_depth);
+
+        if (output_decoded_fifo(output_base_sample)) {
+            continue;
+        }
 
         OpusPacket packet;
         const auto dequeue_status =
@@ -658,8 +684,8 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             if (decoded_samples != config.frame_size) {
                 metrics.decoded_size_mismatches++;
             }
-            inspect_samples(pcm, decoded_samples, output_base_sample, config, metrics,
-                            previous_block, have_previous_block);
+            append_decoded_fifo(pcm.data(), decoded_samples);
+            output_decoded_fifo(output_base_sample);
         } else if (dequeue_status == ParticipantOpusDequeueStatus::WaitingForGap) {
             metrics.gap_waits++;
             continue;
