@@ -104,6 +104,10 @@ static const char* runtime_arch_name() {
 #endif
 }
 
+constexpr uint32_t AUDIO_PATH_FEEDBACK_MIN_PACKETS = 20;
+constexpr double AUDIO_PATH_FEEDBACK_UNSTABLE_GAP_RATE = 0.05;
+constexpr double AUDIO_PATH_FEEDBACK_SEVERE_GAP_RATE = 0.25;
+
 struct PerformerJoinOptions {
     std::string room_id;
     std::string room_handle;
@@ -2152,6 +2156,65 @@ private:
     }
 
 public:
+    static double audio_path_feedback_gap_rate(uint32_t received_packets,
+                                               uint32_t sequence_gaps) {
+        const uint64_t denominator =
+            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
+        if (denominator == 0) {
+            return 0.0;
+        }
+        return static_cast<double>(sequence_gaps) / static_cast<double>(denominator);
+    }
+
+    static uint16_t opus_packet_frames_after_audio_path_feedback(
+        uint16_t current_frame_count, uint32_t received_packets, uint32_t sequence_gaps) {
+        const uint64_t observed_packets =
+            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
+        if (observed_packets < AUDIO_PATH_FEEDBACK_MIN_PACKETS || sequence_gaps == 0) {
+            return current_frame_count;
+        }
+
+        const double gap_rate =
+            audio_path_feedback_gap_rate(received_packets, sequence_gaps);
+        if (gap_rate >= AUDIO_PATH_FEEDBACK_SEVERE_GAP_RATE &&
+            current_frame_count < opus_network_clock::STABLE_FRAME_COUNT) {
+            return opus_network_clock::STABLE_FRAME_COUNT;
+        }
+        if (gap_rate >= AUDIO_PATH_FEEDBACK_UNSTABLE_GAP_RATE &&
+            current_frame_count < opus_network_clock::BALANCED_FRAME_COUNT) {
+            return opus_network_clock::BALANCED_FRAME_COUNT;
+        }
+        return current_frame_count;
+    }
+
+    static bool run_opus_audio_path_feedback_smoke(std::string& failure) {
+        auto expect = [&](uint16_t current, uint32_t received, uint32_t gaps,
+                          uint16_t expected, const char* label) {
+            const uint16_t actual =
+                opus_packet_frames_after_audio_path_feedback(current, received, gaps);
+            if (actual != expected) {
+                failure = std::string(label) + ": expected " +
+                          std::to_string(expected) + ", got " +
+                          std::to_string(actual);
+                return false;
+            }
+            return true;
+        };
+
+        return expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 100, 0,
+                      opus_network_clock::LOW_LATENCY_FRAME_COUNT, "clean low") &&
+               expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 18, 1,
+                      opus_network_clock::LOW_LATENCY_FRAME_COUNT, "too few samples") &&
+               expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 90, 10,
+                      opus_network_clock::BALANCED_FRAME_COUNT, "unstable low") &&
+               expect(opus_network_clock::FAST_FRAME_COUNT, 75, 25,
+                      opus_network_clock::STABLE_FRAME_COUNT, "severe fast") &&
+               expect(opus_network_clock::BALANCED_FRAME_COUNT, 90, 10,
+                      opus_network_clock::BALANCED_FRAME_COUNT, "balanced moderate") &&
+               expect(opus_network_clock::BALANCED_FRAME_COUNT, 75, 25,
+                      opus_network_clock::STABLE_FRAME_COUNT, "severe balanced");
+    }
+
     static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
         ParticipantData participant;
         participant.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
@@ -2418,6 +2481,10 @@ private:
                 send_join();
                 break;
             }
+            case CtrlHdr::Cmd::AUDIO_PATH_STATS: {
+                handle_audio_path_stats_message(bytes, recv_data);
+                break;
+            }
             case CtrlHdr::Cmd::METRONOME_SYNC: {
                 if (bytes < sizeof(MetronomeSyncHdr)) {
                     break;
@@ -2455,6 +2522,37 @@ private:
                 "Removed stale participant {} (no packets for {}s)", id,
                 std::chrono::duration_cast<std::chrono::seconds>(PARTICIPANT_TIMEOUT).count());
         }
+    }
+
+    void handle_audio_path_stats_message(std::size_t bytes, const char* recv_data) {
+        if (bytes < sizeof(AudioPathStatsHdr)) {
+            return;
+        }
+
+        AudioPathStatsHdr stats{};
+        std::memcpy(&stats, recv_data, sizeof(AudioPathStatsHdr));
+        const uint16_t current_frame_count = get_opus_network_frame_count();
+        const uint16_t adapted_frame_count =
+            opus_packet_frames_after_audio_path_feedback(
+                current_frame_count, stats.interval_received,
+                stats.interval_sequence_gaps);
+        if (adapted_frame_count <= current_frame_count) {
+            return;
+        }
+
+        const double gap_rate_percent =
+            audio_path_feedback_gap_rate(stats.interval_received,
+                                         stats.interval_sequence_gaps) *
+            100.0;
+        Log::warn(
+            "Server reports sender audio ingress loss: received={} seq_gap={} "
+            "gap_rate={:.1f}% observed_packet={} total_received={} total_gap={}; "
+            "promoting Opus packet from {} to {} frames",
+            stats.interval_received, stats.interval_sequence_gaps, gap_rate_percent,
+            stats.observed_frame_count, stats.total_received, stats.total_sequence_gaps,
+            current_frame_count, adapted_frame_count);
+        set_opus_network_frame_count(adapted_frame_count);
+        recent_opus_audio_packets_.clear();
     }
 
     void handle_ping_message(std::size_t bytes, const char* recv_data) {
@@ -4912,6 +5010,7 @@ struct ClientStartupOptions {
     bool startup_config_smoke = false;
     bool udp_endpoint_guard_smoke = false;
     bool auto_jitter_empty_playout_smoke = false;
+    bool audio_path_feedback_smoke = false;
     int baseline_snapshot_seconds = 0;
     int baseline_snapshot_interval_seconds = 5;
     std::string baseline_snapshot_label = "manual";
@@ -4983,6 +5082,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.udp_endpoint_guard_smoke = true;
         } else if (arg == "--auto-jitter-empty-playout-smoke") {
             options.auto_jitter_empty_playout_smoke = true;
+        } else if (arg == "--audio-path-feedback-smoke") {
+            options.audio_path_feedback_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
         } else if (arg == "--baseline-snapshot-seconds" && i + 1 < argc) {
@@ -5482,6 +5583,17 @@ int main(int argc, char** argv) {
                 return 2;
             }
             Log::info("Opus empty playout auto jitter smoke passed");
+            log.flush();
+            return 0;
+        }
+        if (startup_options.audio_path_feedback_smoke) {
+            std::string failure;
+            if (!Client::run_opus_audio_path_feedback_smoke(failure)) {
+                Log::error("Opus audio path feedback smoke failed: {}", failure);
+                log.flush();
+                return 2;
+            }
+            Log::info("Opus audio path feedback smoke passed");
             log.flush();
             return 0;
         }

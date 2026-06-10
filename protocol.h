@@ -63,6 +63,7 @@ struct CtrlHdr : MsgHdr {
         METRONOME_SYNC    = 7,  // Server relays room-local metronome state
         JOIN_ACK          = 8,  // Server confirms that this endpoint is registered
         JOIN_REQUIRED     = 9,  // Server asks an unknown endpoint to re-send JOIN
+        AUDIO_PATH_STATS  = 10, // Server reports sender-to-server audio ingress health
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
@@ -129,6 +130,15 @@ struct AudioHdrV2 : MsgHdr {
 struct AudioRedundantHdr : MsgHdr {
     uint8_t packet_count = 0;
     uint8_t reserved[3] = {};
+};
+
+struct AudioPathStatsHdr : CtrlHdr {
+    uint32_t interval_received = 0;
+    uint32_t interval_sequence_gaps = 0;
+    uint32_t total_received = 0;
+    uint32_t total_sequence_gaps = 0;
+    uint16_t observed_frame_count = 0;
+    uint16_t reserved = 0;
 };
 
 #pragma pack(pop)

@@ -111,6 +111,10 @@ if(JAM_BUILD_TESTS)
     add_test(NAME server_redundancy_relay_smoke
              COMMAND $<TARGET_FILE:server> --redundancy-relay-smoke)
     if(NODE_EXECUTABLE)
+        add_test(NAME server_audio_path_feedback_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/audio-path-feedback-smoke.mjs
+                         --server-exe $<TARGET_FILE:server>)
         add_test(NAME latency_probe_return_burst_smoke
                  COMMAND ${NODE_EXECUTABLE}
                          ${CMAKE_SOURCE_DIR}/tools/latency-burst-smoke.mjs
@@ -139,6 +143,8 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --udp-endpoint-guard-smoke)
         add_test(NAME client_auto_jitter_empty_playout_smoke
                  COMMAND $<TARGET_FILE:client> --auto-jitter-empty-playout-smoke)
+        add_test(NAME client_audio_path_feedback_smoke
+                 COMMAND $<TARGET_FILE:client> --audio-path-feedback-smoke)
         add_test(NAME client_startup_config_adaptive_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES

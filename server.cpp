@@ -7,6 +7,7 @@
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -190,6 +191,7 @@ private:
         uint64_t sequence_gaps_interval = 0;
         uint64_t sequence_gap_recoveries_interval = 0;
         uint64_t sequence_late_or_reordered_interval = 0;
+        uint16_t last_frame_count = 0;
         SequenceArrivalTracker sequence_tracker;
     };
 
@@ -598,6 +600,33 @@ private:
         send(buf->data(), buf->size(), endpoint, buf);
     }
 
+    void send_audio_path_stats(uint32_t sender_id, const AudioIngressStats& stats) {
+        if (sender_id == 0 || !client_manager_.exists(stats.endpoint)) {
+            return;
+        }
+
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(AudioPathStatsHdr));
+        AudioPathStatsHdr path{};
+        path.magic = CTRL_MAGIC;
+        path.type = CtrlHdr::Cmd::AUDIO_PATH_STATS;
+        path.participant_id = sender_id;
+        path.interval_received = static_cast<uint32_t>(
+            std::min<uint64_t>(stats.received_interval,
+                               std::numeric_limits<uint32_t>::max()));
+        path.interval_sequence_gaps = static_cast<uint32_t>(
+            std::min<uint64_t>(stats.sequence_gaps_interval,
+                               std::numeric_limits<uint32_t>::max()));
+        path.total_received = static_cast<uint32_t>(
+            std::min<uint64_t>(stats.received_total,
+                               std::numeric_limits<uint32_t>::max()));
+        path.total_sequence_gaps = static_cast<uint32_t>(
+            std::min<uint64_t>(stats.sequence_gaps_total,
+                               std::numeric_limits<uint32_t>::max()));
+        path.observed_frame_count = stats.last_frame_count;
+        std::memcpy(buf->data(), &path, sizeof(AudioPathStatsHdr));
+        send(buf->data(), buf->size(), stats.endpoint, buf);
+    }
+
     void broadcast_participant_info(const udp::endpoint& joined_endpoint, uint32_t participant_id,
                                     const std::string& profile_id,
                                     const std::string& display_name) {
@@ -706,6 +735,7 @@ private:
         std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
         auto& stats = audio_ingress_stats_[sender_id];
         stats.endpoint = endpoint;
+        stats.last_frame_count = audio.frame_count;
         ++stats.received_total;
         ++stats.received_interval;
         const auto sequence_delta = stats.sequence_tracker.record(audio.sequence);
@@ -826,6 +856,7 @@ private:
                 stats.received_total, stats.sequence_gaps_total,
                 stats.sequence_gap_recoveries_total, stats.sequence_unresolved_gaps,
                 stats.sequence_late_or_reordered_total);
+            send_audio_path_stats(sender_id, stats);
             stats.received_interval = 0;
             stats.sequence_gaps_interval = 0;
             stats.sequence_gap_recoveries_interval = 0;
