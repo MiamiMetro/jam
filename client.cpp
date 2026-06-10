@@ -145,7 +145,12 @@ static std::string trim_copy(const std::string& value) {
     return std::string(first, last);
 }
 
-static std::filesystem::path client_config_path_for_executable(const char* executable_path) {
+static std::filesystem::path client_config_path(const char* executable_path,
+                                                const std::string& config_dir) {
+    if (!config_dir.empty()) {
+        return std::filesystem::path(config_dir) / "jam_client.ini";
+    }
+
     std::error_code ec;
     std::filesystem::path exe =
         executable_path != nullptr && executable_path[0] != '\0'
@@ -170,6 +175,9 @@ static AudioDevicePreferences load_audio_device_preferences(
     preferences.loaded = true;
     std::string line;
     while (std::getline(input, line)) {
+        if (line.size() > 4096 || line.find('\0') != std::string::npos) {
+            continue;
+        }
         line = trim_copy(line);
         if (line.empty() || line.front() == '#' || line.front() == ';') {
             continue;
@@ -1033,9 +1041,24 @@ public:
         }
 
         const auto* input_info = AudioStream::get_device_info(selected_input_device_);
-        const auto* output_info = AudioStream::get_device_info(selected_output_device_);
-        if (input_info == nullptr || output_info == nullptr) {
+        if (input_info == nullptr) {
             return false;
+        }
+
+        const std::string input_name = input_info->name;
+        const std::string input_api = input_info->api_name;
+        const auto* output_info = AudioStream::get_device_info(selected_output_device_);
+        if (output_info == nullptr) {
+            return false;
+        }
+
+        const std::string output_name = output_info->name;
+        const std::string output_api = output_info->api_name;
+
+        std::error_code create_error;
+        if (audio_preferences_path_.has_parent_path()) {
+            std::filesystem::create_directories(audio_preferences_path_.parent_path(),
+                                                create_error);
         }
 
         std::ofstream output(audio_preferences_path_, std::ios::trunc);
@@ -1046,10 +1069,10 @@ public:
         }
 
         output << "audio_api=" << selected_audio_api_filter_ << '\n'
-               << "input_device=" << input_info->name << '\n'
-               << "input_api=" << input_info->api_name << '\n'
-               << "output_device=" << output_info->name << '\n'
-               << "output_api=" << output_info->api_name << '\n';
+               << "input_device=" << input_name << '\n'
+               << "input_api=" << input_api << '\n'
+               << "output_device=" << output_name << '\n'
+               << "output_api=" << output_api << '\n';
         Log::info("Saved audio device preferences: {}",
                   audio_preferences_path_.string());
         return true;
@@ -5354,6 +5377,7 @@ struct ClientStartupOptions {
     std::string server_address = "127.0.0.1";
     uint16_t server_port = 9999;
     std::string app_version;
+    std::string config_dir;
     int requested_frames = 0;
     std::string startup_latency_profile = "adaptive";
     std::optional<int> startup_opus_packet_frames;
@@ -5398,6 +5422,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.server_port = parse_udp_port(argv[++i], "--port");
         } else if (arg == "--app-version" && i + 1 < argc) {
             options.app_version = argv[++i];
+        } else if (arg == "--config-dir" && i + 1 < argc) {
+            options.config_dir = argv[++i];
         } else if (arg == "--room" && i + 1 < argc) {
             options.performer_join.room_id = argv[++i];
         } else if (arg == "--room-handle" && i + 1 < argc) {
@@ -5964,7 +5990,8 @@ int main(int argc, char** argv) {
         }
 
         asio::io_context io_context;
-        const auto audio_preferences_path = client_config_path_for_executable(argv[0]);
+        const auto audio_preferences_path =
+            client_config_path(argv[0], startup_options.config_dir);
         const auto audio_preferences =
             load_audio_device_preferences(audio_preferences_path);
 
