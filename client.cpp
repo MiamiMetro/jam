@@ -2152,6 +2152,59 @@ private:
     }
 
 public:
+    static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
+        ParticipantData participant;
+        participant.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
+        participant.buffer_ready.store(true, std::memory_order_relaxed);
+
+        apply_opus_jitter_policy_to_participant(
+            participant, DEFAULT_OPUS_JITTER_PACKETS, true, true);
+
+        const size_t before_target =
+            participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+        const uint64_t before_increases =
+            participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
+
+        participant.buffer_ready.store(true, std::memory_order_relaxed);
+        observe_auto_jitter_instability(participant);
+
+        const size_t after_target =
+            participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+        const size_t after_floor =
+            participant.jitter_buffer_floor_packets.load(std::memory_order_relaxed);
+        const size_t after_queue_limit =
+            participant.opus_queue_limit_packets.load(std::memory_order_relaxed);
+        const uint64_t after_increases =
+            participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
+
+        if (before_target != DEFAULT_OPUS_AUTO_START_JITTER_PACKETS) {
+            failure = "unexpected auto-start jitter target";
+            return false;
+        }
+        if (after_target != before_target + 1) {
+            failure = "empty playout did not raise jitter target";
+            return false;
+        }
+        if (after_floor != after_target) {
+            failure = "jitter floor did not follow raised target";
+            return false;
+        }
+        if (after_queue_limit < after_target + 3) {
+            failure = "queue limit did not expand with raised target";
+            return false;
+        }
+        if (participant.buffer_ready.load(std::memory_order_relaxed)) {
+            failure = "buffer readiness was not reset for rebuffering";
+            return false;
+        }
+        if (after_increases != before_increases + 1) {
+            failure = "auto jitter increase counter did not increment";
+            return false;
+        }
+
+        return true;
+    }
+
     void log_baseline_snapshot(const std::string& label) {
         const auto latency = get_latency_info();
         const auto callback = get_callback_timing_info();
@@ -4846,6 +4899,7 @@ struct ClientStartupOptions {
     bool low_latency_check = false;
     bool startup_config_smoke = false;
     bool udp_endpoint_guard_smoke = false;
+    bool auto_jitter_empty_playout_smoke = false;
     int baseline_snapshot_seconds = 0;
     int baseline_snapshot_interval_seconds = 5;
     std::string baseline_snapshot_label = "manual";
@@ -4915,6 +4969,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.startup_config_smoke = true;
         } else if (arg == "--udp-endpoint-guard-smoke") {
             options.udp_endpoint_guard_smoke = true;
+        } else if (arg == "--auto-jitter-empty-playout-smoke") {
+            options.auto_jitter_empty_playout_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
         } else if (arg == "--baseline-snapshot-seconds" && i + 1 < argc) {
@@ -5405,6 +5461,17 @@ int main(int argc, char** argv) {
             const int result = run_udp_endpoint_guard_smoke(startup_options);
             log.flush();
             return result;
+        }
+        if (startup_options.auto_jitter_empty_playout_smoke) {
+            std::string failure;
+            if (!Client::run_opus_empty_playout_auto_jitter_smoke(failure)) {
+                Log::error("Opus empty playout auto jitter smoke failed: {}", failure);
+                log.flush();
+                return 2;
+            }
+            Log::info("Opus empty playout auto jitter smoke passed");
+            log.flush();
+            return 0;
         }
 
         asio::io_context io_context;

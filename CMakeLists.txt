@@ -121,6 +121,8 @@ if(JAM_BUILD_TESTS)
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
                  COMMAND $<TARGET_FILE:client> --udp-endpoint-guard-smoke)
+        add_test(NAME client_auto_jitter_empty_playout_smoke
+                 COMMAND $<TARGET_FILE:client> --auto-jitter-empty-playout-smoke)
         add_test(NAME client_startup_config_adaptive_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES
