@@ -138,6 +138,20 @@ void test_burst_gap_waits_once_then_conceals_missing_run() {
     require_dequeue(queue, 5, 2);
 }
 
+void test_large_gap_caps_plc_and_resumes_real_packet() {
+    ParticipantOpusPacketQueue queue;
+
+    require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
+    require(queue.enqueue(make_packet(100)), "future packet should enqueue");
+
+    require_dequeue(queue, 1, 0);
+    for (size_t i = 0; i < MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS; ++i) {
+        require_loss_concealment(queue, static_cast<uint32_t>(2 + i), 0);
+    }
+    require_dequeue(queue, 100, 0);
+    require(queue.size_approx() == 0, "large gap cap should leave no buffered packet");
+}
+
 void test_gap_wait_resets_when_missing_packet_arrives() {
     ParticipantOpusPacketQueue queue;
 
@@ -384,6 +398,7 @@ int main() {
     test_skips_permanent_gap_after_budget();
     test_skips_permanent_gap_after_wait_callbacks();
     test_burst_gap_waits_once_then_conceals_missing_run();
+    test_large_gap_caps_plc_and_resumes_real_packet();
     test_gap_wait_resets_when_missing_packet_arrives();
     test_discards_stale_packet_after_skip();
     test_rejects_duplicate_packet();

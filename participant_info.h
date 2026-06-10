@@ -189,11 +189,21 @@ private:
             if (should_wait_for_gap(gap_wait_packets, sequenced_.size())) {
                 return ParticipantOpusDequeueStatus::WaitingForGap;
             }
+            if (gap_loss_run_active_ &&
+                gap_loss_run_packets_ >= MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS) {
+                next_playout_sequence_ = next_sequence;
+                publish_playout_sequence();
+                gap_loss_run_active_ = false;
+                gap_loss_run_packets_ = 0;
+                reset_gap_wait();
+                return dequeue_sequenced_for_playout(packet, 0);
+            }
             packet = make_loss_concealment_packet(sequenced_[next_index],
                                                   next_playout_sequence_);
             next_playout_sequence_ = packet.sequence + 1;
             publish_playout_sequence();
             gap_loss_run_active_ = true;
+            ++gap_loss_run_packets_;
             reset_gap_wait();
             return ParticipantOpusDequeueStatus::Packet;
         } else {
@@ -204,6 +214,7 @@ private:
         next_playout_sequence_ = packet.sequence + 1;
         publish_playout_sequence();
         gap_loss_run_active_ = false;
+        gap_loss_run_packets_ = 0;
         reset_gap_wait();
         erase_sequenced_at(next_index);
         decrement_buffered_count();
@@ -357,6 +368,7 @@ private:
     uint32_t gap_wait_sequence_ = 0;
     size_t gap_wait_callbacks_ = 0;
     bool gap_loss_run_active_ = false;
+    size_t gap_loss_run_packets_ = 0;
     SequenceArrivalTracker admission_tracker_;
     std::atomic<bool> playout_initialized_snapshot_{false};
     std::atomic<uint32_t> next_playout_sequence_snapshot_{0};

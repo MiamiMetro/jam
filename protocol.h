@@ -26,6 +26,7 @@ constexpr size_t DEFAULT_OPUS_QUEUE_LIMIT_PACKETS = 64; // Default Opus burst ca
 constexpr size_t MAX_OPUS_JITTER_PACKETS = 32;    // User-facing Opus jitter limit
 constexpr size_t MIN_OPUS_QUEUE_LIMIT_PACKETS = 1;
 constexpr size_t MAX_OPUS_QUEUE_LIMIT_PACKETS = 128; // User-facing Opus queue limit
+constexpr size_t MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS = 6; // Cap synthetic audio on large gaps
 constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 180; // Default age limit at playout
 constexpr int    MIN_JITTER_PACKET_AGE_MS = 0;        // Manual testing can disable age drops
 constexpr int    MAX_JITTER_PACKET_AGE_MS = 250;      // User-facing age limit
