@@ -62,6 +62,19 @@ public:
         sample_rate_ = 0;
     }
 
+    bool reset() {
+        if (decoder_ == nullptr) {
+            Log::error("Opus decoder not initialized.");
+            return false;
+        }
+        const int err = opus_decoder_ctl(decoder_, OPUS_RESET_STATE);
+        if (err != OPUS_OK) {
+            Log::error("Failed to reset Opus decoder: {}", opus_strerror(err));
+            return false;
+        }
+        return true;
+    }
+
     bool decode(const unsigned char* input, int input_size, int frame_size,
                 std::vector<float>& output) {
         if (decoder_ == nullptr) {

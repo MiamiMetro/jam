@@ -3091,6 +3091,12 @@ private:
 
                 participant.last_codec.store(opus_packet.codec, std::memory_order_relaxed);
                 int decoded_samples = 0;
+                if (opus_packet.reset_decoder && opus_packet.codec == AudioCodec::Opus) {
+                    participant.decoder->reset();
+                    participant.opus_pcm_buffered_frames = 0;
+                    participant.opus_resample_phase = 0.0;
+                    observe_auto_jitter_instability(participant);
+                }
                 if (opus_packet.loss_concealment && opus_packet.codec == AudioCodec::Opus) {
                     const int decode_frame_count =
                         opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
@@ -3205,6 +3211,12 @@ private:
                                 : static_cast<int>(frame_count);
                         const auto next_decode_start = std::chrono::steady_clock::now();
                         int next_decoded_samples = 0;
+                        if (next_packet.reset_decoder) {
+                            participant.decoder->reset();
+                            participant.opus_pcm_buffered_frames = 0;
+                            participant.opus_resample_phase = 0.0;
+                            observe_auto_jitter_instability(participant);
+                        }
                         if (next_packet.loss_concealment) {
                             next_decoded_samples = participant.decoder->decode_plc(
                                 participant.pcm_buffer.data(), next_decode_frame_count);

@@ -656,6 +656,10 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             receiver.pop_packet(packet, static_cast<size_t>(config.jitter_min_packets));
         if (dequeue_status == ParticipantOpusDequeueStatus::Packet) {
             int decoded_samples = 0;
+            if (packet.reset_decoder && packet.codec == AudioCodec::Opus) {
+                decoder.reset();
+                decoded_pcm_fifo.clear();
+            }
             if (packet.loss_concealment && packet.codec == AudioCodec::Opus) {
                 decoded_samples = decoder.decode_plc(pcm.data(), config.frame_size);
                 if (decoded_samples > 0) {

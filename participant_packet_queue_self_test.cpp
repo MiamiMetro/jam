@@ -41,6 +41,16 @@ void require_dequeue(ParticipantOpusPacketQueue& queue, uint32_t expected_sequen
     require(packet.sequence == expected_sequence, "unexpected packet sequence");
 }
 
+void require_dequeue_with_reset(ParticipantOpusPacketQueue& queue,
+                                uint32_t expected_sequence,
+                                size_t gap_wait_packets = 0) {
+    OpusPacket packet{};
+    require(queue.try_dequeue(packet, gap_wait_packets), "expected queued packet");
+    require(!packet.loss_concealment, "expected real packet, got loss concealment");
+    require(packet.reset_decoder, "expected decoder reset on resumed packet");
+    require(packet.sequence == expected_sequence, "unexpected packet sequence");
+}
+
 void require_loss_concealment(ParticipantOpusPacketQueue& queue,
                               uint32_t expected_sequence,
                               size_t gap_wait_packets = 0) {
@@ -148,7 +158,7 @@ void test_large_gap_caps_plc_and_resumes_real_packet() {
     for (size_t i = 0; i < MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS; ++i) {
         require_loss_concealment(queue, static_cast<uint32_t>(2 + i), 0);
     }
-    require_dequeue(queue, 100, 0);
+    require_dequeue_with_reset(queue, 100, 0);
     require(queue.size_approx() == 0, "large gap cap should leave no buffered packet");
 }
 

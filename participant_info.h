@@ -24,6 +24,7 @@ struct OpusPacket {
     uint32_t                              sequence = 0;
     bool                                  sequence_valid = false;
     bool                                  loss_concealment = false;
+    bool                                  reset_decoder = false;
     uint32_t                              sample_rate = 48000;
     uint16_t                              frame_count = 0;
     uint8_t                               channels = 1;
@@ -191,12 +192,16 @@ private:
             }
             if (gap_loss_run_active_ &&
                 gap_loss_run_packets_ >= MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS) {
-                next_playout_sequence_ = next_sequence;
+                packet = sequenced_[next_index];
+                packet.reset_decoder = true;
+                next_playout_sequence_ = packet.sequence + 1;
                 publish_playout_sequence();
                 gap_loss_run_active_ = false;
                 gap_loss_run_packets_ = 0;
                 reset_gap_wait();
-                return dequeue_sequenced_for_playout(packet, 0);
+                erase_sequenced_at(next_index);
+                decrement_buffered_count();
+                return ParticipantOpusDequeueStatus::Packet;
             }
             packet = make_loss_concealment_packet(sequenced_[next_index],
                                                   next_playout_sequence_);
