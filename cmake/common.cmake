@@ -62,7 +62,26 @@ FetchContent_Declare(
     GIT_PROGRESS   TRUE
 )
 
+set(_JAM_PRE_FETCH_BUILD_TESTING_DEFINED FALSE)
+if(DEFINED BUILD_TESTING)
+    set(_JAM_PRE_FETCH_BUILD_TESTING_DEFINED TRUE)
+    set(_JAM_PRE_FETCH_BUILD_TESTING "${BUILD_TESTING}")
+endif()
+set(BUILD_TESTING OFF)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(asio_src opus concurrentqueue_src spdlog picosha2)
+if(DEFINED opus_BINARY_DIR AND NOT OPUS_BUILD_TESTING)
+    # Opus leaves old CTest metadata behind when an existing build tree is
+    # reconfigured with tests disabled. Remove it so `ctest` only runs jam tests.
+    file(REMOVE "${opus_BINARY_DIR}/CTestTestfile.cmake")
+endif()
+if(_JAM_PRE_FETCH_BUILD_TESTING_DEFINED)
+    set(BUILD_TESTING "${_JAM_PRE_FETCH_BUILD_TESTING}")
+else()
+    unset(BUILD_TESTING)
+endif()
+unset(_JAM_PRE_FETCH_BUILD_TESTING)
+unset(_JAM_PRE_FETCH_BUILD_TESTING_DEFINED)
 
 target_compile_definitions(spdlog PUBLIC SPDLOG_USE_STD_FORMAT)
 

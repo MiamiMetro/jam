@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "opus_network_clock.h"
 #include "protocol.h"
 
 // Audio packet construction utilities (extends packet_builder for client-specific needs)
@@ -12,6 +13,50 @@ namespace audio_packet {
 
 inline constexpr size_t v2_header_size() {
     return sizeof(AudioHdrV2) - AUDIO_BUF_SIZE;
+}
+
+inline bool validate_audio_packet_v2_shape(const AudioHdrV2& hdr,
+                                           std::string* reason = nullptr) {
+    if (hdr.sample_rate != opus_network_clock::SAMPLE_RATE || hdr.channels != 1 ||
+        hdr.frame_count == 0) {
+        if (reason != nullptr) {
+            *reason = "unsupported audio shape";
+        }
+        return false;
+    }
+
+    if (hdr.codec == AudioCodec::Opus) {
+        if (!opus_network_clock::is_supported_frame_count(hdr.sample_rate, hdr.frame_count)) {
+            if (reason != nullptr) {
+                *reason = "unsupported opus frame count";
+            }
+            return false;
+        }
+        if (hdr.payload_bytes == 0) {
+            if (reason != nullptr) {
+                *reason = "empty opus payload";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    if (hdr.codec == AudioCodec::PcmInt16) {
+        const size_t expected_payload =
+            static_cast<size_t>(hdr.frame_count) * hdr.channels * sizeof(int16_t);
+        if (expected_payload > AUDIO_BUF_SIZE || hdr.payload_bytes != expected_payload) {
+            if (reason != nullptr) {
+                *reason = "pcm payload shape mismatch";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    if (reason != nullptr) {
+        *reason = "invalid codec";
+    }
+    return false;
 }
 
 inline bool validate_audio_packet_v2_bytes(const unsigned char* data, size_t len,
@@ -51,20 +96,7 @@ inline bool validate_audio_packet_v2_bytes(const unsigned char* data, size_t len
         }
         return false;
     }
-    if (hdr.channels == 0 || hdr.frame_count == 0 || hdr.sample_rate == 0) {
-        if (reason != nullptr) {
-            *reason = "invalid audio shape";
-        }
-        return false;
-    }
-    if (hdr.codec != AudioCodec::Opus && hdr.codec != AudioCodec::PcmInt16) {
-        if (reason != nullptr) {
-            *reason = "invalid codec";
-        }
-        return false;
-    }
-
-    return true;
+    return validate_audio_packet_v2_shape(hdr, reason);
 }
 
 // Create audio packet with encoded data

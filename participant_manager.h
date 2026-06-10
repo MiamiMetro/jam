@@ -101,23 +101,29 @@ public:
             info.id             = id;
             info.profile_id     = data->profile_id;
             info.display_name   = data->display_name;
-            info.is_speaking    = data->is_speaking;
-            info.is_muted       = data->is_muted;
-            info.audio_level    = data->current_level;
-            info.gain           = data->gain;
-            info.pan            = data->pan;
-            info.buffer_ready   = data->buffer_ready;
+            info.is_speaking    = data->is_speaking.load(std::memory_order_relaxed);
+            info.is_muted       = data->is_muted.load(std::memory_order_relaxed);
+            info.audio_level    = data->current_level.load(std::memory_order_relaxed);
+            info.gain           = data->gain.load(std::memory_order_relaxed);
+            info.pan            = data->pan.load(std::memory_order_relaxed);
+            info.buffer_ready   = data->buffer_ready.load(std::memory_order_relaxed);
             info.queue_size     = data->opus_queue.size_approx();
             info.queue_size_avg = data->queue_depth_avg.load(std::memory_order_relaxed);
             info.queue_size_max = data->queue_depth_max.load(std::memory_order_relaxed);
             info.queue_drift_packets =
                 data->queue_depth_drift_milli.load(std::memory_order_relaxed) / 1000.0;
-            info.jitter_buffer_min_packets = data->jitter_buffer_min_packets;
-            info.jitter_buffer_floor_packets = data->jitter_buffer_floor_packets;
-            info.opus_queue_limit_packets = data->opus_queue_limit_packets;
-            info.opus_jitter_manual_override = data->opus_jitter_manual_override;
-            info.opus_jitter_auto_enabled = data->opus_jitter_auto_enabled;
-            info.opus_jitter_auto_floor_packets = data->opus_jitter_auto_floor_packets;
+            info.jitter_buffer_min_packets =
+                data->jitter_buffer_min_packets.load(std::memory_order_relaxed);
+            info.jitter_buffer_floor_packets =
+                data->jitter_buffer_floor_packets.load(std::memory_order_relaxed);
+            info.opus_queue_limit_packets =
+                data->opus_queue_limit_packets.load(std::memory_order_relaxed);
+            info.opus_jitter_manual_override =
+                data->opus_jitter_manual_override.load(std::memory_order_relaxed);
+            info.opus_jitter_auto_enabled =
+                data->opus_jitter_auto_enabled.load(std::memory_order_relaxed);
+            info.opus_jitter_auto_floor_packets =
+                data->opus_jitter_auto_floor_packets.load(std::memory_order_relaxed);
             info.opus_jitter_auto_increases =
                 data->opus_jitter_auto_increases.load(std::memory_order_relaxed);
             info.opus_jitter_auto_decreases =
@@ -143,8 +149,8 @@ public:
                 data->last_packet_frame_count.load(std::memory_order_relaxed);
             info.last_callback_frame_count =
                 data->last_callback_frame_count.load(std::memory_order_relaxed);
-            info.underrun_count = data->underrun_count;
-            info.plc_count      = data->plc_count;
+            info.underrun_count = data->underrun_count.load(std::memory_order_relaxed);
+            info.plc_count      = data->plc_count.load(std::memory_order_relaxed);
             info.packet_age_last_ms =
                 data->packet_age_last_ns.load(std::memory_order_relaxed) / 1e6;
             info.packet_age_avg_ms =
@@ -152,6 +158,10 @@ public:
             info.packet_age_max_ms =
                 data->packet_age_max_ns.load(std::memory_order_relaxed) / 1e6;
             info.sequence_gaps = data->sequence_gaps.load(std::memory_order_relaxed);
+            info.sequence_gap_recoveries =
+                data->sequence_gap_recoveries.load(std::memory_order_relaxed);
+            info.sequence_unresolved_gaps =
+                data->sequence_unresolved_gaps.load(std::memory_order_relaxed);
             info.sequence_late_or_reordered =
                 data->sequence_late_or_reordered.load(std::memory_order_relaxed);
             info.jitter_depth_drops = data->jitter_depth_drops.load(std::memory_order_relaxed);

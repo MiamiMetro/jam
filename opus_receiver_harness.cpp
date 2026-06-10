@@ -682,6 +682,19 @@ int run_self_test() {
     ok &= expect(stable(wifi_stable_metrics), "wifi-target-3-stable",
                  "jitter target 3 stabilizes deterministic Wi-Fi");
 
+    Config reorder_default;
+    reorder_default.scenario = "reorder";
+    reorder_default.frames = 240;
+    reorder_default.callback_frames = 240;
+    reorder_default.callback_frames_set = true;
+    reorder_default.jitter_target = 6;
+    Metrics reorder_default_metrics = run_simulation(reorder_default);
+    ok &= expect(stable(reorder_default_metrics) &&
+                     reorder_default_metrics.sequence_gaps > 0 &&
+                     reorder_default_metrics.late_packets > 0,
+                 "default-reorder-stable",
+                 "adaptive default packetization recovers reordered packets");
+
     Config wifi_auto = wifi_low;
     wifi_auto.auto_jitter = true;
     wifi_auto.packets = 2400;

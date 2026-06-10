@@ -8,11 +8,17 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
 
+option(JAM_BUILD_CLIENT "Build the desktop GUI client" ON)
+option(JAM_BUILD_TESTS "Build and register jam self-tests" ON)
+
 include(cmake/server.cmake)
-include(cmake/client.cmake)
+
+if(JAM_BUILD_CLIENT)
+    include(cmake/client.cmake)
+endif()
 
 add_executable(latency_probe latency_probe.cpp)
-target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog opus)
+target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog opus token_crypto)
 
 add_executable(room_routing_probe room_routing_probe.cpp)
 target_link_libraries(room_routing_probe PRIVATE asio spdlog::spdlog opus token_crypto)
@@ -26,19 +32,30 @@ target_link_libraries(listener_audio_sender_probe PRIVATE asio spdlog::spdlog op
 add_executable(jam_broadcaster jam_broadcaster.cpp)
 target_link_libraries(jam_broadcaster PRIVATE asio spdlog::spdlog)
 
-add_executable(client_manager_self_test client_manager_self_test.cpp)
-target_link_libraries(client_manager_self_test PRIVATE asio)
+if(JAM_BUILD_TESTS)
+    add_executable(client_manager_self_test client_manager_self_test.cpp)
+    target_link_libraries(client_manager_self_test PRIVATE asio concurrentqueue)
 
-add_executable(join_reliability_self_test join_reliability_self_test.cpp)
+    add_executable(join_reliability_self_test join_reliability_self_test.cpp)
 
-add_executable(opus_network_clock_self_test opus_network_clock_self_test.cpp)
+    add_executable(opus_network_clock_self_test opus_network_clock_self_test.cpp)
+
+    add_executable(audio_packet_self_test audio_packet_self_test.cpp)
+
+    add_executable(participant_packet_queue_self_test participant_packet_queue_self_test.cpp)
+    target_link_libraries(participant_packet_queue_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
+
+    add_executable(sequence_tracker_self_test sequence_tracker_self_test.cpp)
+endif()
 
 add_executable(opus_receiver_harness opus_receiver_harness.cpp)
-add_custom_target(opus_receiver_harness_self_test
-    COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test
-    DEPENDS opus_receiver_harness
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-)
+if(JAM_BUILD_TESTS)
+    add_custom_target(opus_receiver_harness_self_test
+        COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test
+        DEPENDS opus_receiver_harness
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+endif()
 
 add_executable(udp_impair_proxy udp_impair_proxy.cpp)
 target_link_libraries(udp_impair_proxy PRIVATE asio)
@@ -46,11 +63,39 @@ target_link_libraries(udp_impair_proxy PRIVATE asio)
 add_executable(multi_participant_jitter_probe multi_participant_jitter_probe.cpp)
 target_link_libraries(multi_participant_jitter_probe PRIVATE asio)
 
-add_executable(recording_writer_self_test recording_writer_self_test.cpp)
-target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)
+if(JAM_BUILD_TESTS)
+    add_executable(recording_writer_self_test recording_writer_self_test.cpp)
+    target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)
 
-add_executable(audio_analysis_self_test audio_analysis_self_test.cpp)
+    add_executable(audio_analysis_self_test audio_analysis_self_test.cpp)
 
-add_executable(audio_backend_policy_self_test audio_backend_policy_self_test.cpp)
+    add_executable(audio_backend_policy_self_test audio_backend_policy_self_test.cpp)
 
-add_executable(juce_audio_adapter_self_test juce_audio_adapter_self_test.cpp)
+    add_executable(juce_audio_adapter_self_test juce_audio_adapter_self_test.cpp)
+endif()
+
+if(JAM_BUILD_TESTS)
+    enable_testing()
+
+    function(jam_add_executable_test target_name)
+        add_test(NAME ${target_name} COMMAND $<TARGET_FILE:${target_name}>)
+    endfunction()
+
+    jam_add_executable_test(client_manager_self_test)
+    jam_add_executable_test(join_reliability_self_test)
+    jam_add_executable_test(opus_network_clock_self_test)
+    jam_add_executable_test(audio_packet_self_test)
+    jam_add_executable_test(participant_packet_queue_self_test)
+    jam_add_executable_test(sequence_tracker_self_test)
+    jam_add_executable_test(recording_writer_self_test)
+    jam_add_executable_test(audio_analysis_self_test)
+    jam_add_executable_test(audio_backend_policy_self_test)
+    jam_add_executable_test(juce_audio_adapter_self_test)
+
+    add_test(NAME opus_receiver_harness_self_test
+             COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test)
+    if(TARGET client)
+        add_test(NAME client_udp_endpoint_guard_smoke
+                 COMMAND $<TARGET_FILE:client> --udp-endpoint-guard-smoke)
+    endif()
+endif()

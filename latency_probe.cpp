@@ -6,10 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <iostream>
 #include <limits>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -26,6 +24,8 @@
 #include "opus_decoder.h"
 #include "opus_encoder.h"
 #include "packet_builder.h"
+#include "participant_info.h"
+#include "performer_join_token.h"
 #include "protocol.h"
 
 using asio::ip::udp;
@@ -62,18 +62,21 @@ struct ProbeConfig {
 struct Args {
     std::string host = "127.0.0.1";
     unsigned short port = 9999;
+    std::string server_id = "local-dev";
+    std::string join_secret;
+    int64_t join_token_ttl_ms = 120000;
     std::string room = "latency-probe";
     std::string sender_user = "latency-probe-sender";
     std::string receiver_user = "latency-probe-receiver";
+    std::string sender_join_token;
+    std::string receiver_join_token;
+    bool require_clean = false;
     bool sweep = false;
+    int invalid_flood_packets = 0;
+    int invalid_flood_interval_us = 0;
     int duration_seconds = 0;
     double playout_ppm = 0.0;
     ProbeConfig config;
-};
-
-struct ReceivedPacket {
-    std::array<unsigned char, AUDIO_BUF_SIZE> data{};
-    uint16_t encoded_bytes = 0;
 };
 
 struct ProbeMetrics {
@@ -107,9 +110,10 @@ struct ProbeResult {
 class ProbeReceiver {
 public:
     ProbeReceiver(asio::io_context& io_context, const udp::endpoint& server_endpoint,
-                  const std::string& room, const std::string& user)
+                  const std::string& room, const std::string& user,
+                  const std::string& join_token)
         : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
-          room_(room), user_(user) {}
+          room_(room), user_(user), join_token_(join_token) {}
 
     void start() {
         do_receive();
@@ -127,19 +131,12 @@ public:
         send_ctrl(CtrlHdr::Cmd::LEAVE);
     }
 
-    bool pop_packet(ReceivedPacket& packet) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (queue_.empty()) {
-            return false;
-        }
-        packet = queue_.front();
-        queue_.pop_front();
-        return true;
+    ParticipantOpusDequeueStatus pop_packet(OpusPacket& packet, size_t gap_wait_packets) {
+        return queue_.dequeue(packet, gap_wait_packets);
     }
 
     size_t queue_size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return queue_.size();
+        return queue_.size_approx();
     }
 
     int received_count() const {
@@ -162,6 +159,7 @@ private:
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
         packet_builder::write_fixed(hdr.display_name, user);
+        packet_builder::write_fixed(hdr.join_token, join_token_);
         socket_.send_to(asio::buffer(&hdr, sizeof(hdr)), server_endpoint_);
     }
 
@@ -176,14 +174,43 @@ private:
     }
 
     void handle_receive(std::size_t bytes) {
-        if (!message_validator::is_valid_audio_packet(
-                bytes, sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t))) {
+        if (bytes < sizeof(MsgHdr)) {
             return;
         }
 
         MsgHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(hdr));
-        if (hdr.magic != AUDIO_MAGIC) {
+        if (hdr.magic == AUDIO_V2_MAGIC) {
+            std::string reason;
+            const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
+            if (!audio_packet::validate_audio_packet_v2_bytes(packet_data, bytes, &reason)) {
+                return;
+            }
+
+            AudioHdrV2 audio{};
+            std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
+
+            OpusPacket packet;
+            std::memcpy(packet.data.data(), packet_builder::audio_v2_payload(packet_data),
+                        audio.payload_bytes);
+            packet.size = audio.payload_bytes;
+            packet.timestamp = clock_type::now();
+            packet.codec = audio.codec;
+            packet.sequence = audio.sequence;
+            packet.sequence_valid = true;
+            packet.sample_rate = audio.sample_rate;
+            packet.frame_count = audio.frame_count;
+            packet.channels = audio.channels;
+
+            if (queue_.enqueue(packet)) {
+                received_count_.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+
+        if (hdr.magic != AUDIO_MAGIC ||
+            !message_validator::is_valid_audio_packet(
+                bytes, sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t))) {
             return;
         }
 
@@ -195,18 +222,31 @@ private:
             return;
         }
 
-        const unsigned char* audio_data =
-            packet_data + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
-
-        ReceivedPacket packet;
-        std::memcpy(packet.data.data(), audio_data, encoded_bytes);
-        packet.encoded_bytes = encoded_bytes;
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            queue_.push_back(packet);
+        const unsigned char* audio_data = packet_builder::audio_v1_payload(packet_data);
+        if (encoded_bytes < 1) {
+            return;
         }
-        received_count_.fetch_add(1, std::memory_order_relaxed);
+
+        OpusPacket packet;
+        if (audio_data[0] == PROBE_CODEC_OPUS) {
+            packet.codec = AudioCodec::Opus;
+        } else if (audio_data[0] == PROBE_CODEC_PCM_INT16) {
+            packet.codec = AudioCodec::PcmInt16;
+        } else {
+            return;
+        }
+        const uint16_t payload_bytes = static_cast<uint16_t>(encoded_bytes - 1);
+        std::memcpy(packet.data.data(), audio_data + 1, payload_bytes);
+        packet.size = payload_bytes;
+        packet.timestamp = clock_type::now();
+        packet.sequence_valid = false;
+        packet.sample_rate = SAMPLE_RATE;
+        packet.frame_count = 0;
+        packet.channels = CHANNELS;
+
+        if (queue_.enqueue(packet)) {
+            received_count_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     udp::socket socket_;
@@ -214,18 +254,19 @@ private:
     udp::endpoint remote_endpoint_;
     std::string room_;
     std::string user_;
+    std::string join_token_;
     std::array<char, 1024> recv_buf_{};
-    mutable std::mutex mutex_;
-    std::deque<ReceivedPacket> queue_;
+    ParticipantOpusPacketQueue queue_;
     std::atomic<int> received_count_{0};
 };
 
 class ProbeSender {
 public:
     ProbeSender(asio::io_context& io_context, const udp::endpoint& server_endpoint,
-                const std::string& room, const std::string& user)
+                const std::string& room, const std::string& user,
+                const std::string& join_token)
         : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
-          room_(room), user_(user) {}
+          room_(room), user_(user), join_token_(join_token) {}
 
     void send_join() {
         send_join_packet(room_, user_);
@@ -239,17 +280,17 @@ public:
         send_ctrl(CtrlHdr::Cmd::LEAVE);
     }
 
-    bool send_audio_packet(uint8_t codec, const unsigned char* payload, size_t payload_bytes) {
-        if (payload_bytes + 1 > AUDIO_BUF_SIZE) {
+    bool send_audio_packet(ProbeCodec codec, uint32_t sequence, int frame_count,
+                           const unsigned char* payload, size_t payload_bytes) {
+        if (payload_bytes > AUDIO_BUF_SIZE) {
             return false;
         }
 
-        std::vector<unsigned char> probe_payload;
-        probe_payload.reserve(payload_bytes + 1);
-        probe_payload.push_back(codec);
-        probe_payload.insert(probe_payload.end(), payload, payload + payload_bytes);
-
-        auto packet = audio_packet::create_audio_packet(probe_payload);
+        const AudioCodec audio_codec =
+            codec == ProbeCodec::Opus ? AudioCodec::Opus : AudioCodec::PcmInt16;
+        auto packet = audio_packet::create_audio_packet_v2(
+            audio_codec, sequence, SAMPLE_RATE, static_cast<uint16_t>(frame_count),
+            CHANNELS, payload, static_cast<uint16_t>(payload_bytes));
         std::error_code ec;
         socket_.send_to(asio::buffer(packet->data(), packet->size()), server_endpoint_, 0, ec);
         return !ec;
@@ -271,6 +312,7 @@ private:
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
         packet_builder::write_fixed(hdr.display_name, user);
+        packet_builder::write_fixed(hdr.join_token, join_token_);
         socket_.send_to(asio::buffer(&hdr, sizeof(hdr)), server_endpoint_);
     }
 
@@ -278,6 +320,7 @@ private:
     udp::endpoint server_endpoint_;
     std::string room_;
     std::string user_;
+    std::string join_token_;
 };
 
 void fill_probe_frame(int packet_index, const ProbeConfig& config, std::vector<float>& frame) {
@@ -300,25 +343,64 @@ const char* codec_name(ProbeCodec codec) {
     return "unknown";
 }
 
-bool decode_pcm_int16_packet(const ReceivedPacket& packet, const ProbeConfig& config,
+void send_invalid_packet_flood(udp::endpoint server_endpoint, int packet_count,
+                               int interval_us, clock_type::time_point start_time) {
+    if (packet_count <= 0) {
+        return;
+    }
+
+    asio::io_context io_context;
+    udp::socket socket(io_context, udp::endpoint(udp::v4(), 0));
+    std::array<unsigned char, sizeof(MsgHdr)> packet{};
+    const uint32_t magics[] = {PING_MAGIC, CTRL_MAGIC, AUDIO_MAGIC, AUDIO_V2_MAGIC};
+
+    std::this_thread::sleep_until(start_time);
+    for (int i = 0; i < packet_count; ++i) {
+        const uint32_t magic = magics[static_cast<size_t>(i) %
+                                      (sizeof(magics) / sizeof(magics[0]))];
+        std::memcpy(packet.data(), &magic, sizeof(magic));
+        std::error_code ec;
+        socket.send_to(asio::buffer(packet), server_endpoint, 0, ec);
+        if (interval_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
+        }
+    }
+}
+
+bool decode_pcm_int16_packet(const OpusPacket& packet, const ProbeConfig& config,
                              std::array<float, MAX_FRAME_SAMPLES>& pcm) {
-    if (packet.encoded_bytes < 1 || packet.data[0] != PROBE_CODEC_PCM_INT16) {
+    if (packet.codec != AudioCodec::PcmInt16) {
         return false;
     }
 
-    size_t payload_bytes = static_cast<size_t>(packet.encoded_bytes - 1);
+    size_t payload_bytes = packet.get_size();
     size_t expected_bytes = static_cast<size_t>(config.frame_size) * sizeof(int16_t);
     if (payload_bytes != expected_bytes) {
         return false;
     }
 
-    const unsigned char* payload = packet.data.data() + 1;
+    const unsigned char* payload = packet.get_data();
     for (int i = 0; i < config.frame_size; ++i) {
         int16_t sample = 0;
         std::memcpy(&sample, payload + static_cast<size_t>(i) * sizeof(sample), sizeof(sample));
         pcm[static_cast<size_t>(i)] = static_cast<float>(sample) / 32767.0F;
     }
     return true;
+}
+
+std::string create_probe_join_token(const Args& args, const std::string& profile_id) {
+    if (args.join_secret.empty()) {
+        return "";
+    }
+
+    performer_join_token::Claims claims;
+    claims.expires_at_ms = performer_join_token::now_ms() + args.join_token_ttl_ms;
+    claims.server_id = args.server_id;
+    claims.room_id = args.room;
+    claims.profile_id = profile_id;
+    claims.role = "performer";
+    claims.nonce = performer_join_token::random_nonce();
+    return performer_join_token::create(claims, args.join_secret);
 }
 
 void inspect_samples(const std::array<float, MAX_FRAME_SAMPLES>& pcm, int decoded_samples,
@@ -400,15 +482,23 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
         metrics.min_queue_depth_after_ready =
             std::min(metrics.min_queue_depth_after_ready, current_queue_depth);
 
-        ReceivedPacket packet;
-        if (receiver.pop_packet(packet)) {
+        OpusPacket packet;
+        const auto dequeue_status =
+            receiver.pop_packet(packet, static_cast<size_t>(config.jitter_min_packets));
+        if (dequeue_status == ParticipantOpusDequeueStatus::Packet) {
             int decoded_samples = 0;
-            if (config.codec == ProbeCodec::Opus) {
-                if (packet.encoded_bytes < 1 || packet.data[0] != PROBE_CODEC_OPUS) {
+            if (packet.loss_concealment && packet.codec == AudioCodec::Opus) {
+                decoded_samples = decoder.decode_plc(pcm.data(), config.frame_size);
+                if (decoded_samples > 0) {
+                    metrics.plc_frames++;
+                }
+            } else if (packet.codec == AudioCodec::Opus) {
+                if (config.codec != ProbeCodec::Opus) {
                     metrics.decode_failures++;
                     continue;
                 }
-                decoded_samples = decoder.decode_into(packet.data.data() + 1, packet.encoded_bytes - 1,
+                decoded_samples = decoder.decode_into(packet.get_data(),
+                                                      static_cast<int>(packet.get_size()),
                                                       pcm.data(), config.frame_size);
                 if (decoded_samples <= 0) {
                     metrics.decode_failures++;
@@ -426,6 +516,8 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             }
             inspect_samples(pcm, decoded_samples, output_base_sample, config, metrics,
                             previous_block, have_previous_block);
+        } else if (dequeue_status == ParticipantOpusDequeueStatus::WaitingForGap) {
+            continue;
         } else if (receiver.received_count() < config.total_packets) {
             metrics.underruns++;
             if (config.codec == ProbeCodec::Opus) {
@@ -453,6 +545,7 @@ void run_sender_loop(const ProbeConfig& config, ProbeSender& sender, ProbeMetric
     std::vector<float> frame(static_cast<size_t>(config.frame_size), 0.0F);
     std::vector<unsigned char> encoded;
     std::vector<unsigned char> pcm_payload(static_cast<size_t>(config.frame_size) * sizeof(int16_t));
+    uint32_t sequence = 0;
     auto frame_duration =
         std::chrono::duration_cast<clock_type::duration>(std::chrono::duration<double>(
             static_cast<double>(config.frame_size) / static_cast<double>(SAMPLE_RATE)));
@@ -469,7 +562,8 @@ void run_sender_loop(const ProbeConfig& config, ProbeSender& sender, ProbeMetric
                 metrics.encode_failures++;
                 continue;
             }
-            sent = sender.send_audio_packet(PROBE_CODEC_OPUS, encoded.data(), encoded.size());
+            sent = sender.send_audio_packet(ProbeCodec::Opus, sequence++, config.frame_size,
+                                            encoded.data(), encoded.size());
         } else {
             for (int i = 0; i < config.frame_size; ++i) {
                 float clamped = std::clamp(frame[static_cast<size_t>(i)], -1.0F, 1.0F);
@@ -477,8 +571,8 @@ void run_sender_loop(const ProbeConfig& config, ProbeSender& sender, ProbeMetric
                 std::memcpy(pcm_payload.data() + static_cast<size_t>(i) * sizeof(sample), &sample,
                             sizeof(sample));
             }
-            sent = sender.send_audio_packet(PROBE_CODEC_PCM_INT16, pcm_payload.data(),
-                                            pcm_payload.size());
+            sent = sender.send_audio_packet(ProbeCodec::PcmInt16, sequence++, config.frame_size,
+                                            pcm_payload.data(), pcm_payload.size());
         }
         if (sent) {
             metrics.sent_packets++;
@@ -494,8 +588,17 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     udp::endpoint server_endpoint =
         *resolver.resolve(udp::v4(), args.host, std::to_string(args.port)).begin();
 
-    ProbeReceiver receiver(io_context, server_endpoint, args.room, args.receiver_user);
-    ProbeSender sender(io_context, server_endpoint, args.room, args.sender_user);
+    const std::string receiver_join_token =
+        !args.receiver_join_token.empty() ? args.receiver_join_token
+                                          : create_probe_join_token(args, args.receiver_user);
+    const std::string sender_join_token =
+        !args.sender_join_token.empty() ? args.sender_join_token
+                                        : create_probe_join_token(args, args.sender_user);
+
+    ProbeReceiver receiver(io_context, server_endpoint, args.room, args.receiver_user,
+                           receiver_join_token);
+    ProbeSender sender(io_context, server_endpoint, args.room, args.sender_user,
+                       sender_join_token);
 
     receiver.start();
     std::thread io_thread([&io_context]() { io_context.run(); });
@@ -507,12 +610,22 @@ ProbeResult run_probe(const Args& args, const ProbeConfig& config) {
     ProbeMetrics metrics;
     auto start_time = clock_type::now() + 100ms;
 
+    std::thread invalid_flood_thread;
+    if (args.invalid_flood_packets > 0) {
+        invalid_flood_thread = std::thread(send_invalid_packet_flood, server_endpoint,
+                                           args.invalid_flood_packets,
+                                           args.invalid_flood_interval_us, start_time);
+    }
+
     std::thread playout_thread(run_playout_loop, std::cref(config), std::ref(receiver),
                                std::ref(metrics), start_time, args.playout_ppm);
     std::thread sender_thread(run_sender_loop, std::cref(config), std::ref(sender),
                               std::ref(metrics), start_time);
 
     sender_thread.join();
+    if (invalid_flood_thread.joinable()) {
+        invalid_flood_thread.join();
+    }
     playout_thread.join();
 
     sender.send_leave();
@@ -547,6 +660,16 @@ bool has_corruption_indicators(const ProbeResult& result) {
            m.non_finite_samples > 0 || m.out_of_range_samples > 0;
 }
 
+bool has_delivery_indicators(const ProbeResult& result) {
+    const auto& m = result.metrics;
+    return m.sent_packets <= 0 || m.received_packets != m.sent_packets ||
+           m.decoded_packets != m.sent_packets;
+}
+
+bool has_clean_failure_indicators(const ProbeResult& result) {
+    return has_corruption_indicators(result) || has_delivery_indicators(result);
+}
+
 void print_result(const Args& args, const ProbeResult& result) {
     const auto& c = result.config;
     const auto& m = result.metrics;
@@ -558,19 +681,22 @@ void print_result(const Args& args, const ProbeResult& result) {
         m.min_queue_depth_after_ready == std::numeric_limits<int>::max()
             ? 0
             : m.min_queue_depth_after_ready;
-    std::cout << "latency_probe v1\n";
+    std::cout << "latency_probe v2\n";
     std::cout << "server: " << args.host << ":" << args.port << "\n";
     std::cout << "codec: " << codec_name(c.codec) << "\n";
     std::cout << "sample_rate: " << SAMPLE_RATE << "\n";
     std::cout << "frames_per_packet: " << c.frame_size << "\n";
     std::cout << "jitter_min_packets: " << c.jitter_min_packets << "\n";
     std::cout << "playout_ppm: " << args.playout_ppm << "\n";
+    std::cout << "invalid_flood_packets: " << args.invalid_flood_packets << "\n";
     std::cout << "total_packets: " << c.total_packets << "\n";
     std::cout << "impulse_packet: " << IMPULSE_PACKET << "\n";
     std::cout << "sent_packets: " << m.sent_packets << "\n";
     std::cout << "encode_failures: " << m.encode_failures << "\n";
     std::cout << "received_packets: " << m.received_packets << "\n";
     std::cout << "decoded_packets: " << m.decoded_packets << "\n";
+    std::cout << "missing_packets: " << (m.sent_packets - m.received_packets) << "\n";
+    std::cout << "undecoded_packets: " << (m.sent_packets - m.decoded_packets) << "\n";
     std::cout << "detected_output_sample: " << m.detected_output_sample << "\n";
     std::cout << "latency_samples: " << result.latency_samples << "\n";
     std::cout << "latency_ms: " << result.latency_ms << "\n";
@@ -590,6 +716,9 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "max_discontinuity: " << m.max_discontinuity << "\n";
     if (has_corruption_indicators(result)) {
         std::cout << "warning: corruption indicators were observed\n";
+    }
+    if (has_delivery_indicators(result)) {
+        std::cout << "warning: packet delivery/decode mismatch was observed\n";
     }
 }
 
@@ -619,7 +748,8 @@ void print_sweep_row(const Args& args, const ProbeResult& result) {
               << m.underruns << ',' << m.plc_frames << ',' << m.decode_failures << ','
               << m.decoded_size_mismatches << ',' << m.non_finite_samples << ','
               << m.out_of_range_samples << ',' << m.repeated_blocks << ','
-              << m.max_discontinuity << ',' << (has_corruption_indicators(result) ? "warn" : "ok")
+              << m.max_discontinuity << ','
+              << (has_clean_failure_indicators(result) ? "warn" : "ok")
               << "\n";
 }
 
@@ -631,6 +761,18 @@ Args parse_args(int argc, char** argv) {
             args.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             args.port = static_cast<unsigned short>(std::stoi(argv[++i]));
+        } else if (arg == "--server-id" && i + 1 < argc) {
+            args.server_id = argv[++i];
+        } else if (arg == "--join-secret" && i + 1 < argc) {
+            args.join_secret = argv[++i];
+        } else if (arg == "--join-token-ttl-ms" && i + 1 < argc) {
+            args.join_token_ttl_ms = std::stoll(argv[++i]);
+        } else if (arg == "--sender-join-token" && i + 1 < argc) {
+            args.sender_join_token = argv[++i];
+        } else if (arg == "--receiver-join-token" && i + 1 < argc) {
+            args.receiver_join_token = argv[++i];
+        } else if (arg == "--require-clean" || arg == "--fail-on-warning") {
+            args.require_clean = true;
         } else if (arg == "--room" && i + 1 < argc) {
             args.room = argv[++i];
         } else if (arg == "--sender-user" && i + 1 < argc) {
@@ -647,6 +789,10 @@ Args parse_args(int argc, char** argv) {
             args.duration_seconds = std::stoi(argv[++i]);
         } else if (arg == "--playout-ppm" && i + 1 < argc) {
             args.playout_ppm = std::stod(argv[++i]);
+        } else if (arg == "--invalid-flood-packets" && i + 1 < argc) {
+            args.invalid_flood_packets = std::stoi(argv[++i]);
+        } else if (arg == "--invalid-flood-interval-us" && i + 1 < argc) {
+            args.invalid_flood_interval_us = std::stoi(argv[++i]);
         } else if (arg == "--codec" && i + 1 < argc) {
             std::string codec = argv[++i];
             if (codec == "opus") {
@@ -669,6 +815,8 @@ Args parse_args(int argc, char** argv) {
     if (args.config.total_packets <= IMPULSE_PACKET) {
         throw std::runtime_error("--packets/--seconds must run past the impulse packet");
     }
+    args.invalid_flood_packets = std::max(0, args.invalid_flood_packets);
+    args.invalid_flood_interval_us = std::max(0, args.invalid_flood_interval_us);
     return args;
 }
 
@@ -695,6 +843,9 @@ int main(int argc, char** argv) {
 
         ProbeResult result = run_probe(args, args.config);
         print_result(args, result);
+        if (args.require_clean && has_clean_failure_indicators(result)) {
+            return 3;
+        }
         return result.metrics.detected_output_sample >= 0 ? 0 : 2;
     } catch (const std::exception& e) {
         std::cerr << "latency_probe failed: " << e.what() << "\n";

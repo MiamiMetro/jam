@@ -27,6 +27,7 @@
 #include "packet_builder.h"
 #include "periodic_timer.h"
 #include "protocol.h"
+#include "sequence_tracker.h"
 #include "server_config.h"
 
 using asio::ip::udp;
@@ -134,12 +135,17 @@ public:
     // Send with optional shared_ptr to keep data alive during async operation
     void send(void* data, std::size_t len, const udp::endpoint& target,
               const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
-        socket_.async_send_to(asio::buffer(data, len), target,
-                              [keep_alive](std::error_code error_code, std::size_t) {
+        auto send_buffer = keep_alive;
+        if (send_buffer == nullptr) {
+            const auto* bytes = static_cast<const unsigned char*>(data);
+            send_buffer = std::make_shared<std::vector<unsigned char>>(bytes, bytes + len);
+        }
+
+        socket_.async_send_to(asio::buffer(send_buffer->data(), send_buffer->size()), target,
+                              [send_buffer](std::error_code error_code, std::size_t) {
                                   if (error_code) {
                                       Log::error("send error: {}", error_code.message());
                                   }
-                                  // keep_alive keeps the data alive until send completes
                               });
     }
 
@@ -153,27 +159,44 @@ private:
     };
 
     struct AudioForwardStats {
-        uint32_t next_sequence = 0;
-        bool sequence_initialized = false;
         uint64_t forwarded_total = 0;
         uint64_t sequence_gaps_total = 0;
+        uint64_t sequence_gap_recoveries_total = 0;
+        uint64_t sequence_unresolved_gaps = 0;
         uint64_t sequence_late_or_reordered_total = 0;
         uint64_t forwarded_interval = 0;
         uint64_t sequence_gaps_interval = 0;
+        uint64_t sequence_gap_recoveries_interval = 0;
         uint64_t sequence_late_or_reordered_interval = 0;
+        SequenceArrivalTracker sequence_tracker;
+    };
+
+    struct AudioIngressStats {
+        udp::endpoint endpoint;
+        uint64_t received_total = 0;
+        uint64_t sequence_gaps_total = 0;
+        uint64_t sequence_gap_recoveries_total = 0;
+        uint64_t sequence_unresolved_gaps = 0;
+        uint64_t sequence_late_or_reordered_total = 0;
+        uint64_t received_interval = 0;
+        uint64_t sequence_gaps_interval = 0;
+        uint64_t sequence_gap_recoveries_interval = 0;
+        uint64_t sequence_late_or_reordered_interval = 0;
+        SequenceArrivalTracker sequence_tracker;
     };
 
     void handle_receive_error(std::error_code error_code) {
-        Log::error("receive error: {}", error_code.message());
-        client_manager_.remove_client(remote_endpoint_);
-        Log::info("Client {}:{} removed due to receive error",
-                  remote_endpoint_.address().to_string(), remote_endpoint_.port());
+        if (error_code == asio::error::operation_aborted) {
+            return;
+        }
+
+        Log::warn("UDP receive error: {}; keeping participants registered",
+                  error_code.message());
         do_receive();  // keep listening
     }
 
     void handle_ping_message(std::size_t bytes) {
         if (!message_validator::is_valid_ping(bytes) || !client_manager_.exists(remote_endpoint_)) {
-            do_receive();
             return;
         }
 
@@ -184,14 +207,13 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
         shdr.t2_server_recv = nanoseconds;
         shdr.t3_server_send = nanoseconds;
-        std::memcpy(recv_buf_.data(), &shdr, sizeof(SyncHdr));
-
-        send(recv_buf_.data(), sizeof(SyncHdr), remote_endpoint_);
+        auto packet = std::make_shared<std::vector<unsigned char>>(sizeof(SyncHdr));
+        std::memcpy(packet->data(), &shdr, sizeof(SyncHdr));
+        send(packet->data(), packet->size(), remote_endpoint_, packet);
     }
 
     void handle_ctrl_message(std::size_t bytes) {
         if (bytes < sizeof(CtrlHdr)) {
-            do_receive();
             return;
         }
 
@@ -304,7 +326,6 @@ private:
                                         : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
         if (!message_validator::is_valid_audio_packet(bytes, min_audio_packet_size)) {
             Log::debug("Audio packet too small: {} bytes", bytes);
-            do_receive();
             return;
         }
 
@@ -330,6 +351,7 @@ private:
         // Copy packet data before forwarding since recv_buf_ will be reused by do_receive()
         auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
                                                                         recv_buf_.data() + bytes);
+        record_audio_ingress(sender_id, remote_endpoint_, packet_copy->data(), bytes);
         forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
     }
 
@@ -539,6 +561,40 @@ private:
         }
     }
 
+    void record_audio_ingress(uint32_t sender_id, const udp::endpoint& endpoint, void* packet_data,
+                              std::size_t packet_size) {
+        if (sender_id == 0 || packet_size < sizeof(MsgHdr)) {
+            return;
+        }
+
+        MsgHdr hdr{};
+        std::memcpy(&hdr, packet_data, sizeof(MsgHdr));
+        if (hdr.magic != AUDIO_V2_MAGIC || packet_size < audio_packet::v2_header_size()) {
+            return;
+        }
+
+        AudioHdrV2 audio{};
+        std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
+        auto& stats = audio_ingress_stats_[sender_id];
+        stats.endpoint = endpoint;
+        ++stats.received_total;
+        ++stats.received_interval;
+        const auto sequence_delta = stats.sequence_tracker.record(audio.sequence);
+        if (sequence_delta.gaps_detected > 0) {
+            stats.sequence_gaps_total += sequence_delta.gaps_detected;
+            stats.sequence_gaps_interval += sequence_delta.gaps_detected;
+        }
+        if (sequence_delta.gaps_recovered > 0) {
+            stats.sequence_gap_recoveries_total += sequence_delta.gaps_recovered;
+            stats.sequence_gap_recoveries_interval += sequence_delta.gaps_recovered;
+        }
+        stats.sequence_unresolved_gaps = stats.sequence_tracker.unresolved_gaps();
+        if (sequence_delta.late_or_duplicate) {
+            ++stats.sequence_late_or_reordered_total;
+            ++stats.sequence_late_or_reordered_interval;
+        }
+    }
+
     void record_audio_forward(uint32_t sender_id, const udp::endpoint& target, void* packet_data,
                               std::size_t packet_size) {
         if (sender_id == 0 || packet_size < sizeof(MsgHdr)) {
@@ -562,17 +618,17 @@ private:
         auto& stats = audio_forward_stats_[key];
         ++stats.forwarded_total;
         ++stats.forwarded_interval;
-        if (!stats.sequence_initialized) {
-            stats.sequence_initialized = true;
-            stats.next_sequence = audio.sequence + 1;
-        } else if (audio.sequence == stats.next_sequence) {
-            ++stats.next_sequence;
-        } else if (audio.sequence > stats.next_sequence) {
-            const uint32_t gap = audio.sequence - stats.next_sequence;
-            stats.sequence_gaps_total += gap;
-            stats.sequence_gaps_interval += gap;
-            stats.next_sequence = audio.sequence + 1;
-        } else {
+        const auto sequence_delta = stats.sequence_tracker.record(audio.sequence);
+        if (sequence_delta.gaps_detected > 0) {
+            stats.sequence_gaps_total += sequence_delta.gaps_detected;
+            stats.sequence_gaps_interval += sequence_delta.gaps_detected;
+        }
+        if (sequence_delta.gaps_recovered > 0) {
+            stats.sequence_gap_recoveries_total += sequence_delta.gaps_recovered;
+            stats.sequence_gap_recoveries_interval += sequence_delta.gaps_recovered;
+        }
+        stats.sequence_unresolved_gaps = stats.sequence_tracker.unresolved_gaps();
+        if (sequence_delta.late_or_duplicate) {
             ++stats.sequence_late_or_reordered_total;
             ++stats.sequence_late_or_reordered_interval;
         }
@@ -585,6 +641,32 @@ private:
             invalid_audio_drops_since_log_ = 0;
         }
 
+        for (auto& [sender_id, stats]: audio_ingress_stats_) {
+            if (stats.received_interval == 0 && stats.sequence_gaps_interval == 0 &&
+                stats.sequence_late_or_reordered_interval == 0) {
+                continue;
+            }
+
+            Log::info(
+                "Ingress diag interval sender={} endpoint={}:{} received={} seq_gap={} "
+                "gap_rate={:.1f}% seq_recovered={} seq_unresolved={} seq_late={} late={:.1f}% "
+                "total received={} seq_gap={} seq_recovered={} seq_unresolved={} seq_late={}",
+                sender_id, stats.endpoint.address().to_string(), stats.endpoint.port(),
+                stats.received_interval, stats.sequence_gaps_interval,
+                percent_missing(stats.sequence_gaps_interval, stats.received_interval),
+                stats.sequence_gap_recoveries_interval, stats.sequence_unresolved_gaps,
+                stats.sequence_late_or_reordered_interval,
+                percent_of_packets(stats.sequence_late_or_reordered_interval,
+                                   stats.received_interval),
+                stats.received_total, stats.sequence_gaps_total,
+                stats.sequence_gap_recoveries_total, stats.sequence_unresolved_gaps,
+                stats.sequence_late_or_reordered_total);
+            stats.received_interval = 0;
+            stats.sequence_gaps_interval = 0;
+            stats.sequence_gap_recoveries_interval = 0;
+            stats.sequence_late_or_reordered_interval = 0;
+        }
+
         for (auto& [key, stats]: audio_forward_stats_) {
             if (stats.forwarded_interval == 0 && stats.sequence_gaps_interval == 0 &&
                 stats.sequence_late_or_reordered_interval == 0) {
@@ -594,15 +676,39 @@ private:
             const uint32_t sender_id = static_cast<uint32_t>(key >> 32);
             const uint32_t target_id = static_cast<uint32_t>(key & 0xFFFFFFFFU);
             Log::info(
-                "Forward diag interval sender={} target={} forwarded={} seq_gap={} seq_late={} "
-                "total forwarded={} seq_gap={} seq_late={}",
+                "Forward diag interval sender={} target={} forwarded={} seq_gap={} gap_rate={:.1f}% "
+                "seq_recovered={} seq_unresolved={} seq_late={} late={:.1f}% "
+                "total forwarded={} seq_gap={} seq_recovered={} seq_unresolved={} seq_late={}",
                 sender_id, target_id, stats.forwarded_interval, stats.sequence_gaps_interval,
-                stats.sequence_late_or_reordered_interval, stats.forwarded_total,
-                stats.sequence_gaps_total, stats.sequence_late_or_reordered_total);
+                percent_missing(stats.sequence_gaps_interval, stats.forwarded_interval),
+                stats.sequence_gap_recoveries_interval, stats.sequence_unresolved_gaps,
+                stats.sequence_late_or_reordered_interval,
+                percent_of_packets(stats.sequence_late_or_reordered_interval,
+                                   stats.forwarded_interval),
+                stats.forwarded_total,
+                stats.sequence_gaps_total, stats.sequence_gap_recoveries_total,
+                stats.sequence_unresolved_gaps, stats.sequence_late_or_reordered_total);
             stats.forwarded_interval = 0;
             stats.sequence_gaps_interval = 0;
+            stats.sequence_gap_recoveries_interval = 0;
             stats.sequence_late_or_reordered_interval = 0;
         }
+    }
+
+    static double percent_missing(uint64_t missing_events, uint64_t received_packets) {
+        const uint64_t denominator = missing_events + received_packets;
+        if (denominator == 0) {
+            return 0.0;
+        }
+        return (static_cast<double>(missing_events) * 100.0) /
+               static_cast<double>(denominator);
+    }
+
+    static double percent_of_packets(uint64_t events, uint64_t packets) {
+        if (packets == 0) {
+            return 0.0;
+        }
+        return (static_cast<double>(events) * 100.0) / static_cast<double>(packets);
     }
 
     ServerOptions options_;
@@ -610,6 +716,7 @@ private:
 
     ClientManager client_manager_;
     std::unordered_map<udp::endpoint, UnknownEndpointInfo, endpoint_hash> unknown_endpoints_;
+    std::unordered_map<uint32_t, AudioIngressStats> audio_ingress_stats_;
     std::unordered_map<uint64_t, AudioForwardStats> audio_forward_stats_;
     uint64_t unknown_audio_drops_since_log_ = 0;
     uint64_t invalid_audio_drops_since_log_ = 0;

@@ -170,11 +170,9 @@ Run on the VPS as `jam`:
 ```bash
 cd /home/jam/jam
 
-# VPS builds only need the server target. The desktop client pulls in
-# workstation-only dependencies, so disable it before configuring CMake.
-sed -i 's/^include(cmake\/client.cmake)/# include(cmake\/client.cmake)/' CMakeLists.txt
-
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+# VPS builds only need the server target. Disable the desktop client so CMake
+# does not fetch/configure workstation-only GUI/audio dependencies.
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJAM_BUILD_CLIENT=OFF -DJAM_BUILD_TESTS=OFF
 cmake --build build --target server
 ```
 
@@ -256,20 +254,13 @@ Share only the generated client command with that friend.
 
 ## 7. Update after code changes
 
-The initial VPS server build comments out `include(cmake/client.cmake)` in
-`CMakeLists.txt`. That local edit is intentional for VPS builds, but it makes
-the Git working tree dirty. Before `git pull`, restore the tracked file, then
-reapply the VPS-only edit after pulling.
-
 If using git:
 
 ```bash
 ssh -i "$LOCAL_KEY" -p "$VPS_SSH_PORT" jam@"$VPS_HOST"
 cd /home/jam/jam
-git restore CMakeLists.txt
 git pull
-sed -i 's/^include(cmake\/client.cmake)/# include(cmake\/client.cmake)/' CMakeLists.txt
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJAM_BUILD_CLIENT=OFF -DJAM_BUILD_TESTS=OFF
 cmake --build build --target server
 sudo systemctl restart jam-server
 sudo systemctl status jam-server --no-pager
@@ -369,10 +360,34 @@ ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "sudo systemctl restart
 Deploy latest code and restart:
 
 ```bat
-ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git restore CMakeLists.txt && git pull && sed -i 's/^include(cmake\/client.cmake)/# include(cmake\/client.cmake)/' CMakeLists.txt && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build --target server && sudo systemctl restart jam-server && sudo systemctl status jam-server --no-pager"
+ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && git pull && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJAM_BUILD_CLIENT=OFF -DJAM_BUILD_TESTS=OFF && cmake --build build --target server && sudo systemctl restart jam-server && sudo systemctl status jam-server --no-pager"
 ```
 
 The commands with `sudo` use `-t` because they may need the `jam` password.
+
+Verify the deployed production-auth UDP path from your Windows machine:
+
+```bat
+cmake --build build --config Release --target latency_probe
+build\Release\latency_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room room1 --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
+```
+
+Then run the same check with malformed public-UDP noise mixed in:
+
+```bat
+build\Release\latency_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room room1 --codec opus --frames 240 --jitter 6 --seconds 20 --invalid-flood-packets 2000 --require-clean
+```
+
+This probe creates two short-lived performer clients with valid join tokens and
+sends sequenced Opus through the public VPS. A healthy run should show
+`received_packets` equal to `sent_packets`, `decoded_packets` equal to
+`sent_packets`, `missing_packets: 0`, `undecoded_packets: 0`,
+`decode_failures: 0`, `decoded_size_mismatches: 0`, `non_finite_samples: 0`,
+`underruns: 0`, and `plc_frames: 0`. With `--require-clean`, the command exits
+nonzero if any of those checks fail. The malformed-packet flood checks that
+random public UDP noise does not corrupt the server receive loop. If either
+probe fails while server/client logs show `seq_recovered`, the remaining
+problem is real packet loss/backlog rather than reordering.
 
 ## Notes
 
