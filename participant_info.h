@@ -419,6 +419,7 @@ struct ParticipantData {
     std::atomic<bool>                     opus_jitter_manual_override{false};
     std::atomic<bool>                     opus_jitter_auto_enabled{false};
     std::atomic<size_t>                   opus_jitter_auto_floor_packets{DEFAULT_OPUS_JITTER_PACKETS};
+    std::atomic<size_t>                   opus_jitter_auto_max_packets{DEFAULT_OPUS_AUTO_MAX_JITTER_PACKETS};
     std::atomic<int>                      opus_jitter_auto_stable_callbacks{0};
     std::atomic<int>                      opus_jitter_auto_instability_events{0};
     std::atomic<uint64_t>                 opus_jitter_auto_increases{0};
@@ -480,6 +481,7 @@ struct ParticipantInfo {
     bool     opus_jitter_manual_override;
     bool     opus_jitter_auto_enabled;
     size_t   opus_jitter_auto_floor_packets;
+    size_t   opus_jitter_auto_max_packets;
     uint64_t opus_jitter_auto_increases;
     uint64_t opus_jitter_auto_decreases;
     size_t   opus_pcm_buffered_frames;
