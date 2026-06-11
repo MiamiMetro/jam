@@ -149,16 +149,16 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "Startup config smoke:.*opus_packet=480.*jitter_floor=3.*auto_start_jitter=4.*auto_jitter_max=8.*auto_jitter=true.*auto_optimize=true.*redundancy=auto")
+                "Startup config smoke:.*opus_packet=480.*jitter_floor=6.*auto_start_jitter=14.*auto_jitter=true")
         add_test(NAME client_startup_config_low_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke --latency-profile low)
         set_tests_properties(client_startup_config_low_smoke PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "Startup config smoke:.*opus_packet=120.*jitter_floor=3.*auto_start_jitter=disabled.*auto_jitter=false.*auto_optimize=false")
+                "Startup config smoke:.*opus_packet=120.*jitter_floor=3.*auto_start_jitter=disabled.*auto_jitter=false")
         add_test(NAME client_startup_config_stable_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke --latency-profile stable)
         set_tests_properties(client_startup_config_stable_smoke PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "Startup config smoke:.*opus_packet=960.*jitter_floor=8.*auto_start_jitter=8.*auto_jitter_max=8.*auto_jitter=true.*auto_optimize=true")
+                "Startup config smoke:.*opus_packet=960.*jitter_floor=8.*auto_start_jitter=14.*auto_jitter=true")
     endif()
 endif()

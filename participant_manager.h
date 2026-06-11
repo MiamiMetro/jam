@@ -124,8 +124,6 @@ public:
                 data->opus_jitter_auto_enabled.load(std::memory_order_relaxed);
             info.opus_jitter_auto_floor_packets =
                 data->opus_jitter_auto_floor_packets.load(std::memory_order_relaxed);
-            info.opus_jitter_auto_max_packets =
-                data->opus_jitter_auto_max_packets.load(std::memory_order_relaxed);
             info.opus_jitter_auto_increases =
                 data->opus_jitter_auto_increases.load(std::memory_order_relaxed);
             info.opus_jitter_auto_decreases =

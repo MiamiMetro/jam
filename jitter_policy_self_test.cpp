@@ -48,15 +48,6 @@ void test_auto_start_jitter_respects_higher_configured_floor() {
             "auto-start jitter should still be clamped to the user-facing maximum");
 }
 
-void test_auto_start_jitter_respects_configured_ceiling() {
-    require(opus_auto_start_jitter_packets(DEFAULT_OPUS_JITTER_PACKETS,
-                                           DEFAULT_OPUS_JITTER_PACKETS) ==
-                DEFAULT_OPUS_JITTER_PACKETS,
-            "auto-start jitter should respect the configured auto ceiling");
-    require(clamp_opus_auto_jitter_max_packets(6, 3) == 6,
-            "auto jitter ceiling should not fall below the configured floor");
-}
-
 void test_auto_start_target_does_not_snap_to_floor_before_ready() {
     require(!jitter_target_should_snap_to_floor(
                 AudioCodec::Opus, false, true, false,
@@ -98,7 +89,6 @@ int main() {
     test_configured_opus_jitter_is_clamped();
     test_auto_start_jitter_uses_larger_startup_cushion();
     test_auto_start_jitter_respects_higher_configured_floor();
-    test_auto_start_jitter_respects_configured_ceiling();
     test_auto_start_target_does_not_snap_to_floor_before_ready();
     test_non_auto_target_snaps_to_floor_before_ready();
     test_target_raises_when_floor_increases();
