@@ -578,6 +578,36 @@ public:
         uint64_t over_deadline_count;
     };
 
+    struct PathDiagnostics {
+        double rtt_last_ms = 0.0;
+        double rtt_min_ms = 0.0;
+        double rtt_avg_ms = 0.0;
+        double rtt_max_ms = 0.0;
+        uint32_t ping_received = 0;
+        uint32_t ping_missing = 0;
+        uint32_t ping_consecutive_missing = 0;
+        double ping_gap_percent = 0.0;
+        uint32_t audio_ingress_received = 0;
+        uint32_t audio_ingress_gaps = 0;
+        double audio_ingress_gap_percent = 0.0;
+        double opus_send_queue_avg_ms = 0.0;
+        double opus_send_queue_max_ms = 0.0;
+        double total_estimate_ms = 0.0;
+        double total_input_ms = 0.0;
+        double total_opus_ms = 0.0;
+        double total_network_ms = 0.0;
+        double total_jitter_ms = 0.0;
+        double total_output_ms = 0.0;
+        double tx_pace_avg_ms = 0.0;
+        double tx_pace_max_ms = 0.0;
+        size_t rx_queue_current = 0;
+        size_t rx_queue_avg_max = 0;
+        size_t rx_queue_peak = 0;
+        int underruns = 0;
+        size_t plc_frames = 0;
+        uint32_t udp_rebind_count = 0;
+    };
+
     DeviceInfo get_device_info() const {
         return device_info_;
     }
@@ -592,6 +622,80 @@ public:
 
     double get_rtt_ms() const {
         return rtt_ms_.load(std::memory_order_relaxed);
+    }
+
+    PathDiagnostics get_path_diagnostics() const {
+        auto ns_to_ms = [](int64_t ns) {
+            return static_cast<double>(ns) / 1'000'000.0;
+        };
+        auto gap_percent = [](uint32_t received, uint32_t missing) {
+            const uint64_t total =
+                static_cast<uint64_t>(received) + static_cast<uint64_t>(missing);
+            if (total == 0) {
+                return 0.0;
+            }
+            return (static_cast<double>(missing) * 100.0) /
+                   static_cast<double>(total);
+        };
+
+        PathDiagnostics diagnostics;
+        diagnostics.rtt_last_ms = get_rtt_ms();
+        diagnostics.rtt_min_ms = ns_to_ms(rtt_min_ns_.load(std::memory_order_relaxed));
+        diagnostics.rtt_avg_ms = ns_to_ms(rtt_avg_ns_.load(std::memory_order_relaxed));
+        diagnostics.rtt_max_ms = ns_to_ms(rtt_max_ns_.load(std::memory_order_relaxed));
+        diagnostics.ping_received =
+            ping_path_total_received_.load(std::memory_order_relaxed);
+        diagnostics.ping_missing =
+            ping_path_total_missing_.load(std::memory_order_relaxed);
+        diagnostics.ping_consecutive_missing =
+            ping_path_consecutive_missing_.load(std::memory_order_relaxed);
+        diagnostics.ping_gap_percent =
+            gap_percent(diagnostics.ping_received, diagnostics.ping_missing);
+        diagnostics.audio_ingress_received =
+            audio_path_interval_received_.load(std::memory_order_relaxed);
+        diagnostics.audio_ingress_gaps =
+            audio_path_interval_gaps_.load(std::memory_order_relaxed);
+        diagnostics.audio_ingress_gap_percent =
+            gap_percent(diagnostics.audio_ingress_received,
+                        diagnostics.audio_ingress_gaps);
+        diagnostics.opus_send_queue_avg_ms =
+            ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed));
+        diagnostics.opus_send_queue_max_ms =
+            ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed));
+        const auto latency = get_latency_info();
+        const double fallback_buffer_ms =
+            latency.buffer_duration_ms > 0.0 ? latency.buffer_duration_ms
+                                              : get_opus_network_packet_ms();
+        diagnostics.total_input_ms =
+            latency.input_latency_ms > 0.0 ? latency.input_latency_ms : fallback_buffer_ms;
+        diagnostics.total_opus_ms = get_opus_network_packet_ms();
+        diagnostics.total_network_ms = std::max(0.0, diagnostics.rtt_last_ms * 0.5);
+        diagnostics.total_jitter_ms =
+            static_cast<double>(get_opus_jitter_buffer_packets()) *
+            diagnostics.total_opus_ms;
+        diagnostics.total_output_ms =
+            latency.output_latency_ms > 0.0 ? latency.output_latency_ms : fallback_buffer_ms;
+        diagnostics.total_estimate_ms =
+            diagnostics.total_input_ms + diagnostics.total_opus_ms +
+            diagnostics.total_network_ms + diagnostics.total_jitter_ms +
+            diagnostics.total_output_ms + diagnostics.opus_send_queue_avg_ms;
+        diagnostics.tx_pace_avg_ms =
+            ns_to_ms(tx_send_pace_avg_ns_.load(std::memory_order_relaxed));
+        diagnostics.tx_pace_max_ms =
+            ns_to_ms(tx_send_pace_max_ns_.load(std::memory_order_relaxed));
+        diagnostics.udp_rebind_count =
+            udp_path_rebind_count_.load(std::memory_order_relaxed);
+
+        for (const auto& participant: participant_manager_.get_all_info()) {
+            diagnostics.rx_queue_current += participant.queue_size;
+            diagnostics.rx_queue_avg_max =
+                std::max(diagnostics.rx_queue_avg_max, participant.queue_size_avg);
+            diagnostics.rx_queue_peak =
+                std::max(diagnostics.rx_queue_peak, participant.queue_size_max);
+            diagnostics.underruns += participant.underrun_count;
+            diagnostics.plc_frames += participant.plc_count;
+        }
+        return diagnostics;
     }
 
     uint64_t get_total_bytes_rx() const {
@@ -1135,6 +1239,26 @@ public:
         return true;
     }
 
+    void reset_audio_path() {
+        const bool was_active = audio_.is_stream_active();
+        const auto input_device = selected_input_device_;
+        const auto output_device = selected_output_device_;
+        const auto config = get_audio_config();
+
+        if (was_active) {
+            stop_audio_stream();
+        }
+
+        clear_audio_path_queues();
+
+        if (was_active && input_device != AudioStream::NO_DEVICE &&
+            output_device != AudioStream::NO_DEVICE) {
+            start_audio_stream(input_device, output_device, config);
+        }
+
+        Log::warn("Manual audio path reset: cleared local queues and restarted audio stream");
+    }
+
     // =========================================================================
     // Participant control methods (mute, gain, pan)
     // =========================================================================
@@ -1341,6 +1465,40 @@ private:
         configure_udp_socket(socket_);
     }
 
+    void clear_audio_path_queues() {
+        PcmSendFrame discarded_pcm;
+        while (pcm_send_queue_.try_dequeue(discarded_pcm)) {
+        }
+        OpusSendFrame discarded_opus;
+        while (opus_send_queue_.try_dequeue(discarded_opus)) {
+        }
+        opus_tx_accumulator_.fill(0.0F);
+        opus_tx_accumulated_frames_ = 0;
+        opus_tx_accumulator_capture_time_ = {};
+        opus_tx_accumulator_reset_requested_.store(true, std::memory_order_release);
+        recent_opus_audio_packets_.clear();
+
+        participant_manager_.for_each([](uint32_t, ParticipantData& participant) {
+            participant.opus_queue.clear();
+            participant.opus_pcm_buffered_frames = 0;
+            participant.opus_pcm_buffered_frames_observed.store(
+                0, std::memory_order_relaxed);
+            participant.last_pcm_valid = false;
+            participant.pcm_concealment_used = false;
+            participant.buffer_ready.store(false, std::memory_order_relaxed);
+            participant.opus_consecutive_empty_callbacks.store(
+                0, std::memory_order_relaxed);
+            participant.queue_depth_avg.store(0, std::memory_order_relaxed);
+            participant.queue_depth_max.store(0, std::memory_order_relaxed);
+            participant.queue_depth_drift_milli.store(0, std::memory_order_relaxed);
+            participant.queue_size_history.fill(0);
+            participant.history_index = 0;
+            if (participant.decoder) {
+                participant.decoder->reset();
+            }
+        });
+    }
+
     void request_udp_path_rebind(std::string reason) {
         if (!join_state_.is_join_confirmed()) {
             return;
@@ -1420,8 +1578,17 @@ private:
         have_ping_reply_sequence_.store(false, std::memory_order_release);
         ping_path_interval_received_.store(0, std::memory_order_relaxed);
         ping_path_interval_missing_.store(0, std::memory_order_relaxed);
+        ping_path_total_received_.store(0, std::memory_order_relaxed);
+        ping_path_total_missing_.store(0, std::memory_order_relaxed);
+        ping_path_consecutive_missing_.store(0, std::memory_order_relaxed);
+        audio_path_interval_received_.store(0, std::memory_order_relaxed);
+        audio_path_interval_gaps_.store(0, std::memory_order_relaxed);
         server_clock_ready_.store(false, std::memory_order_release);
         rtt_ms_.store(0.0, std::memory_order_relaxed);
+        rtt_last_ns_.store(0, std::memory_order_relaxed);
+        rtt_min_ns_.store(0, std::memory_order_relaxed);
+        rtt_avg_ns_.store(0, std::memory_order_relaxed);
+        rtt_max_ns_.store(0, std::memory_order_relaxed);
         recent_opus_audio_packets_.clear();
 
         receive_generation_.fetch_add(1, std::memory_order_acq_rel);
@@ -2924,35 +3091,25 @@ private:
 
         AudioPathStatsHdr stats{};
         std::memcpy(&stats, recv_data, sizeof(AudioPathStatsHdr));
-        const uint16_t current_frame_count = get_opus_network_frame_count();
-        const uint16_t adapted_frame_count =
-            opus_packet_frames_after_audio_path_feedback(
-                current_frame_count, stats.interval_received,
-                stats.interval_sequence_gaps);
+        audio_path_interval_received_.store(stats.interval_received,
+                                            std::memory_order_relaxed);
+        audio_path_interval_gaps_.store(stats.interval_sequence_gaps,
+                                        std::memory_order_relaxed);
         const double gap_rate_percent =
             audio_path_feedback_gap_rate(stats.interval_received,
                                          stats.interval_sequence_gaps) *
             100.0;
-        const bool should_rebind =
-            should_rebind_udp_path_after_feedback(current_frame_count,
-                                                  stats.interval_received,
-                                                  stats.interval_sequence_gaps);
-        if (adapted_frame_count <= current_frame_count) {
-            if (should_rebind) {
-                request_udp_path_rebind("severe server audio ingress loss");
-            }
+        if (stats.interval_sequence_gaps == 0) {
             return;
         }
 
         Log::warn(
             "Server reports sender audio ingress loss: received={} seq_gap={} "
             "gap_rate={:.1f}% observed_packet={} total_received={} total_gap={}; "
-            "promoting Opus packet from {} to {} frames",
+            "manual mode keeps current Opus packet at {} frames",
             stats.interval_received, stats.interval_sequence_gaps, gap_rate_percent,
             stats.observed_frame_count, stats.total_received, stats.total_sequence_gaps,
-            current_frame_count, adapted_frame_count);
-        set_opus_network_frame_count(adapted_frame_count);
-        recent_opus_audio_packets_.clear();
+            get_opus_network_frame_count());
     }
 
     void observe_ping_path_timeout(uint32_t sent_sequence) {
@@ -2971,22 +3128,16 @@ private:
             missing_replies = sent_sequence;
         }
 
+        ping_path_consecutive_missing_.store(missing_replies,
+                                             std::memory_order_relaxed);
         if (missing_replies < PING_PATH_TIMEOUT_PROMOTE_REPLIES) {
             return;
         }
 
-        const uint16_t current_frame_count = get_opus_network_frame_count();
-        if (current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT) {
-            request_udp_path_rebind("server ping replies timed out");
-            return;
-        }
-
         Log::warn(
-            "Server ping replies are missing for {} consecutive sends; promoting Opus packet "
-            "from {} to {} frames",
-            missing_replies, current_frame_count, opus_network_clock::STABLE_FRAME_COUNT);
-        set_opus_network_frame_count(opus_network_clock::STABLE_FRAME_COUNT);
-        recent_opus_audio_packets_.clear();
+            "Server ping replies are missing for {} consecutive sends; manual mode keeps "
+            "current Opus packet at {} frames",
+            missing_replies, get_opus_network_frame_count());
     }
 
     void observe_ping_path_feedback(uint32_t reply_sequence, double rtt_ms) {
@@ -3000,8 +3151,12 @@ private:
         }
 
         last_ping_reply_sequence_.store(reply_sequence, std::memory_order_release);
+        ping_path_total_received_.fetch_add(1, std::memory_order_relaxed);
+        ping_path_consecutive_missing_.store(0, std::memory_order_relaxed);
         ping_path_interval_received_.fetch_add(1, std::memory_order_relaxed);
         if (missing_replies > 0) {
+            ping_path_total_missing_.fetch_add(missing_replies,
+                                               std::memory_order_relaxed);
             ping_path_interval_missing_.fetch_add(missing_replies,
                                                   std::memory_order_relaxed);
         }
@@ -3014,30 +3169,18 @@ private:
             return;
         }
 
-        const uint16_t current_frame_count = get_opus_network_frame_count();
-        const uint16_t adapted_frame_count =
-            opus_packet_frames_after_ping_path_feedback(current_frame_count, received,
-                                                        missing, rtt_ms);
         ping_path_interval_received_.store(0, std::memory_order_relaxed);
         ping_path_interval_missing_.store(0, std::memory_order_relaxed);
         const double gap_rate_percent =
             audio_path_feedback_gap_rate(received, missing) * 100.0;
-        const bool should_rebind =
-            should_rebind_udp_path_after_feedback(current_frame_count, received, missing);
-        if (adapted_frame_count <= current_frame_count) {
-            if (should_rebind) {
-                request_udp_path_rebind("severe server ping loss");
-            }
+        if (missing == 0 && rtt_ms < PING_PATH_HIGH_RTT_MS) {
             return;
         }
 
         Log::warn(
             "Server ping path is unstable: replies={} missing={} gap_rate={:.1f}% "
-            "rtt_ms={:.1f}; promoting Opus packet from {} to {} frames",
-            received, missing, gap_rate_percent, rtt_ms, current_frame_count,
-            adapted_frame_count);
-        set_opus_network_frame_count(adapted_frame_count);
-        recent_opus_audio_packets_.clear();
+            "rtt_ms={:.1f}; manual mode keeps current Opus packet at {} frames",
+            received, missing, gap_rate_percent, rtt_ms, get_opus_network_frame_count());
     }
 
     void handle_ping_message(std::size_t bytes, const char* recv_data) {
@@ -3059,6 +3202,13 @@ private:
 
         // Store RTT for GUI display (thread-safe atomic update)
         rtt_ms_.store(rtt_ms, std::memory_order_relaxed);
+        const int64_t rtt_ns = std::max<int64_t>(0, rtt);
+        observe_latency_sample(rtt_last_ns_, rtt_avg_ns_, rtt_max_ns_, rtt_ns);
+        int64_t previous_min = rtt_min_ns_.load(std::memory_order_relaxed);
+        while ((previous_min == 0 || rtt_ns < previous_min) &&
+               !rtt_min_ns_.compare_exchange_weak(previous_min, rtt_ns,
+                                                  std::memory_order_relaxed)) {
+        }
         observe_ping_path_feedback(hdr.seq, rtt_ms);
         if (!server_clock_ready_.exchange(true, std::memory_order_acq_rel)) {
             server_clock_offset_ns_.store(offset, std::memory_order_release);
@@ -4322,6 +4472,10 @@ private:
 
     // RTT tracking (thread-safe with atomic)
     std::atomic<double> rtt_ms_{0.0};
+    std::atomic<int64_t> rtt_last_ns_{0};
+    std::atomic<int64_t> rtt_min_ns_{0};
+    std::atomic<int64_t> rtt_avg_ns_{0};
+    std::atomic<int64_t> rtt_max_ns_{0};
     std::atomic<int64_t> server_clock_offset_ns_{0};
     std::atomic<bool>    server_clock_ready_{false};
     std::atomic<uint32_t> ping_tx_sequence_{0};
@@ -4329,6 +4483,11 @@ private:
     std::atomic<bool>     have_ping_reply_sequence_{false};
     std::atomic<uint32_t> ping_path_interval_received_{0};
     std::atomic<uint32_t> ping_path_interval_missing_{0};
+    std::atomic<uint32_t> ping_path_total_received_{0};
+    std::atomic<uint32_t> ping_path_total_missing_{0};
+    std::atomic<uint32_t> ping_path_consecutive_missing_{0};
+    std::atomic<uint32_t> audio_path_interval_received_{0};
+    std::atomic<uint32_t> audio_path_interval_gaps_{0};
     std::atomic<int64_t>  next_udp_path_rebind_allowed_ns_{0};
     std::atomic<bool>     udp_path_rebind_pending_{false};
     std::atomic<uint32_t> udp_path_rebind_count_{0};
@@ -4648,6 +4807,64 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Dropped: %llu",
                     static_cast<unsigned long long>(recording.dropped_blocks));
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // ========== PATH DIAGNOSTICS ==========
+        Client::PathDiagnostics path = client.get_path_diagnostics();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Path:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("RTT %.1f/%.1f/%.1f ms",
+                    path.rtt_last_ms, path.rtt_avg_ms, path.rtt_max_ms);
+        JamGui::ShowTooltipOnHover("RTT last / average / max since the current UDP path joined");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Ping loss %.1f%%", path.ping_gap_percent);
+        char ping_tooltip[128];
+        std::snprintf(ping_tooltip, sizeof(ping_tooltip),
+                      "Missing ping replies: received=%u missing=%u consecutive=%u",
+                      path.ping_received, path.ping_missing,
+                      path.ping_consecutive_missing);
+        JamGui::ShowTooltipOnHover(ping_tooltip);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Ingress loss %.1f%%", path.audio_ingress_gap_percent);
+        char ingress_tooltip[128];
+        std::snprintf(ingress_tooltip, sizeof(ingress_tooltip),
+                      "Server-reported audio ingress: received=%u gaps=%u",
+                      path.audio_ingress_received,
+                      path.audio_ingress_gaps);
+        JamGui::ShowTooltipOnHover(ingress_tooltip);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Total ~%.1f ms", path.total_estimate_ms);
+        char total_tooltip[192];
+        std::snprintf(total_tooltip, sizeof(total_tooltip),
+                      "Input %.1f + Opus %.1f + RTT/2 %.1f + jitter %.1f + "
+                      "output %.1f + TX q %.1f ms",
+                      path.total_input_ms, path.total_opus_ms,
+                      path.total_network_ms, path.total_jitter_ms,
+                      path.total_output_ms, path.opus_send_queue_avg_ms);
+        JamGui::ShowTooltipOnHover(total_tooltip);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("TX q %.2f/%.2f ms",
+                    path.opus_send_queue_avg_ms, path.opus_send_queue_max_ms);
+        JamGui::ShowTooltipOnHover("Opus sender queue age average / max");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Pace %.2f/%.2f ms", path.tx_pace_avg_ms, path.tx_pace_max_ms);
+        JamGui::ShowTooltipOnHover("Audio packet send pacing average / max");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("RX q %zu/%zu/%zu",
+                    path.rx_queue_current, path.rx_queue_avg_max, path.rx_queue_peak);
+        JamGui::ShowTooltipOnHover("Receiver queue current total / worst average / worst max");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("PLC/Underrun %zu/%d", path.plc_frames, path.underruns);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Opus %u J%zu Q%zu",
+                    client.get_opus_network_frame_count(),
+                    client.get_opus_jitter_buffer_packets(),
+                    client.get_opus_queue_limit_packets());
+        JamGui::ShowTooltipOnHover("Current manual Opus frames, jitter packets, queue limit");
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -5328,11 +5545,24 @@ static void draw_bottom_bar(Client& client) {
     bool opus_packet_changed =
         (pending_opus_frames_per_packet != client.get_opus_network_frame_count());
     bool devices_changed = stream_restart_needed || opus_packet_changed;
+    static auto last_apply_time = std::chrono::steady_clock::time_point{};
+    static auto last_reset_time = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    constexpr auto APPLY_COOLDOWN = std::chrono::milliseconds(1500);
+    constexpr auto RESET_COOLDOWN = std::chrono::milliseconds(3000);
+    const bool apply_cooling_down =
+        last_apply_time.time_since_epoch().count() != 0 &&
+        now - last_apply_time < APPLY_COOLDOWN;
 
     if (devices_changed) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8F, 0.6F, 0.2F, 1.0F));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9F, 0.7F, 0.3F, 1.0F));
-        if (ImGui::Button("APPLY")) {
+        if (apply_cooling_down) {
+            ImGui::BeginDisabled();
+            ImGui::Button("APPLYING");
+            ImGui::EndDisabled();
+        } else if (ImGui::Button("APPLY")) {
+            last_apply_time = now;
             client.set_audio_api_filter(selected_api_name());
             client.set_input_device(pending_input);
             client.set_output_device(pending_output);
@@ -5372,6 +5602,22 @@ static void draw_bottom_bar(Client& client) {
             ImGui::PopStyleColor(2);
         }
     }
+
+    ImGui::SameLine();
+    const bool reset_cooling_down =
+        last_reset_time.time_since_epoch().count() != 0 &&
+        now - last_reset_time < RESET_COOLDOWN;
+    if (reset_cooling_down) {
+        ImGui::BeginDisabled();
+        ImGui::Button("RESET");
+        ImGui::EndDisabled();
+    } else if (ImGui::Button("RESET")) {
+        last_reset_time = now;
+        client.reset_audio_path();
+    }
+    JamGui::ShowTooltipOnHover(
+        "Manual audio path reset: restarts the local stream and clears local audio queues. "
+        "It keeps the current UDP session joined.");
 
     // Show error message if any
     const std::string& last_error = AudioStream::get_last_error();
@@ -5673,7 +5919,7 @@ bool apply_startup_latency_profile(Client& client,
                                      : static_cast<int>(DEFAULT_OPUS_QUEUE_LIMIT_PACKETS);
     const int age_limit_ms =
         low_profile ? 120 : stable_profile ? 250 : DEFAULT_JITTER_PACKET_AGE_MS;
-    const bool auto_jitter = !low_profile;
+    const bool auto_jitter = false;
     const int opus_packet_frames =
         low_profile      ? opus_network_clock::LOW_LATENCY_FRAME_COUNT
         : stable_profile ? opus_network_clock::STABLE_FRAME_COUNT

@@ -121,6 +121,23 @@ public:
         return buffered_count_.load(std::memory_order_acquire);
     }
 
+    void clear() {
+        OpusPacket packet{};
+        while (incoming_.try_dequeue(packet)) {
+        }
+        unsequenced_.clear();
+        sequenced_.clear();
+        buffered_count_.store(0, std::memory_order_release);
+        playout_initialized_ = false;
+        next_playout_sequence_ = 0;
+        reset_gap_wait();
+        gap_loss_run_active_ = false;
+        gap_loss_run_packets_ = 0;
+        admission_tracker_ = SequenceArrivalTracker{};
+        playout_initialized_snapshot_.store(false, std::memory_order_release);
+        next_playout_sequence_snapshot_.store(0, std::memory_order_release);
+    }
+
 private:
     static bool sequence_before(uint32_t lhs, uint32_t rhs) {
         return sequence_number_before(lhs, rhs);
