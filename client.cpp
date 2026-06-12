@@ -2571,6 +2571,38 @@ private:
         return participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) + 3;
     }
 
+    static size_t opus_latency_trim_threshold_packets(const ParticipantData& participant) {
+        const size_t target_packets = opus_playout_target_queue_packets(participant);
+        const size_t packet_frames =
+            participant.last_packet_frame_count.load(std::memory_order_relaxed);
+        const size_t callback_frames =
+            participant.last_callback_frame_count.load(std::memory_order_relaxed);
+        size_t burst_headroom = 3;
+        if (packet_frames > 0 && callback_frames > packet_frames) {
+            burst_headroom = std::max(
+                burst_headroom,
+                (callback_frames + packet_frames - 1) / packet_frames);
+        }
+        return std::min<size_t>(MAX_OPUS_QUEUE_SIZE, target_packets + burst_headroom);
+    }
+
+    static size_t trim_opus_queue_to_latency_target(ParticipantData& participant) {
+        if (participant.last_codec.load(std::memory_order_relaxed) != AudioCodec::Opus) {
+            return participant.opus_queue.size_approx();
+        }
+
+        size_t current_queue_size = participant.opus_queue.size_approx();
+        const size_t trim_threshold = opus_latency_trim_threshold_packets(participant);
+        while (current_queue_size > trim_threshold) {
+            if (!participant.opus_queue.discard_oldest_actual_packet_for_latency_trim()) {
+                break;
+            }
+            --current_queue_size;
+            participant.opus_target_trim_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+        return current_queue_size;
+    }
+
     void update_jitter_floor(ParticipantData& participant, const OpusPacket& packet) {
         const size_t floor_packets = jitter_floor_for_packet(packet);
         if (packet.codec == AudioCodec::Opus &&
@@ -3297,6 +3329,43 @@ public:
         const double overfilled_ratio = ratio_at_depth(6, 64, 24);
         if (overfilled_ratio <= 1.0 || overfilled_ratio > 1.005) {
             failure = "overfilled queue ratio should stay within drift-scale fast clamp";
+            return false;
+        }
+
+        ParticipantData trim_participant;
+        trim_participant.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
+        trim_participant.last_packet_frame_count.store(120, std::memory_order_relaxed);
+        trim_participant.last_callback_frame_count.store(480, std::memory_order_relaxed);
+        trim_participant.jitter_buffer_min_packets.store(8, std::memory_order_relaxed);
+        for (size_t i = 0; i < 40; ++i) {
+            (void)trim_participant.opus_queue.enqueue(
+                make_packet(static_cast<uint32_t>(i + 1)));
+        }
+        OpusPacket first_trim_packet;
+        if (trim_participant.opus_queue.dequeue(first_trim_packet, 0) !=
+                ParticipantOpusDequeueStatus::Packet ||
+            first_trim_packet.sequence != 1) {
+            failure = "trim setup failed to initialize sequenced playout";
+            return false;
+        }
+        const size_t trim_threshold =
+            opus_latency_trim_threshold_packets(trim_participant);
+        const size_t queue_after_trim =
+            trim_opus_queue_to_latency_target(trim_participant);
+        if (trim_threshold != 12 || queue_after_trim != trim_threshold) {
+            failure = "Opus target trim did not reduce burst backlog to target headroom";
+            return false;
+        }
+        if (trim_participant.opus_target_trim_drops.load(std::memory_order_relaxed) !=
+            27) {
+            failure = "Opus target trim did not count discarded backlog packets";
+            return false;
+        }
+        OpusPacket post_trim_packet;
+        if (trim_participant.opus_queue.dequeue(post_trim_packet, 0) !=
+                ParticipantOpusDequeueStatus::Packet ||
+            post_trim_packet.loss_concealment || post_trim_packet.sequence != 29) {
+            failure = "Opus target trim left a self-inflicted sequence gap";
             return false;
         }
 
@@ -4267,6 +4336,11 @@ private:
                 }
             }
 
+            if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::Opus) {
+                observe_participant_queue_depth(
+                    participant, trim_opus_queue_to_latency_target(participant));
+            }
+
             const float participant_gain = participant.gain.load(std::memory_order_relaxed);
             double playout_ratio = opus_playout_rate_ratio(participant);
             if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::Opus &&
@@ -4598,11 +4672,13 @@ private:
                     }
                 }
 
-                // Track queue size history for diagnostics. Manual jitter control owns the
-                // Opus playout target; do not auto-adjust it here.
+                // Track queue size history for diagnostics. Opus trims old backlog down to the
+                // latency target; PCM keeps its existing drift-drop policy.
                 size_t current_queue_size = participant.opus_queue.size_approx();
-                if (opus_packet.codec == AudioCodec::PcmInt16 &&
-                    current_queue_size > pcm_drift_drop_threshold(participant)) {
+                if (opus_packet.codec == AudioCodec::Opus) {
+                    current_queue_size = trim_opus_queue_to_latency_target(participant);
+                } else if (opus_packet.codec == AudioCodec::PcmInt16 &&
+                           current_queue_size > pcm_drift_drop_threshold(participant)) {
                     if (participant.opus_queue.discard_oldest_actual_packet()) {
                         current_queue_size--;
                         participant.pcm_drift_drops.fetch_add(1, std::memory_order_relaxed);

@@ -117,6 +117,28 @@ public:
         return false;
     }
 
+    bool discard_oldest_actual_packet_for_latency_trim() {
+        drain_incoming_for_playout();
+        if (!unsequenced_.empty()) {
+            unsequenced_.erase(unsequenced_.begin());
+            decrement_buffered_count();
+            return true;
+        }
+        if (!sequenced_.empty()) {
+            const size_t index = earliest_index_locked();
+            const uint32_t sequence = sequenced_[index].sequence;
+            erase_sequenced_at(index);
+            decrement_buffered_count();
+            if (playout_initialized_ && sequence == next_playout_sequence_) {
+                next_playout_sequence_ = sequence + 1;
+                reset_gap_wait();
+                publish_playout_sequence();
+            }
+            return true;
+        }
+        return false;
+    }
+
     size_t size_approx() const {
         return buffered_count_.load(std::memory_order_acquire);
     }
