@@ -1741,6 +1741,8 @@ private:
 
         join_state_.reset();
         have_ping_reply_sequence_.store(false, std::memory_order_release);
+        ping_tx_sequence_.store(0, std::memory_order_release);
+        last_ping_reply_sequence_.store(0, std::memory_order_release);
         ping_path_interval_received_.store(0, std::memory_order_relaxed);
         ping_path_interval_missing_.store(0, std::memory_order_relaxed);
         ping_path_total_received_.store(0, std::memory_order_relaxed);
@@ -2929,12 +2931,24 @@ public:
     static bool should_rebind_udp_path_after_feedback(uint16_t current_frame_count,
                                                       uint32_t received_packets,
                                                       uint32_t sequence_gaps) {
+        return current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT &&
+               should_rebind_udp_path_after_severe_loss(received_packets, sequence_gaps);
+    }
+
+    static bool should_rebind_udp_path_after_severe_loss(uint32_t received_packets,
+                                                         uint32_t sequence_gaps) {
         const uint64_t observed_packets =
             static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
-        return current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT &&
-               observed_packets >= UDP_PATH_REBIND_MIN_OBSERVED_PACKETS &&
+        return observed_packets >= UDP_PATH_REBIND_MIN_OBSERVED_PACKETS &&
                audio_path_feedback_gap_rate(received_packets, sequence_gaps) >=
                    UDP_PATH_REBIND_SEVERE_GAP_RATE;
+    }
+
+    static bool should_rebind_udp_path_after_ping_feedback(uint32_t received_replies,
+                                                           uint32_t missing_replies,
+                                                           double rtt_ms) {
+        return rtt_ms >= PING_PATH_HIGH_RTT_MS &&
+               should_rebind_udp_path_after_severe_loss(received_replies, missing_replies);
     }
 
     static uint16_t opus_packet_frames_after_audio_path_feedback(
@@ -3029,7 +3043,8 @@ public:
                !should_rebind_udp_path_after_feedback(
                    opus_network_clock::STABLE_FRAME_COUNT, 6, 1) &&
                should_rebind_udp_path_after_feedback(
-                   opus_network_clock::STABLE_FRAME_COUNT, 5, 5);
+                   opus_network_clock::STABLE_FRAME_COUNT, 5, 5) &&
+               should_rebind_udp_path_after_severe_loss(5, 95);
     }
 
     static bool run_opus_ping_path_feedback_smoke(std::string& failure) {
@@ -3056,6 +3071,10 @@ public:
                       opus_network_clock::BALANCED_FRAME_COUNT, "unstable fast") &&
                expect(opus_network_clock::STABLE_FRAME_COUNT, 1, 99, 500.0,
                       opus_network_clock::STABLE_FRAME_COUNT, "already stable") &&
+               !should_rebind_udp_path_after_ping_feedback(8, 0, 400.0) &&
+               !should_rebind_udp_path_after_ping_feedback(7, 1, 400.0) &&
+               !should_rebind_udp_path_after_ping_feedback(5, 3, 20.0) &&
+               should_rebind_udp_path_after_ping_feedback(5, 3, 400.0) &&
                should_rebind_udp_path_after_feedback(
                    opus_network_clock::STABLE_FRAME_COUNT, 1, 99);
     }
@@ -3685,6 +3704,10 @@ private:
             stats.total_received, stats.total_sequence_gaps,
             stats.total_unrecovered_sequence_gaps,
             get_opus_network_frame_count());
+        if (should_rebind_udp_path_after_severe_loss(stats.interval_received,
+                                                     interval_unrecovered_gaps)) {
+            request_udp_path_rebind("severe sender audio ingress loss");
+        }
     }
 
     void observe_ping_path_timeout(uint32_t sent_sequence) {
@@ -3713,6 +3736,7 @@ private:
             "Server ping replies are missing for {} consecutive sends; manual mode keeps "
             "current Opus packet at {} frames",
             missing_replies, get_opus_network_frame_count());
+        request_udp_path_rebind("missing server ping replies");
     }
 
     void observe_ping_path_feedback(uint32_t reply_sequence, double rtt_ms) {
@@ -3756,6 +3780,9 @@ private:
             "Server ping path is unstable: replies={} missing={} gap_rate={:.1f}% "
             "rtt_ms={:.1f}; manual mode keeps current Opus packet at {} frames",
             received, missing, gap_rate_percent, rtt_ms, get_opus_network_frame_count());
+        if (should_rebind_udp_path_after_ping_feedback(received, missing, rtt_ms)) {
+            request_udp_path_rebind("severe server ping path loss");
+        }
     }
 
     void handle_ping_message(std::size_t bytes, const char* recv_data) {
