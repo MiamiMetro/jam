@@ -20,18 +20,24 @@ constexpr size_t MAX_OPUS_QUEUE_SIZE       = 128; // Hard safety cap for Opus re
 constexpr size_t TARGET_OPUS_QUEUE_SIZE    = 3;   // Target queue size for adaptive management
 constexpr size_t MIN_JITTER_BUFFER_PACKETS = 3;   // Minimum packets before playback starts
 constexpr size_t MIN_OPUS_JITTER_PACKETS = 0;     // Manual testing can disable Opus prebuffer
-constexpr size_t DEFAULT_OPUS_JITTER_PACKETS = 6; // Default steady-state Opus playout floor
-constexpr size_t DEFAULT_OPUS_AUTO_START_JITTER_PACKETS = 14; // Initial adaptive internet cushion
+constexpr int    DEFAULT_OPUS_JITTER_MS = 20;     // Default steady-state Opus playout floor
+constexpr int    DEFAULT_OPUS_AUTO_START_JITTER_MS = 40; // Initial adaptive internet cushion
+constexpr size_t DEFAULT_OPUS_JITTER_PACKETS = 2; // 20 ms at the default 10 ms packet
+constexpr size_t DEFAULT_OPUS_AUTO_START_JITTER_PACKETS = 4; // 40 ms at default packet
 constexpr size_t DEFAULT_OPUS_QUEUE_LIMIT_PACKETS = 64; // Default Opus burst capacity
 constexpr size_t MAX_OPUS_JITTER_PACKETS = 32;    // User-facing Opus jitter limit
 constexpr size_t MIN_OPUS_QUEUE_LIMIT_PACKETS = 1;
 constexpr size_t MAX_OPUS_QUEUE_LIMIT_PACKETS = 128; // User-facing Opus queue limit
-constexpr size_t MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS = 6; // Cap synthetic audio on large gaps
-constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 180; // Default age limit at playout
+constexpr size_t MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS = 2; // Cap synthetic audio on large gaps
+constexpr int    DEFAULT_JITTER_PACKET_AGE_MS = 120; // Default age limit at playout
 constexpr int    MIN_JITTER_PACKET_AGE_MS = 0;        // Manual testing can disable age drops
 constexpr int    MAX_JITTER_PACKET_AGE_MS = 250;      // User-facing age limit
 constexpr size_t AUDIO_REDUNDANT_TARGET_BYTES = 1200; // Keep protected UDP datagrams below common MTUs
 constexpr uint8_t MAX_AUDIO_REDUNDANT_PACKETS = 12; // Current packet + recent history within target bytes
+constexpr int    OPUS_REDUNDANCY_DEPTH_AUTO = -1; // Choose history depth from packet rate
+constexpr int    DEFAULT_OPUS_REDUNDANCY_DEPTH_PACKETS = OPUS_REDUNDANCY_DEPTH_AUTO;
+constexpr int    MAX_OPUS_REDUNDANCY_DEPTH_PACKETS =
+    static_cast<int>(MAX_AUDIO_REDUNDANT_PACKETS) - 1; // Previous packets per datagram
 
 // Endpoint capabilities negotiated in extended JOIN/JOIN_ACK packets.
 constexpr uint32_t AUDIO_CAP_REDUNDANCY = 1U << 0;
@@ -137,6 +143,8 @@ struct AudioPathStatsHdr : CtrlHdr {
     uint32_t interval_sequence_gaps = 0;
     uint32_t total_received = 0;
     uint32_t total_sequence_gaps = 0;
+    uint32_t interval_unrecovered_sequence_gaps = 0;
+    uint32_t total_unrecovered_sequence_gaps = 0;
     uint16_t observed_frame_count = 0;
     uint16_t reserved = 0;
 };

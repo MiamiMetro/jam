@@ -425,12 +425,11 @@ private:
             return;
         }
 
-        audio_packet::for_each_redundant_audio_child(
+        audio_packet::for_each_redundant_audio_child_reverse(
             packet_copy->data(), packet_copy->size(),
-            [&](unsigned char* child, size_t child_len, uint8_t index) {
-                if (index == 0) {
-                    record_audio_ingress(sender_id, remote_endpoint_, child, child_len);
-                }
+            [&](const unsigned char* child, size_t child_len, uint8_t index) {
+                record_audio_ingress(sender_id, remote_endpoint_, child, child_len,
+                                     index == 0);
             });
         forward_audio_to_others(remote_endpoint_, packet_copy->data(), packet_copy->size(),
                                 packet_copy);
@@ -616,12 +615,22 @@ private:
         path.interval_sequence_gaps = static_cast<uint32_t>(
             std::min<uint64_t>(stats.sequence_gaps_interval,
                                std::numeric_limits<uint32_t>::max()));
+        path.interval_unrecovered_sequence_gaps = static_cast<uint32_t>(
+            std::min<uint64_t>(
+                unrecovered_gap_count(stats.sequence_gaps_interval,
+                                      stats.sequence_gap_recoveries_interval),
+                std::numeric_limits<uint32_t>::max()));
         path.total_received = static_cast<uint32_t>(
             std::min<uint64_t>(stats.received_total,
                                std::numeric_limits<uint32_t>::max()));
         path.total_sequence_gaps = static_cast<uint32_t>(
             std::min<uint64_t>(stats.sequence_gaps_total,
                                std::numeric_limits<uint32_t>::max()));
+        path.total_unrecovered_sequence_gaps = static_cast<uint32_t>(
+            std::min<uint64_t>(
+                unrecovered_gap_count(stats.sequence_gaps_total,
+                                      stats.sequence_gap_recoveries_total),
+                std::numeric_limits<uint32_t>::max()));
         path.observed_frame_count = stats.last_frame_count;
         std::memcpy(buf->data(), &path, sizeof(AudioPathStatsHdr));
         send(buf->data(), buf->size(), stats.endpoint, buf);
@@ -719,8 +728,9 @@ private:
             });
     }
 
-    void record_audio_ingress(uint32_t sender_id, const udp::endpoint& endpoint, void* packet_data,
-                              std::size_t packet_size) {
+    void record_audio_ingress(uint32_t sender_id, const udp::endpoint& endpoint,
+                              const void* packet_data, std::size_t packet_size,
+                              bool count_received = true) {
         if (sender_id == 0 || packet_size < sizeof(MsgHdr)) {
             return;
         }
@@ -736,8 +746,10 @@ private:
         auto& stats = audio_ingress_stats_[sender_id];
         stats.endpoint = endpoint;
         stats.last_frame_count = audio.frame_count;
-        ++stats.received_total;
-        ++stats.received_interval;
+        if (count_received) {
+            ++stats.received_total;
+            ++stats.received_interval;
+        }
         const auto sequence_delta = stats.sequence_tracker.record(audio.sequence);
         if (sequence_delta.gaps_detected > 0) {
             stats.sequence_gaps_total += sequence_delta.gaps_detected;
@@ -748,7 +760,8 @@ private:
             stats.sequence_gap_recoveries_interval += sequence_delta.gaps_recovered;
         }
         stats.sequence_unresolved_gaps = stats.sequence_tracker.unresolved_gaps();
-        if (sequence_delta.late_or_duplicate) {
+        if (sequence_delta.late_or_duplicate &&
+            (count_received || sequence_delta.gaps_recovered > 0)) {
             ++stats.sequence_late_or_reordered_total;
             ++stats.sequence_late_or_reordered_interval;
         }
@@ -844,16 +857,24 @@ private:
 
             Log::info(
                 "Ingress diag interval sender={} endpoint={}:{} received={} seq_gap={} "
-                "gap_rate={:.1f}% seq_recovered={} seq_unresolved={} seq_late={} late={:.1f}% "
-                "total received={} seq_gap={} seq_recovered={} seq_unresolved={} seq_late={}",
+                "net_gap={} gap_rate={:.1f}% seq_recovered={} seq_unresolved={} "
+                "seq_late={} late={:.1f}% total received={} seq_gap={} net_gap={} "
+                "seq_recovered={} seq_unresolved={} seq_late={}",
                 sender_id, stats.endpoint.address().to_string(), stats.endpoint.port(),
                 stats.received_interval, stats.sequence_gaps_interval,
-                percent_missing(stats.sequence_gaps_interval, stats.received_interval),
+                unrecovered_gap_count(stats.sequence_gaps_interval,
+                                      stats.sequence_gap_recoveries_interval),
+                percent_missing(unrecovered_gap_count(
+                                    stats.sequence_gaps_interval,
+                                    stats.sequence_gap_recoveries_interval),
+                                stats.received_interval),
                 stats.sequence_gap_recoveries_interval, stats.sequence_unresolved_gaps,
                 stats.sequence_late_or_reordered_interval,
                 percent_of_packets(stats.sequence_late_or_reordered_interval,
                                    stats.received_interval),
                 stats.received_total, stats.sequence_gaps_total,
+                unrecovered_gap_count(stats.sequence_gaps_total,
+                                      stats.sequence_gap_recoveries_total),
                 stats.sequence_gap_recoveries_total, stats.sequence_unresolved_gaps,
                 stats.sequence_late_or_reordered_total);
             send_audio_path_stats(sender_id, stats);
@@ -928,6 +949,10 @@ private:
         }
         return (static_cast<double>(missing_events) * 100.0) /
                static_cast<double>(denominator);
+    }
+
+    static uint64_t unrecovered_gap_count(uint64_t gaps, uint64_t recoveries) {
+        return gaps > recoveries ? gaps - recoveries : 0;
     }
 
     static double percent_of_packets(uint64_t events, uint64_t packets) {

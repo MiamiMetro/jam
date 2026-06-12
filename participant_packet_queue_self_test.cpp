@@ -47,7 +47,11 @@ void require_dequeue_with_reset(ParticipantOpusPacketQueue& queue,
     OpusPacket packet{};
     require(queue.try_dequeue(packet, gap_wait_packets), "expected queued packet");
     require(!packet.loss_concealment, "expected real packet, got loss concealment");
-    require(packet.reset_decoder, "expected decoder reset on resumed packet");
+    if (!packet.reset_decoder) {
+        std::cerr << "FAIL: expected decoder reset on resumed packet, expected sequence "
+                  << expected_sequence << ", got sequence " << packet.sequence << '\n';
+        std::exit(1);
+    }
     require(packet.sequence == expected_sequence, "unexpected packet sequence");
 }
 
@@ -144,12 +148,14 @@ void test_burst_gap_waits_once_then_conceals_missing_run() {
             "burst gap should wait second callback");
     require_loss_concealment(queue, 2, 2);
     require_loss_concealment(queue, 3, 2);
-    require_loss_concealment(queue, 4, 2);
-    require_dequeue(queue, 5, 2);
+    require_dequeue_with_reset(queue, 5, 2);
 }
 
 void test_large_gap_caps_plc_and_resumes_real_packet() {
     ParticipantOpusPacketQueue queue;
+
+    require(MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS <= 2,
+            "large gaps should not synthesize more than two PLC packets");
 
     require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
     require(queue.enqueue(make_packet(100)), "future packet should enqueue");

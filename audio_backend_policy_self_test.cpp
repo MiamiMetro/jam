@@ -65,12 +65,25 @@ int main() {
             "AudioDeviceInfo::max_output_channels must be int");
 
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "ASIO")
-                <= audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "WASAPI"),
-            "ASIO must rank no worse than WASAPI on Windows");
+                <= audio_backend::rank_api_for_platform(audio_backend::Platform::windows,
+                                                        "Windows Audio (Low Latency Mode)"),
+            "ASIO must rank no worse than Windows Audio on Windows");
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "ASIO") == 0,
             "ASIO must be preferred on Windows");
-    require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "Windows WASAPI") == 1,
-            "WASAPI-containing names must be second on Windows");
+    require(audio_backend::rank_api_for_platform(
+                audio_backend::Platform::windows,
+                "Windows Audio (Low Latency Mode)") == 1,
+            "JUCE low-latency Windows Audio must be second on Windows");
+    require(audio_backend::rank_api_for_platform(
+                audio_backend::Platform::windows,
+                "Windows Audio (Exclusive Mode)") == 2,
+            "JUCE exclusive Windows Audio must outrank shared Windows Audio");
+    require(audio_backend::rank_api_for_platform(
+                audio_backend::Platform::windows, "Windows Audio") == 3,
+            "JUCE shared Windows Audio must be ranked as a usable fallback");
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows,
+                                                 "Windows WASAPI") == 3,
+            "legacy WASAPI-containing names must remain usable on Windows");
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::macos, "CoreAudio") == 0,
             "CoreAudio must be preferred on macOS");
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::macos, "ASIO") == 100,
@@ -83,13 +96,14 @@ int main() {
             "other APIs must be fallback-ranked on Linux");
 
     std::vector<AudioDeviceInfo> windows_devices{
-        device(1, "WASAPI", true, false, true, false),
-        device(2, "WASAPI", false, true, false, true),
+        device(1, "Windows Audio", true, false, true, false),
+        device(2, "Windows Audio", false, true, false, true),
         device(3, "ASIO", true, true, false, false),
     };
 
-    require(audio_backend::rank_api_for_platform("ASIO") <= audio_backend::rank_api_for_platform("WASAPI"),
-            "ASIO must rank no worse than WASAPI on Windows builds");
+    require(audio_backend::rank_api_for_platform("ASIO") <=
+                audio_backend::rank_api_for_platform("Windows Audio"),
+            "ASIO must rank no worse than Windows Audio on Windows builds");
     require(audio_backend::choose_default_input_device_for_platform(windows_devices, audio_backend::Platform::windows) == 3,
             "Windows input selection must prefer ASIO over WASAPI");
     require(audio_backend::choose_default_output_device_for_platform(windows_devices, audio_backend::Platform::windows) == 3,
@@ -106,14 +120,26 @@ int main() {
             "output selection must skip devices with negative output channels");
 
     std::vector<AudioDeviceInfo> single_api_devices{
-        device(10, "WASAPI", true, false, true, false),
-        device(11, "WASAPI", false, true, false, true),
+        device(10, "Windows Audio", true, false, true, false),
+        device(11, "Windows Audio", false, true, false, true),
     };
 
     require(audio_backend::choose_default_input_device(single_api_devices) == 10,
             "input should use default input when only one API is present");
     require(audio_backend::choose_default_output_device(single_api_devices) == 11,
             "output should use default output when only one API is present");
+
+    std::vector<AudioDeviceInfo> juce_windows_devices{
+        device(20, "Windows Audio", true, true, true, true),
+        device(21, "Windows Audio (Exclusive Mode)", true, true, false, false),
+        device(22, "Windows Audio (Low Latency Mode)", true, true, false, false),
+    };
+    require(audio_backend::choose_default_input_device_for_platform(
+                juce_windows_devices, audio_backend::Platform::windows) == 22,
+            "Windows input selection must prefer JUCE low-latency mode");
+    require(audio_backend::choose_default_output_device_for_platform(
+                juce_windows_devices, audio_backend::Platform::windows) == 22,
+            "Windows output selection must prefer JUCE low-latency mode");
 
     std::cout << "audio backend policy self-test passed\n";
     return 0;

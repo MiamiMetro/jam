@@ -10,10 +10,12 @@ const CTRL_JOIN_ACK = 8;
 const CTRL_AUDIO_PATH_STATS = 10;
 const AUDIO_CODEC_OPUS = 1;
 const AUDIO_CAP_REDUNDANCY = 1;
+const AUDIO_REDUNDANT_MAGIC = 0x41555244;
 const CTRL_HDR_SIZE = 9;
 const JOIN_HDR_SIZE = CTRL_HDR_SIZE + 64 + 64 + 64 + 64 + 512 + 1 + 4;
 const AUDIO_V2_HDR_SIZE = 22;
-const AUDIO_PATH_STATS_HDR_SIZE = 29;
+const AUDIO_REDUNDANT_HDR_SIZE = 8;
+const AUDIO_PATH_STATS_HDR_SIZE = 37;
 
 function usage(message) {
   if (message) {
@@ -141,6 +143,19 @@ function createAudioPacket(sequence) {
   return packet;
 }
 
+function createRedundantAudioPacket(children) {
+  const payloadBytes = children.reduce((total, child) => total + child.length, 0);
+  const packet = Buffer.alloc(AUDIO_REDUNDANT_HDR_SIZE + payloadBytes);
+  packet.writeUInt32LE(AUDIO_REDUNDANT_MAGIC, 0);
+  packet.writeUInt8(children.length, 4);
+  let offset = AUDIO_REDUNDANT_HDR_SIZE;
+  for (const child of children) {
+    child.copy(packet, offset);
+    offset += child.length;
+  }
+  return packet;
+}
+
 function send(socket, packet, port) {
   return new Promise((resolve, reject) => {
     socket.send(packet, port, "127.0.0.1", (error) => {
@@ -193,10 +208,13 @@ function waitForAudioPathStats(socket, timeoutMs) {
         intervalSequenceGaps: message.readUInt32LE(13),
         totalReceived: message.readUInt32LE(17),
         totalSequenceGaps: message.readUInt32LE(21),
-        observedFrameCount: message.readUInt16LE(25),
+        intervalUnrecoveredSequenceGaps: message.readUInt32LE(25),
+        totalUnrecoveredSequenceGaps: message.readUInt32LE(29),
+        observedFrameCount: message.readUInt16LE(33),
       };
-      if (stats.intervalReceived >= 2 &&
-          stats.intervalSequenceGaps >= 50 &&
+      if (stats.intervalReceived >= 3 &&
+          stats.intervalSequenceGaps >= 1 &&
+          stats.intervalUnrecoveredSequenceGaps === 0 &&
           stats.observedFrameCount === 480) {
         cleanup();
         resolve(stats);
@@ -229,10 +247,18 @@ try {
   console.log(`[smoke] joined participant ${participantId}`);
 
   await send(socket, createAudioPacket(1), serverPort);
-  await send(socket, createAudioPacket(100), serverPort);
+  await send(socket, createAudioPacket(3), serverPort);
+  await send(
+    socket,
+    createRedundantAudioPacket([
+      createAudioPacket(4),
+      createAudioPacket(2),
+    ]),
+    serverPort,
+  );
   const stats = await waitForAudioPathStats(socket, 8000);
   console.log(
-    `[smoke] feedback received=${stats.intervalReceived} gaps=${stats.intervalSequenceGaps} frame=${stats.observedFrameCount}`,
+    `[smoke] feedback received=${stats.intervalReceived} gaps=${stats.intervalSequenceGaps} net_gaps=${stats.intervalUnrecoveredSequenceGaps} frame=${stats.observedFrameCount}`,
   );
 } finally {
   socket.close();

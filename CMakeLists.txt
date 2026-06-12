@@ -135,7 +135,7 @@ if(JAM_BUILD_TESTS)
                          --burst-offset 120
                          --drop-direction server-to-client
                          --allow-loss
-                         --max-gap-plc-run 6
+                         --max-gap-plc-run 2
                          --min-decoder-resets 1)
     endif()
     if(TARGET client)
@@ -145,20 +145,58 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --auto-jitter-empty-playout-smoke)
         add_test(NAME client_audio_path_feedback_smoke
                  COMMAND $<TARGET_FILE:client> --audio-path-feedback-smoke)
+        add_test(NAME client_opus_playout_policy_smoke
+                 COMMAND $<TARGET_FILE:client> --opus-playout-policy-smoke)
+        add_test(NAME client_opus_redundancy_policy_smoke
+                 COMMAND $<TARGET_FILE:client> --opus-redundancy-policy-smoke)
         add_test(NAME client_startup_config_adaptive_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "Startup config smoke:.*opus_packet=480.*jitter_floor=6.*auto_start_jitter=disabled.*auto_jitter=false")
+                "Startup config smoke:.*opus_packet=480.*jitter_floor=2.*jitter_ms=20.*auto_start_jitter=disabled.*age_limit_ms=120.*auto_jitter=false")
         add_test(NAME client_startup_config_low_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke --latency-profile low)
         set_tests_properties(client_startup_config_low_smoke PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "Startup config smoke:.*opus_packet=120.*jitter_floor=3.*auto_start_jitter=disabled.*auto_jitter=false")
+                "Startup config smoke:.*opus_packet=120.*jitter_floor=4.*jitter_ms=10.*auto_start_jitter=disabled.*age_limit_ms=60.*auto_jitter=false")
         add_test(NAME client_startup_config_stable_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke --latency-profile stable)
         set_tests_properties(client_startup_config_stable_smoke PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "Startup config smoke:.*opus_packet=960.*jitter_floor=8.*auto_start_jitter=disabled.*auto_jitter=false")
+                "Startup config smoke:.*opus_packet=960.*jitter_floor=4.*jitter_ms=80.*auto_start_jitter=disabled.*age_limit_ms=250.*auto_jitter=false")
+        add_test(NAME client_startup_config_jitter_ms_scaling_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke
+                         --opus-packet-frames 960
+                         --jitter-ms 40)
+        set_tests_properties(client_startup_config_jitter_ms_scaling_smoke PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "Startup config smoke:.*opus_packet=960.*jitter_floor=2.*jitter_ms=40.*age_limit_ms=120")
+        add_test(NAME client_startup_config_jitter_requested_ms_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke
+                         --opus-packet-frames 960
+                         --jitter-ms 45)
+        set_tests_properties(client_startup_config_jitter_requested_ms_smoke PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "Startup config smoke:.*opus_packet=960.*jitter_floor=3.*jitter_ms=45.*age_limit_ms=120")
+        add_test(NAME client_startup_config_jitter_age_validation_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke
+                         --jitter-ms 200
+                         --age-limit-ms 100)
+        set_tests_properties(client_startup_config_jitter_age_validation_smoke PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "Startup config smoke:.*opus_packet=480.*jitter_floor=10.*jitter_ms=100.*age_limit_ms=100")
+        add_test(NAME client_startup_config_jitter_unit_conflict_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke
+                         --jitter-ms 50
+                         --jitter 4)
+        set_tests_properties(client_startup_config_jitter_unit_conflict_smoke PROPERTIES
+            WILL_FAIL TRUE)
+        add_test(NAME client_startup_config_redundancy_depth_smoke
+                 COMMAND $<TARGET_FILE:client> --startup-config-smoke
+                         --opus-packet-frames 120
+                         --redundancy-depth off)
+        set_tests_properties(client_startup_config_redundancy_depth_smoke PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "Startup config smoke:.*opus_packet=120.*redundancy_depth=0.*effective_redundancy_depth=0")
     endif()
 endif()

@@ -117,6 +117,8 @@ constexpr double PING_PATH_HIGH_RTT_MS = 250.0;
 constexpr uint32_t UDP_PATH_REBIND_MIN_OBSERVED_PACKETS = 8;
 constexpr double UDP_PATH_REBIND_SEVERE_GAP_RATE = 0.25;
 constexpr auto UDP_PATH_REBIND_COOLDOWN = 15s;
+constexpr int OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS = 200;
+constexpr int OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE = 3;
 
 struct PerformerJoinOptions {
     std::string room_id;
@@ -656,8 +658,11 @@ public:
         diagnostics.audio_ingress_gaps =
             audio_path_interval_gaps_.load(std::memory_order_relaxed);
         diagnostics.audio_ingress_gap_percent =
-            gap_percent(diagnostics.audio_ingress_received,
-                        diagnostics.audio_ingress_gaps);
+            audio_path_feedback_net_gap_rate(
+                diagnostics.audio_ingress_received,
+                audio_path_interval_sequence_gaps_.load(std::memory_order_relaxed),
+                diagnostics.audio_ingress_gaps) *
+            100.0;
         diagnostics.opus_send_queue_avg_ms =
             ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed));
         diagnostics.opus_send_queue_max_ms =
@@ -755,6 +760,31 @@ public:
         return opus_network_clock::frame_duration_ms(sample_rate, get_opus_network_frame_count());
     }
 
+    size_t opus_jitter_packets_for_target_ms(int target_ms) const {
+        const uint32_t sample_rate =
+            static_cast<uint32_t>(std::max(1, current_audio_sample_rate()));
+        const uint16_t frame_count = get_opus_network_frame_count();
+        size_t packets = opus_jitter_packets_for_ms(
+            target_ms,
+            sample_rate,
+            frame_count);
+        const int age_limit_ms = get_jitter_packet_age_limit_ms();
+        if (age_limit_ms > 0) {
+            packets = std::min(packets,
+                               opus_jitter_packets_within_ms(age_limit_ms,
+                                                             sample_rate,
+                                                             frame_count));
+        }
+        return packets;
+    }
+
+    int opus_jitter_effective_ms_for_packets(size_t packets) const {
+        return opus_jitter_ms_for_packets(
+            packets,
+            static_cast<uint32_t>(std::max(1, current_audio_sample_rate())),
+            get_opus_network_frame_count());
+    }
+
     void set_opus_network_frame_count(int frame_count) {
         const uint32_t sample_rate =
             static_cast<uint32_t>(std::max(1, current_audio_sample_rate()));
@@ -767,19 +797,84 @@ public:
             Log::info("Opus network packet changed from {} to {} frames ({:.1f} ms)",
                       previous, normalized,
                       opus_network_clock::frame_duration_ms(sample_rate, normalized));
+            apply_opus_jitter_buffer_ms(
+                opus_jitter_buffer_ms_.load(std::memory_order_acquire));
         }
     }
 
     size_t get_opus_jitter_buffer_packets() const {
-        return opus_jitter_buffer_packets_.load(std::memory_order_acquire);
+        return opus_jitter_packets_for_target_ms(get_opus_jitter_buffer_ms());
+    }
+
+    int get_opus_jitter_buffer_ms() const {
+        return opus_jitter_buffer_ms_.load(std::memory_order_acquire);
     }
 
     size_t get_opus_auto_start_jitter_packets() const {
-        return opus_auto_start_jitter_packets(get_opus_jitter_buffer_packets());
+        return opus_auto_start_jitter_packets_for_audio(
+            get_opus_jitter_buffer_packets(),
+            static_cast<uint32_t>(std::max(1, current_audio_sample_rate())),
+            get_opus_network_frame_count());
+    }
+
+    int get_opus_auto_start_jitter_ms() const {
+        return opus_jitter_effective_ms_for_packets(get_opus_auto_start_jitter_packets());
     }
 
     size_t get_opus_queue_limit_packets() const {
         return opus_queue_limit_packets_.load(std::memory_order_acquire);
+    }
+
+    static int normalize_opus_redundancy_depth(int depth) {
+        if (depth < 0) {
+            return OPUS_REDUNDANCY_DEPTH_AUTO;
+        }
+        return std::clamp(depth, 0, MAX_OPUS_REDUNDANCY_DEPTH_PACKETS);
+    }
+
+    static int auto_opus_redundancy_depth_for_frame_count(uint16_t frame_count) {
+        if (frame_count <= opus_network_clock::LOW_LATENCY_FRAME_COUNT) {
+            return 1;
+        }
+        if (frame_count >= opus_network_clock::STABLE_FRAME_COUNT) {
+            return 3;
+        }
+        return 2;
+    }
+
+    static int effective_opus_redundancy_depth(int configured_depth,
+                                               uint16_t frame_count) {
+        const int normalized = normalize_opus_redundancy_depth(configured_depth);
+        if (normalized == OPUS_REDUNDANCY_DEPTH_AUTO) {
+            return auto_opus_redundancy_depth_for_frame_count(frame_count);
+        }
+        return normalized;
+    }
+
+    static size_t opus_redundancy_child_count_for_policy(int configured_depth,
+                                                         uint16_t frame_count,
+                                                         size_t available_previous) {
+        const int effective_depth =
+            effective_opus_redundancy_depth(configured_depth, frame_count);
+        if (effective_depth <= 0) {
+            return 1;
+        }
+        return 1 + std::min(available_previous, static_cast<size_t>(effective_depth));
+    }
+
+    int get_opus_redundancy_depth_setting() const {
+        return opus_redundancy_depth_packets_.load(std::memory_order_acquire);
+    }
+
+    int get_effective_opus_redundancy_depth() const {
+        return effective_opus_redundancy_depth(
+            get_opus_redundancy_depth_setting(),
+            static_cast<uint16_t>(get_opus_network_frame_count()));
+    }
+
+    void set_opus_redundancy_depth(int depth) {
+        opus_redundancy_depth_packets_.store(normalize_opus_redundancy_depth(depth),
+                                             std::memory_order_release);
     }
 
     int get_jitter_packet_age_limit_ms() const {
@@ -788,11 +883,14 @@ public:
 
     static void apply_opus_jitter_policy_to_participant(ParticipantData& participant,
                                                         size_t floor_packets,
+                                                        size_t auto_start_packets,
                                                         bool auto_enabled,
                                                         bool reset_target) {
         const size_t floor = clamp_opus_jitter_packets(floor_packets);
+        const size_t auto_start =
+            std::max(floor, clamp_opus_jitter_packets(auto_start_packets));
         const size_t target =
-            auto_enabled ? opus_auto_start_jitter_packets(floor) : floor;
+            auto_enabled ? auto_start : floor;
 
         participant.opus_jitter_auto_enabled.store(auto_enabled,
                                                    std::memory_order_relaxed);
@@ -826,9 +924,30 @@ public:
     void set_opus_jitter_buffer_packets(size_t packets) {
         const size_t clamped =
             std::clamp(packets, MIN_OPUS_JITTER_PACKETS, MAX_OPUS_JITTER_PACKETS);
-        opus_jitter_buffer_packets_.store(clamped, std::memory_order_release);
+        set_opus_jitter_buffer_ms(opus_jitter_effective_ms_for_packets(clamped));
+    }
 
-        participant_manager_.for_each([clamped](uint32_t, ParticipantData& participant) {
+    static int clamp_opus_jitter_ms_for_age_limit(int target_ms, int age_limit_ms) {
+        int clamped_ms = std::clamp(target_ms, 0, MAX_JITTER_PACKET_AGE_MS);
+        if (age_limit_ms > 0) {
+            clamped_ms = std::min(clamped_ms, age_limit_ms);
+        }
+        return clamped_ms;
+    }
+
+    void set_opus_jitter_buffer_ms(int target_ms) {
+        const int clamped_ms =
+            clamp_opus_jitter_ms_for_age_limit(target_ms, get_jitter_packet_age_limit_ms());
+        apply_opus_jitter_buffer_ms(clamped_ms);
+    }
+
+    void apply_opus_jitter_buffer_ms(int clamped_ms) {
+        opus_jitter_buffer_ms_.store(clamped_ms, std::memory_order_release);
+
+        const size_t clamped = opus_jitter_packets_for_target_ms(clamped_ms);
+        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
+        participant_manager_.for_each([clamped, auto_start_packets](
+                                          uint32_t, ParticipantData& participant) {
             if (participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
                 return;
             }
@@ -836,7 +955,7 @@ public:
                 participant.jitter_buffer_floor_packets.load(std::memory_order_relaxed) >=
                     DEFAULT_OPUS_JITTER_PACKETS) {
                 apply_opus_jitter_policy_to_participant(
-                    participant, clamped,
+                    participant, clamped, auto_start_packets,
                     participant.opus_jitter_auto_enabled.load(std::memory_order_relaxed),
                     true);
             }
@@ -855,20 +974,53 @@ public:
     }
 
     void set_jitter_packet_age_limit_ms(int age_ms) {
-        jitter_packet_age_limit_ms_.store(
-            std::clamp(age_ms, MIN_JITTER_PACKET_AGE_MS, MAX_JITTER_PACKET_AGE_MS),
-            std::memory_order_release);
+        const int clamped =
+            std::clamp(age_ms, MIN_JITTER_PACKET_AGE_MS, MAX_JITTER_PACKET_AGE_MS);
+        jitter_packet_age_limit_ms_.store(clamped, std::memory_order_release);
+        if (clamped <= 0) {
+            return;
+        }
+
+        const int previous_jitter_ms = get_opus_jitter_buffer_ms();
+        if (previous_jitter_ms > clamped) {
+            apply_opus_jitter_buffer_ms(clamped);
+            Log::info("Clamped global Opus jitter from {} ms to packet age limit {} ms",
+                      previous_jitter_ms, clamped);
+        }
+
+        const size_t max_packets = opus_jitter_packets_for_target_ms(clamped);
+        participant_manager_.for_each([max_packets](uint32_t, ParticipantData& participant) {
+            const size_t current_target =
+                participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+            if (current_target <= max_packets) {
+                return;
+            }
+            participant.jitter_buffer_min_packets.store(max_packets,
+                                                        std::memory_order_relaxed);
+            participant.jitter_buffer_floor_packets.store(
+                std::min(participant.jitter_buffer_floor_packets.load(
+                             std::memory_order_relaxed),
+                         max_packets),
+                std::memory_order_relaxed);
+            participant.opus_jitter_auto_floor_packets.store(
+                std::min(participant.opus_jitter_auto_floor_packets.load(
+                             std::memory_order_relaxed),
+                         max_packets),
+                std::memory_order_relaxed);
+        });
     }
 
     void set_opus_auto_jitter_default(bool enabled) {
         opus_auto_jitter_default_.store(enabled, std::memory_order_release);
         const size_t global_default = get_opus_jitter_buffer_packets();
-        participant_manager_.for_each([enabled, global_default](uint32_t, ParticipantData& participant) {
+        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
+        participant_manager_.for_each([enabled, global_default, auto_start_packets](
+                                          uint32_t, ParticipantData& participant) {
             if (participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
                 return;
             }
-            apply_opus_jitter_policy_to_participant(participant, global_default, enabled,
-                                                    !enabled);
+            apply_opus_jitter_policy_to_participant(
+                participant, global_default, auto_start_packets, enabled, !enabled);
         });
     }
 
@@ -895,21 +1047,33 @@ public:
         });
     }
 
+    void set_participant_opus_jitter_buffer_ms(uint32_t id, int target_ms) {
+        const int clamped_ms =
+            clamp_opus_jitter_ms_for_age_limit(target_ms, get_jitter_packet_age_limit_ms());
+        const size_t clamped = opus_jitter_packets_for_target_ms(clamped_ms);
+        set_participant_opus_jitter_buffer_packets(id, clamped);
+    }
+
     void reset_participant_opus_jitter_buffer_packets(uint32_t id) {
         const size_t global_default = get_opus_jitter_buffer_packets();
-        participant_manager_.with_participant(id, [global_default](ParticipantData& participant) {
+        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
+        participant_manager_.with_participant(id, [global_default, auto_start_packets](
+                                                  ParticipantData& participant) {
             participant.opus_jitter_manual_override.store(false, std::memory_order_relaxed);
-            apply_opus_jitter_policy_to_participant(participant, global_default, false,
-                                                    true);
+            apply_opus_jitter_policy_to_participant(
+                participant, global_default, auto_start_packets, false, true);
         });
     }
 
     void set_participant_opus_auto_jitter(uint32_t id, bool enabled) {
         const size_t global_default = get_opus_jitter_buffer_packets();
-        participant_manager_.with_participant(id, [enabled, global_default](ParticipantData& participant) {
+        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
+        participant_manager_.with_participant(id, [enabled, global_default,
+                                                   auto_start_packets](
+                                                  ParticipantData& participant) {
             participant.opus_jitter_manual_override.store(false, std::memory_order_relaxed);
-            apply_opus_jitter_policy_to_participant(participant, global_default, enabled,
-                                                    !enabled);
+            apply_opus_jitter_policy_to_participant(
+                participant, global_default, auto_start_packets, enabled, !enabled);
         });
     }
 
@@ -919,6 +1083,7 @@ public:
         }
         apply_opus_jitter_policy_to_participant(
             participant, get_opus_jitter_buffer_packets(),
+            get_opus_auto_start_jitter_packets(),
             opus_auto_jitter_default_.load(std::memory_order_acquire), true);
     }
 
@@ -1582,6 +1747,7 @@ private:
         ping_path_total_missing_.store(0, std::memory_order_relaxed);
         ping_path_consecutive_missing_.store(0, std::memory_order_relaxed);
         audio_path_interval_received_.store(0, std::memory_order_relaxed);
+        audio_path_interval_sequence_gaps_.store(0, std::memory_order_relaxed);
         audio_path_interval_gaps_.store(0, std::memory_order_relaxed);
         server_clock_ready_.store(false, std::memory_order_release);
         rtt_ms_.store(0.0, std::memory_order_relaxed);
@@ -1824,11 +1990,34 @@ private:
             return packet;
         }
 
+        if (packet->size() < audio_packet::v2_header_size()) {
+            return packet;
+        }
+
+        AudioHdrV2 audio{};
+        std::memcpy(&audio, packet->data(), audio_packet::v2_header_size());
+        const int configured_depth = get_opus_redundancy_depth_setting();
+        const int effective_depth =
+            effective_opus_redundancy_depth(configured_depth, audio.frame_count);
+        if (effective_depth <= 0) {
+            recent_opus_audio_packets_.clear();
+            return packet;
+        }
+
+        const size_t child_count = opus_redundancy_child_count_for_policy(
+            configured_depth, audio.frame_count, recent_opus_audio_packets_.size());
         std::vector<const std::vector<unsigned char>*> packets{packet.get()};
         for (const auto& previous_packet: recent_opus_audio_packets_) {
+            if (packets.size() >= child_count) {
+                break;
+            }
             if (previous_packet != nullptr) {
                 packets.push_back(previous_packet.get());
             }
+        }
+        if (packets.size() <= 1) {
+            remember_recent_opus_audio_packet(packet);
+            return packet;
         }
         auto redundant_packet = audio_packet::create_redundant_audio_packet(
             packets, AUDIO_REDUNDANT_TARGET_BYTES);
@@ -2008,8 +2197,18 @@ private:
         const double target_packets =
             static_cast<double>(opus_playout_target_queue_packets(participant));
         const double queue_error = queued_packets - target_packets;
-        const double gain = queue_error < 0.0 ? 0.01 : 0.005;
-        double ratio = std::clamp(1.0 + (queue_error * gain), 0.95, 1.04);
+        constexpr double deadband_packets = 1.0;
+        constexpr double gain = 0.001;
+        constexpr double min_ratio = 0.995;
+        constexpr double max_ratio = 1.005;
+        double correction_error = 0.0;
+        if (queue_error > deadband_packets) {
+            correction_error = queue_error - deadband_packets;
+        } else if (queue_error < -deadband_packets) {
+            correction_error = queue_error + deadband_packets;
+        }
+        double ratio = std::clamp(1.0 + (correction_error * gain),
+                                  min_ratio, max_ratio);
 
         const uint64_t queue_limit_drops =
             participant.opus_queue_limit_drops.load(std::memory_order_relaxed);
@@ -2020,7 +2219,7 @@ private:
         if (participant.opus_rate_correction_callbacks > 0) {
             participant.opus_rate_correction_callbacks--;
             if (queued_packets >= target_packets * 0.5) {
-                ratio = std::max(ratio, 1.04);
+                ratio = std::max(ratio, max_ratio);
             }
         }
 
@@ -2230,11 +2429,18 @@ private:
     static size_t opus_playout_target_queue_packets(const ParticipantData& participant) {
         const size_t jitter_floor = std::max<size_t>(
             1, participant.jitter_buffer_min_packets.load(std::memory_order_relaxed));
-        const size_t queue_midpoint =
-            std::max<size_t>(
-                1, participant.opus_queue_limit_packets.load(std::memory_order_relaxed) / 2);
-        return std::max(jitter_floor,
-                        std::min<size_t>(MAX_OPUS_JITTER_PACKETS, queue_midpoint));
+        return std::min<size_t>(MAX_OPUS_JITTER_PACKETS, jitter_floor);
+    }
+
+    static size_t opus_gap_wait_dequeue_attempts(const ParticipantData& participant) {
+        const size_t packet_frames =
+            participant.last_packet_frame_count.load(std::memory_order_relaxed);
+        const size_t callback_frames =
+            participant.last_callback_frame_count.load(std::memory_order_relaxed);
+        if (packet_frames == 0 || callback_frames == 0) {
+            return 1;
+        }
+        return std::max<size_t>(1, (packet_frames + callback_frames - 1) / callback_frames);
     }
 
     static size_t ready_threshold_packets(const ParticipantData& participant) {
@@ -2259,69 +2465,90 @@ private:
         return std::max<size_t>(3, target_packets);
     }
 
-    static void observe_auto_jitter_instability(ParticipantData& participant) {
-        if (!participant.opus_jitter_auto_enabled.load(std::memory_order_relaxed) ||
-            participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
-            return;
-        }
-
-        participant.opus_jitter_auto_stable_callbacks.store(0, std::memory_order_relaxed);
-        participant.opus_jitter_auto_instability_events.fetch_add(1,
-                                                                  std::memory_order_relaxed);
-        const size_t current_target =
-            participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        if (current_target < MAX_OPUS_JITTER_PACKETS) {
-            const size_t next_target =
-                std::min(MAX_OPUS_JITTER_PACKETS,
-                         std::max<size_t>(3, current_target + 1));
-            if (next_target > current_target) {
-                participant.jitter_buffer_min_packets.store(next_target,
-                                                            std::memory_order_relaxed);
-                participant.jitter_buffer_floor_packets.store(next_target,
-                                                              std::memory_order_relaxed);
-                const size_t queue_limit =
-                    participant.opus_queue_limit_packets.load(std::memory_order_relaxed);
-                participant.opus_queue_limit_packets.store(
-                    std::max(queue_limit, next_target + 3), std::memory_order_relaxed);
-                participant.buffer_ready.store(false, std::memory_order_relaxed);
-                participant.opus_consecutive_empty_callbacks.store(
-                    0, std::memory_order_relaxed);
-                participant.opus_jitter_auto_increases.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
+    static void observe_opus_age_limit_drop(ParticipantData& participant) {
+        participant.jitter_age_drops.fetch_add(1, std::memory_order_relaxed);
+        participant.opus_age_limit_drops.fetch_add(1, std::memory_order_relaxed);
     }
 
-    static void observe_auto_jitter_stable(ParticipantData& participant) {
-        if (!participant.opus_jitter_auto_enabled.load(std::memory_order_relaxed) ||
-            participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
-            return;
-        }
+    static bool auto_jitter_is_active(const ParticipantData& participant) {
+        return participant.opus_jitter_auto_enabled.load(std::memory_order_relaxed) &&
+               !participant.opus_jitter_manual_override.load(std::memory_order_relaxed);
+    }
 
-        participant.opus_jitter_auto_instability_events.store(0, std::memory_order_relaxed);
-        const int stable_callbacks =
-            participant.opus_jitter_auto_stable_callbacks.fetch_add(
-                1, std::memory_order_relaxed) +
-            1;
-        constexpr int STABLE_CALLBACKS_BEFORE_DECREASE = 2000;
-        if (stable_callbacks < STABLE_CALLBACKS_BEFORE_DECREASE) {
-            return;
-        }
+    static void complete_auto_jitter_control_window(ParticipantData& participant) {
+        participant.opus_jitter_auto_stable_callbacks.store(0,
+                                                            std::memory_order_relaxed);
+        const int instability_events =
+            participant.opus_jitter_auto_instability_events.exchange(
+                0, std::memory_order_relaxed);
 
-        participant.opus_jitter_auto_stable_callbacks.store(0, std::memory_order_relaxed);
         const size_t floor_packets =
             std::clamp(participant.opus_jitter_auto_floor_packets.load(
                            std::memory_order_relaxed),
                        MIN_OPUS_JITTER_PACKETS, MAX_OPUS_JITTER_PACKETS);
         const size_t current_target =
             participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        if (current_target > floor_packets) {
+
+        if (instability_events >= OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE) {
+            if (current_target < MAX_OPUS_JITTER_PACKETS) {
+                const size_t next_target =
+                    std::min(MAX_OPUS_JITTER_PACKETS,
+                             std::max<size_t>(3, current_target + 1));
+                if (next_target > current_target) {
+                    participant.jitter_buffer_min_packets.store(
+                        next_target, std::memory_order_relaxed);
+                    participant.jitter_buffer_floor_packets.store(
+                        next_target, std::memory_order_relaxed);
+                    const size_t queue_limit =
+                        participant.opus_queue_limit_packets.load(
+                            std::memory_order_relaxed);
+                    participant.opus_queue_limit_packets.store(
+                        std::max(queue_limit, next_target + 3),
+                        std::memory_order_relaxed);
+                    participant.opus_jitter_auto_increases.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+
+        if (instability_events == 0 && current_target > floor_packets) {
             const size_t next_target = current_target - 1;
             participant.jitter_buffer_min_packets.store(next_target,
                                                         std::memory_order_relaxed);
             participant.jitter_buffer_floor_packets.store(next_target,
                                                           std::memory_order_relaxed);
-            participant.opus_jitter_auto_decreases.fetch_add(1, std::memory_order_relaxed);
+            participant.opus_jitter_auto_decreases.fetch_add(
+                1, std::memory_order_relaxed);
         }
+    }
+
+    static void observe_auto_jitter_window_callback(ParticipantData& participant) {
+        const int observed_callbacks =
+            participant.opus_jitter_auto_stable_callbacks.fetch_add(
+                1, std::memory_order_relaxed) +
+            1;
+        if (observed_callbacks >= OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS) {
+            complete_auto_jitter_control_window(participant);
+        }
+    }
+
+    static void observe_auto_jitter_instability(ParticipantData& participant) {
+        if (!auto_jitter_is_active(participant)) {
+            return;
+        }
+
+        participant.opus_jitter_auto_instability_events.fetch_add(
+            1, std::memory_order_relaxed);
+        observe_auto_jitter_window_callback(participant);
+    }
+
+    static void observe_auto_jitter_stable(ParticipantData& participant) {
+        if (!auto_jitter_is_active(participant)) {
+            return;
+        }
+
+        observe_auto_jitter_window_callback(participant);
     }
 
     static size_t max_receive_queue_packets(const OpusPacket& packet, size_t opus_queue_limit) {
@@ -2655,6 +2882,18 @@ public:
         return static_cast<double>(sequence_gaps) / static_cast<double>(denominator);
     }
 
+    static double audio_path_feedback_net_gap_rate(uint32_t received_packets,
+                                                   uint32_t sequence_gaps,
+                                                   uint32_t unrecovered_sequence_gaps) {
+        const uint64_t denominator =
+            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
+        if (denominator == 0) {
+            return 0.0;
+        }
+        return static_cast<double>(unrecovered_sequence_gaps) /
+               static_cast<double>(denominator);
+    }
+
     static bool should_rebind_udp_path_after_feedback(uint16_t current_frame_count,
                                                       uint32_t received_packets,
                                                       uint32_t sequence_gaps) {
@@ -2726,9 +2965,23 @@ public:
             }
             return true;
         };
+        auto expect_net_rate = [&](uint32_t received, uint32_t gaps,
+                                   uint32_t unrecovered_gaps, double expected,
+                                   const char* label) {
+            const double actual =
+                audio_path_feedback_net_gap_rate(received, gaps, unrecovered_gaps);
+            if (std::fabs(actual - expected) > 0.000001) {
+                failure = std::string(label) + ": expected net rate " +
+                          std::to_string(expected) + ", got " +
+                          std::to_string(actual);
+                return false;
+            }
+            return true;
+        };
 
         return expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 100, 0,
                       opus_network_clock::LOW_LATENCY_FRAME_COUNT, "clean low") &&
+               expect_net_rate(75, 25, 5, 0.05, "redundancy-repaired net loss") &&
                expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 18, 1,
                       opus_network_clock::LOW_LATENCY_FRAME_COUNT, "too few samples") &&
                expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 90, 10,
@@ -2775,28 +3028,88 @@ public:
                    opus_network_clock::STABLE_FRAME_COUNT, 1, 99);
     }
 
-    static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
-        ParticipantData participant;
-        participant.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
-        participant.buffer_ready.store(true, std::memory_order_relaxed);
+    static bool run_opus_redundancy_policy_smoke(std::string& failure) {
+        auto expect_depth = [&](int configured, uint16_t frame_count, int expected,
+                                const char* label) {
+            const int actual = effective_opus_redundancy_depth(configured, frame_count);
+            if (actual != expected) {
+                failure = std::string(label) + ": expected depth " +
+                          std::to_string(expected) + ", got " +
+                          std::to_string(actual);
+                return false;
+            }
+            return true;
+        };
+        auto expect_children = [&](int configured, uint16_t frame_count,
+                                   size_t available_previous, size_t expected,
+                                   const char* label) {
+            const size_t actual = opus_redundancy_child_count_for_policy(
+                configured, frame_count, available_previous);
+            if (actual != expected) {
+                failure = std::string(label) + ": expected child count " +
+                          std::to_string(expected) + ", got " +
+                          std::to_string(actual);
+                return false;
+            }
+            return true;
+        };
 
-        apply_opus_jitter_policy_to_participant(
-            participant, DEFAULT_OPUS_JITTER_PACKETS, true, true);
+        return expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                            opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1,
+                            "auto low latency depth") &&
+               expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                            opus_network_clock::FAST_FRAME_COUNT, 2,
+                            "auto fast depth") &&
+               expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                            opus_network_clock::DEFAULT_FRAME_COUNT, 2,
+                            "auto default depth") &&
+               expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                            opus_network_clock::STABLE_FRAME_COUNT, 3,
+                            "auto stable depth") &&
+               expect_children(0, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 1,
+                               "off sends plain packet") &&
+               expect_children(1, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
+                               "explicit one previous") &&
+               expect_children(2, opus_network_clock::DEFAULT_FRAME_COUNT, 8, 3,
+                               "explicit two previous") &&
+               expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
+                               opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
+                               "auto low latency child count") &&
+               expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
+                               opus_network_clock::STABLE_FRAME_COUNT, 8, 4,
+                               "auto stable child count") &&
+               expect_children(99, opus_network_clock::DEFAULT_FRAME_COUNT, 20,
+                               MAX_AUDIO_REDUNDANT_PACKETS,
+                               "explicit depth clamps to protocol max");
+    }
+
+    static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
+        auto initialize_auto_participant = [](ParticipantData& target) {
+            target.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
+            target.buffer_ready.store(true, std::memory_order_relaxed);
+            apply_opus_jitter_policy_to_participant(
+                target, DEFAULT_OPUS_JITTER_PACKETS,
+                DEFAULT_OPUS_AUTO_START_JITTER_PACKETS, true, true);
+            target.buffer_ready.store(true, std::memory_order_relaxed);
+        };
+        auto observe_stable_callbacks = [](ParticipantData& target, int callbacks) {
+            for (int i = 0; i < callbacks; ++i) {
+                observe_auto_jitter_stable(target);
+            }
+        };
+
+        ParticipantData participant;
+        initialize_auto_participant(participant);
 
         const size_t before_target =
             participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
         const uint64_t before_increases =
             participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
 
-        participant.buffer_ready.store(true, std::memory_order_relaxed);
         observe_auto_jitter_instability(participant);
 
         const size_t after_target =
             participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        const size_t after_floor =
-            participant.jitter_buffer_floor_packets.load(std::memory_order_relaxed);
-        const size_t after_queue_limit =
-            participant.opus_queue_limit_packets.load(std::memory_order_relaxed);
         const uint64_t after_increases =
             participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
 
@@ -2804,24 +3117,209 @@ public:
             failure = "unexpected auto-start jitter target";
             return false;
         }
-        if (after_target != before_target + 1) {
-            failure = "empty playout did not raise jitter target";
+        if (after_target != before_target) {
+            failure = "isolated instability event raised jitter target immediately";
             return false;
         }
-        if (after_floor != after_target) {
-            failure = "jitter floor did not follow raised target";
+        if (!participant.buffer_ready.load(std::memory_order_relaxed)) {
+            failure = "jitter target increase forced an unnecessary rebuffer";
             return false;
         }
-        if (after_queue_limit < after_target + 3) {
+        if (after_increases != before_increases) {
+            failure = "isolated instability event counted as target increase";
+            return false;
+        }
+
+        observe_stable_callbacks(participant,
+                                 OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS - 1);
+        if (participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
+            before_target) {
+            failure = "sparse instability window should hold the target";
+            return false;
+        }
+        observe_stable_callbacks(participant,
+                                 OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS);
+        if (participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
+            before_target - 1) {
+            failure = "clean window after sparse event did not decay the target";
+            return false;
+        }
+
+        ParticipantData burst_participant;
+        initialize_auto_participant(burst_participant);
+        const size_t burst_before_target =
+            burst_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+        const uint64_t burst_before_increases =
+            burst_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
+        for (int i = 0; i < OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE; ++i) {
+            observe_auto_jitter_instability(burst_participant);
+        }
+        observe_stable_callbacks(
+            burst_participant,
+            OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS -
+                OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE);
+        const size_t burst_after_target =
+            burst_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+        const size_t burst_after_floor =
+            burst_participant.jitter_buffer_floor_packets.load(std::memory_order_relaxed);
+        const size_t burst_after_queue_limit =
+            burst_participant.opus_queue_limit_packets.load(std::memory_order_relaxed);
+        const uint64_t burst_after_increases =
+            burst_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
+        if (burst_after_target != burst_before_target + 1) {
+            failure = "instability window did not raise jitter target by one";
+            return false;
+        }
+        if (burst_after_floor != burst_after_target) {
+            failure = "jitter display floor did not follow raised target";
+            return false;
+        }
+        if (burst_after_queue_limit < burst_after_target + 3) {
             failure = "queue limit did not expand with raised target";
             return false;
         }
-        if (participant.buffer_ready.load(std::memory_order_relaxed)) {
-            failure = "buffer readiness was not reset for rebuffering";
+        if (!burst_participant.buffer_ready.load(std::memory_order_relaxed)) {
+            failure = "windowed jitter target increase forced rebuffer";
             return false;
         }
-        if (after_increases != before_increases + 1) {
+        if (burst_after_increases != burst_before_increases + 1) {
             failure = "auto jitter increase counter did not increment";
+            return false;
+        }
+
+        ParticipantData decay_participant;
+        initialize_auto_participant(decay_participant);
+        const size_t decay_start =
+            decay_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+        const size_t decay_floor =
+            decay_participant.opus_jitter_auto_floor_packets.load(std::memory_order_relaxed);
+        observe_stable_callbacks(
+            decay_participant,
+            static_cast<int>((decay_start - decay_floor) *
+                             OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS));
+        if (decay_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
+            decay_floor) {
+            failure = "clean auto-jitter decay did not reach configured floor";
+            return false;
+        }
+        if (decay_participant.opus_jitter_auto_decreases.load(std::memory_order_relaxed) !=
+            decay_start - decay_floor) {
+            failure = "auto jitter decrease counter did not match decay";
+            return false;
+        }
+
+        ParticipantData age_drop_participant;
+        initialize_auto_participant(age_drop_participant);
+        const size_t age_before_target =
+            age_drop_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+        const uint64_t age_before_increases =
+            age_drop_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
+
+        observe_opus_age_limit_drop(age_drop_participant);
+
+        if (age_drop_participant.jitter_age_drops.load(std::memory_order_relaxed) != 1 ||
+            age_drop_participant.opus_age_limit_drops.load(std::memory_order_relaxed) != 1) {
+            failure = "age drop diagnostics were not counted";
+            return false;
+        }
+        if (age_drop_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
+            age_before_target) {
+            failure = "age drop raised auto jitter target";
+            return false;
+        }
+        if (age_drop_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed) !=
+            age_before_increases) {
+            failure = "age drop counted as auto jitter instability";
+            return false;
+        }
+        const int participant_jitter_ms =
+            clamp_opus_jitter_ms_for_age_limit(150, 100);
+        const size_t participant_jitter_packets =
+            opus_jitter_packets_for_ms(participant_jitter_ms, 48000,
+                                       opus_network_clock::DEFAULT_FRAME_COUNT);
+        if (participant_jitter_ms != 100 || participant_jitter_packets != 10) {
+            failure = "participant jitter ms did not clamp to packet age limit";
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool run_opus_playout_policy_smoke(std::string& failure) {
+        auto make_packet = [](uint32_t sequence) {
+            OpusPacket packet{};
+            packet.sequence = sequence;
+            packet.sequence_valid = true;
+            packet.frame_count = 480;
+            packet.size = 1;
+            packet.data[0] = static_cast<uint8_t>(sequence);
+            packet.timestamp = std::chrono::steady_clock::now();
+            return packet;
+        };
+
+        auto ratio_at_depth = [&](size_t jitter_packets, size_t queue_limit,
+                                  size_t queued_packets) {
+            ParticipantData participant;
+            participant.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
+            participant.last_packet_frame_count.store(480, std::memory_order_relaxed);
+            participant.last_callback_frame_count.store(240, std::memory_order_relaxed);
+            participant.jitter_buffer_min_packets.store(jitter_packets,
+                                                        std::memory_order_relaxed);
+            participant.opus_queue_limit_packets.store(queue_limit,
+                                                       std::memory_order_relaxed);
+            for (size_t i = 0; i < queued_packets; ++i) {
+                (void)participant.opus_queue.enqueue(make_packet(
+                    static_cast<uint32_t>(i + 1)));
+            }
+            return opus_playout_rate_ratio(participant);
+        };
+
+        for (size_t jitter_packets = 1; jitter_packets <= 8; ++jitter_packets) {
+            for (size_t queue_limit: {size_t{8}, size_t{16}, size_t{64}, size_t{128}}) {
+                const double ratio =
+                    ratio_at_depth(jitter_packets, queue_limit, jitter_packets);
+                if (std::abs(ratio - 1.0) > 0.0001) {
+                    failure = "playout ratio drifted at jitter target depth: jitter=" +
+                              std::to_string(jitter_packets) +
+                              " queue_limit=" + std::to_string(queue_limit) +
+                              " ratio=" + std::to_string(ratio);
+                    return false;
+                }
+            }
+        }
+
+        const double underfilled_ratio = ratio_at_depth(6, 64, 1);
+        if (underfilled_ratio < 0.995 || underfilled_ratio >= 1.0) {
+            failure = "underfilled queue ratio should stay within drift-scale slow clamp";
+            return false;
+        }
+
+        const double overfilled_ratio = ratio_at_depth(6, 64, 24);
+        if (overfilled_ratio <= 1.0 || overfilled_ratio > 1.005) {
+            failure = "overfilled queue ratio should stay within drift-scale fast clamp";
+            return false;
+        }
+
+        ParticipantData gap_wait_participant;
+        gap_wait_participant.last_packet_frame_count.store(480, std::memory_order_relaxed);
+        gap_wait_participant.last_callback_frame_count.store(240, std::memory_order_relaxed);
+        gap_wait_participant.jitter_buffer_min_packets.store(6, std::memory_order_relaxed);
+        gap_wait_participant.opus_queue_limit_packets.store(64, std::memory_order_relaxed);
+        const size_t default_gap_wait =
+            opus_gap_wait_dequeue_attempts(gap_wait_participant);
+        gap_wait_participant.opus_queue_limit_packets.store(128, std::memory_order_relaxed);
+        const size_t deep_queue_gap_wait =
+            opus_gap_wait_dequeue_attempts(gap_wait_participant);
+        if (default_gap_wait != 2 || deep_queue_gap_wait != default_gap_wait) {
+            failure = "gap wait should be one packet interval and independent of queue limit";
+            return false;
+        }
+
+        gap_wait_participant.last_packet_frame_count.store(960, std::memory_order_relaxed);
+        const size_t stable_packet_gap_wait =
+            opus_gap_wait_dequeue_attempts(gap_wait_participant);
+        if (stable_packet_gap_wait != 4) {
+            failure = "gap wait should scale to one packet interval for larger packets";
             return false;
         }
 
@@ -3091,24 +3589,32 @@ private:
 
         AudioPathStatsHdr stats{};
         std::memcpy(&stats, recv_data, sizeof(AudioPathStatsHdr));
+        const uint32_t interval_unrecovered_gaps =
+            stats.interval_unrecovered_sequence_gaps;
         audio_path_interval_received_.store(stats.interval_received,
                                             std::memory_order_relaxed);
-        audio_path_interval_gaps_.store(stats.interval_sequence_gaps,
+        audio_path_interval_sequence_gaps_.store(stats.interval_sequence_gaps,
+                                                std::memory_order_relaxed);
+        audio_path_interval_gaps_.store(interval_unrecovered_gaps,
                                         std::memory_order_relaxed);
         const double gap_rate_percent =
-            audio_path_feedback_gap_rate(stats.interval_received,
-                                         stats.interval_sequence_gaps) *
+            audio_path_feedback_net_gap_rate(stats.interval_received,
+                                             stats.interval_sequence_gaps,
+                                             interval_unrecovered_gaps) *
             100.0;
-        if (stats.interval_sequence_gaps == 0) {
+        if (stats.interval_sequence_gaps == 0 && interval_unrecovered_gaps == 0) {
             return;
         }
 
         Log::warn(
             "Server reports sender audio ingress loss: received={} seq_gap={} "
-            "gap_rate={:.1f}% observed_packet={} total_received={} total_gap={}; "
+            "net_gap={} net_gap_rate={:.1f}% observed_packet={} total_received={} "
+            "total_gap={} total_net_gap={}; "
             "manual mode keeps current Opus packet at {} frames",
-            stats.interval_received, stats.interval_sequence_gaps, gap_rate_percent,
-            stats.observed_frame_count, stats.total_received, stats.total_sequence_gaps,
+            stats.interval_received, stats.interval_sequence_gaps,
+            interval_unrecovered_gaps, gap_rate_percent, stats.observed_frame_count,
+            stats.total_received, stats.total_sequence_gaps,
+            stats.total_unrecovered_sequence_gaps,
             get_opus_network_frame_count());
     }
 
@@ -3222,7 +3728,8 @@ private:
         // Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
     }
 
-    void handle_audio_message(std::size_t bytes, const char* recv_data) {
+    void handle_audio_message(std::size_t bytes, const char* recv_data,
+                              bool count_duplicate_late = true) {
         MsgHdr msg_hdr{};
         std::memcpy(&msg_hdr, recv_data, sizeof(MsgHdr));
         if (msg_hdr.magic == AUDIO_REDUNDANT_MAGIC) {
@@ -3349,7 +3856,8 @@ private:
                     participant.sequence_unresolved_gaps.store(
                         participant.sequence_tracker.unresolved_gaps(),
                         std::memory_order_relaxed);
-                    if (sequence_delta.late_or_duplicate) {
+                    if (sequence_delta.late_or_duplicate &&
+                        (count_duplicate_late || sequence_delta.gaps_recovered > 0)) {
                         participant.sequence_late_or_reordered.fetch_add(
                             1, std::memory_order_relaxed);
                     }
@@ -3421,8 +3929,9 @@ private:
 
         audio_packet::for_each_redundant_audio_child_reverse(
             packet_bytes, bytes,
-            [&](const unsigned char* child, size_t child_len, uint8_t) {
-                handle_audio_message(child_len, reinterpret_cast<const char*>(child));
+            [&](const unsigned char* child, size_t child_len, uint8_t index) {
+                handle_audio_message(child_len, reinterpret_cast<const char*>(child),
+                                     index == 0);
             });
     }
 
@@ -3777,7 +4286,7 @@ private:
 
             OpusPacket opus_packet;
             const size_t playout_gap_wait_packets =
-                opus_playout_target_queue_packets(participant);
+                opus_gap_wait_dequeue_attempts(participant);
             auto dequeue_status =
                 participant.opus_queue.dequeue(opus_packet, playout_gap_wait_packets);
 
@@ -3792,9 +4301,7 @@ private:
                         .count();
 
                 while (packet_age_ns > max_packet_age_ns) {
-                    participant.jitter_age_drops.fetch_add(1, std::memory_order_relaxed);
-                    participant.opus_age_limit_drops.fetch_add(1, std::memory_order_relaxed);
-                    observe_auto_jitter_instability(participant);
+                    observe_opus_age_limit_drop(participant);
                     dequeue_status =
                         participant.opus_queue.dequeue(opus_packet, playout_gap_wait_packets);
                     if (dequeue_status != ParticipantOpusDequeueStatus::Packet) {
@@ -4378,10 +4885,12 @@ private:
         AudioStream::AudioConfig::DEFAULT_FRAMES_PER_BUFFER};
     std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
     std::atomic<uint16_t>    opus_network_frame_count_{opus_network_clock::DEFAULT_FRAME_COUNT};
-    std::atomic<size_t>      opus_jitter_buffer_packets_{DEFAULT_OPUS_JITTER_PACKETS};
+    std::atomic<int>         opus_jitter_buffer_ms_{DEFAULT_OPUS_JITTER_MS};
     std::atomic<size_t>      opus_queue_limit_packets_{DEFAULT_OPUS_QUEUE_LIMIT_PACKETS};
     std::atomic<int>         jitter_packet_age_limit_ms_{DEFAULT_JITTER_PACKET_AGE_MS};
     std::atomic<bool>        opus_auto_jitter_default_{true};
+    std::atomic<int>         opus_redundancy_depth_packets_{
+        DEFAULT_OPUS_REDUNDANCY_DEPTH_PACKETS};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
     moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
@@ -4487,6 +4996,7 @@ private:
     std::atomic<uint32_t> ping_path_total_missing_{0};
     std::atomic<uint32_t> ping_path_consecutive_missing_{0};
     std::atomic<uint32_t> audio_path_interval_received_{0};
+    std::atomic<uint32_t> audio_path_interval_sequence_gaps_{0};
     std::atomic<uint32_t> audio_path_interval_gaps_{0};
     std::atomic<int64_t>  next_udp_path_rebind_allowed_ns_{0};
     std::atomic<bool>     udp_path_rebind_pending_{false};
@@ -4642,14 +5152,14 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Jitter floor:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        int jitter_packets = static_cast<int>(client.get_opus_jitter_buffer_packets());
+        int jitter_ms = client.get_opus_jitter_buffer_ms();
         const bool jitter_enabled = client.get_audio_codec() == AudioCodec::Opus;
         if (!jitter_enabled) {
             ImGui::BeginDisabled();
         }
         ImGui::PushItemWidth(width - PADDING);
-        if (ImGui::InputInt("##OpusJitterPackets", &jitter_packets, 1, 1)) {
-            client.set_opus_jitter_buffer_packets(static_cast<size_t>(std::max(jitter_packets, 0)));
+        if (ImGui::InputInt("##OpusJitterMs", &jitter_ms, 5, 10)) {
+            client.set_opus_jitter_buffer_ms(std::max(jitter_ms, 0));
             if (client.get_opus_queue_limit_packets() <
                 client.get_opus_jitter_buffer_packets()) {
                 client.set_opus_queue_limit_packets(client.get_opus_jitter_buffer_packets());
@@ -4662,12 +5172,14 @@ static void draw_master_strip(Client& client, float available_height) {
         const double packet_ms = client.get_opus_network_packet_ms();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         if (client.get_opus_auto_jitter_default()) {
-            ImGui::Text("%zu pkt floor, %zu start",
+            ImGui::Text("%d ms (%zu pkt) floor, %d ms (%zu pkt) start",
+                        client.get_opus_jitter_buffer_ms(),
                         client.get_opus_jitter_buffer_packets(),
+                        client.get_opus_auto_start_jitter_ms(),
                         client.get_opus_auto_start_jitter_packets());
         } else {
-            ImGui::Text("%zu pkt, %.1f ms", client.get_opus_jitter_buffer_packets(),
-                        client.get_opus_jitter_buffer_packets() * packet_ms);
+            ImGui::Text("%d ms (%zu pkt)", client.get_opus_jitter_buffer_ms(),
+                        client.get_opus_jitter_buffer_packets());
         }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         bool auto_jitter_default = client.get_opus_auto_jitter_default();
@@ -4720,6 +5232,49 @@ static void draw_master_strip(Client& client, float available_height) {
         }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%d ms max", client.get_jitter_packet_age_limit_ms());
+
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("Redundancy:");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        int redundancy_depth = client.get_opus_redundancy_depth_setting();
+        char redundancy_preview[32];
+        if (redundancy_depth == OPUS_REDUNDANCY_DEPTH_AUTO) {
+            std::snprintf(redundancy_preview, sizeof(redundancy_preview), "Auto (%d)",
+                          client.get_effective_opus_redundancy_depth());
+        } else if (redundancy_depth == 0) {
+            std::snprintf(redundancy_preview, sizeof(redundancy_preview), "Off");
+        } else {
+            std::snprintf(redundancy_preview, sizeof(redundancy_preview), "%d prev",
+                          redundancy_depth);
+        }
+        if (!jitter_enabled) {
+            ImGui::BeginDisabled();
+        }
+        ImGui::PushItemWidth(width - PADDING);
+        if (ImGui::BeginCombo("##OpusRedundancyDepth", redundancy_preview)) {
+            if (ImGui::Selectable("Auto", redundancy_depth == OPUS_REDUNDANCY_DEPTH_AUTO)) {
+                client.set_opus_redundancy_depth(OPUS_REDUNDANCY_DEPTH_AUTO);
+            }
+            if (ImGui::Selectable("Off", redundancy_depth == 0)) {
+                client.set_opus_redundancy_depth(0);
+            }
+            for (int depth = 1; depth <= MAX_OPUS_REDUNDANCY_DEPTH_PACKETS; ++depth) {
+                char label[32];
+                std::snprintf(label, sizeof(label), "%d previous", depth);
+                if (ImGui::Selectable(label, redundancy_depth == depth)) {
+                    client.set_opus_redundancy_depth(depth);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopItemWidth();
+        if (!jitter_enabled) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        ImGui::Text("%d prev effective", client.get_effective_opus_redundancy_depth());
+        JamGui::ShowTooltipOnHover("Previous Opus packets carried in each UDP datagram");
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -4891,7 +5446,8 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Text("Cb: %.2f/%.2f ms", callback_timing.avg_ms, callback_timing.deadline_ms);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Max: %.2f ms", callback_timing.max_ms);
-        if (device_info.output_api == "WASAPI" && !latency.backend_latency_available) {
+        if (device_info.output_api.find("Windows Audio") != std::string::npos &&
+            !latency.backend_latency_available) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::TextColored(ImVec4(1.0F, 0.6F, 0.2F, 1.0F), "Backend latency unknown");
         }
@@ -5176,11 +5732,13 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
             }
             JamGui::ShowTooltipOnHover("Automatically raise this participant's jitter on instability");
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-            int participant_jitter = static_cast<int>(p.jitter_buffer_min_packets);
+            int participant_jitter_ms = static_cast<int>(std::lround(
+                static_cast<double>(p.jitter_buffer_min_packets) *
+                client.get_opus_network_packet_ms()));
             ImGui::PushItemWidth(width - 42.0F);
-            if (ImGui::InputInt("##ParticipantJitterPackets", &participant_jitter, 1, 1)) {
-                client.set_participant_opus_jitter_buffer_packets(
-                    p.id, static_cast<size_t>(std::max(participant_jitter, 0)));
+            if (ImGui::InputInt("##ParticipantJitterMs", &participant_jitter_ms, 5, 10)) {
+                client.set_participant_opus_jitter_buffer_ms(
+                    p.id, std::max(participant_jitter_ms, 0));
             }
             ImGui::PopItemWidth();
             ImGui::SameLine();
@@ -5193,8 +5751,10 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                     ? (static_cast<double>(p.last_packet_frame_count) * 1000.0 / 48000.0)
                     : 0.0;
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-            ImGui::Text("%zu pkt, %.1f ms", p.jitter_buffer_min_packets,
-                        static_cast<double>(p.jitter_buffer_min_packets) * packet_ms);
+            ImGui::Text("%d ms (%zu pkt)",
+                        static_cast<int>(std::lround(
+                            static_cast<double>(p.jitter_buffer_min_packets) * packet_ms)),
+                        p.jitter_buffer_min_packets);
             if (p.opus_jitter_auto_enabled ||
                 p.opus_jitter_auto_increases > 0 ||
                 p.opus_jitter_auto_decreases > 0) {
@@ -5775,8 +6335,10 @@ struct ClientStartupOptions {
     std::string startup_latency_profile = "adaptive";
     std::optional<int> startup_opus_packet_frames;
     std::optional<int> startup_jitter_packets;
+    std::optional<int> startup_jitter_ms;
     std::optional<int> startup_queue_limit_packets;
     std::optional<int> startup_age_limit_ms;
+    std::optional<int> startup_redundancy_depth_packets;
     bool startup_auto_jitter = false;
     bool startup_disable_auto_jitter = false;
     bool list_audio_devices = false;
@@ -5786,6 +6348,8 @@ struct ClientStartupOptions {
     bool udp_endpoint_guard_smoke = false;
     bool auto_jitter_empty_playout_smoke = false;
     bool audio_path_feedback_smoke = false;
+    bool opus_playout_policy_smoke = false;
+    bool opus_redundancy_policy_smoke = false;
     int baseline_snapshot_seconds = 0;
     int baseline_snapshot_interval_seconds = 5;
     std::string baseline_snapshot_label = "manual";
@@ -5804,6 +6368,19 @@ bool bind_udp_socket_in_range(udp::socket& socket, uint16_t first_port,
 bool receive_ctrl_command(udp::socket& socket, CtrlHdr::Cmd expected_cmd,
                           std::chrono::milliseconds timeout);
 int run_udp_send_endpoint_snapshot_smoke(const ClientStartupOptions& startup_options);
+
+int parse_opus_redundancy_depth_option(const std::string& value) {
+    std::string normalized = value;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized == "auto") {
+        return OPUS_REDUNDANCY_DEPTH_AUTO;
+    }
+    if (normalized == "off" || normalized == "none" || normalized == "disabled") {
+        return 0;
+    }
+    return Client::normalize_opus_redundancy_depth(std::stoi(value));
+}
 
 ClientStartupOptions parse_startup_options(int argc, char** argv) {
     ClientStartupOptions options;
@@ -5842,11 +6419,17 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.startup_opus_packet_frames = std::stoi(argv[++i]);
         } else if ((arg == "--jitter" || arg == "--opus-jitter") && i + 1 < argc) {
             options.startup_jitter_packets = std::stoi(argv[++i]);
+        } else if ((arg == "--jitter-ms" || arg == "--opus-jitter-ms") && i + 1 < argc) {
+            options.startup_jitter_ms = std::stoi(argv[++i]);
         } else if ((arg == "--queue-limit" || arg == "--opus-queue-limit") && i + 1 < argc) {
             options.startup_queue_limit_packets = std::stoi(argv[++i]);
         } else if ((arg == "--age-limit-ms" || arg == "--jitter-age-limit-ms") &&
                    i + 1 < argc) {
             options.startup_age_limit_ms = std::stoi(argv[++i]);
+        } else if ((arg == "--redundancy-depth" || arg == "--opus-redundancy-depth") &&
+                   i + 1 < argc) {
+            options.startup_redundancy_depth_packets =
+                parse_opus_redundancy_depth_option(argv[++i]);
         } else if (arg == "--auto-jitter") {
             options.startup_auto_jitter = true;
         } else if (arg == "--no-auto-jitter") {
@@ -5863,6 +6446,10 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.auto_jitter_empty_playout_smoke = true;
         } else if (arg == "--audio-path-feedback-smoke") {
             options.audio_path_feedback_smoke = true;
+        } else if (arg == "--opus-playout-policy-smoke") {
+            options.opus_playout_policy_smoke = true;
+        } else if (arg == "--opus-redundancy-policy-smoke") {
+            options.opus_redundancy_policy_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
         } else if (arg == "--baseline-snapshot-seconds" && i + 1 < argc) {
@@ -5910,15 +6497,15 @@ bool apply_startup_latency_profile(Client& client,
         return false;
     }
 
-    const int jitter_packets =
-        low_profile ? 3
-                    : stable_profile ? 8 : static_cast<int>(DEFAULT_OPUS_JITTER_PACKETS);
+    const int jitter_ms =
+        low_profile ? 10
+                    : stable_profile ? 80 : DEFAULT_OPUS_JITTER_MS;
     const int queue_limit_packets =
         low_profile ? 24
                     : stable_profile ? 96
                                      : static_cast<int>(DEFAULT_OPUS_QUEUE_LIMIT_PACKETS);
     const int age_limit_ms =
-        low_profile ? 120 : stable_profile ? 250 : DEFAULT_JITTER_PACKET_AGE_MS;
+        low_profile ? 60 : stable_profile ? 250 : DEFAULT_JITTER_PACKET_AGE_MS;
     const bool auto_jitter = false;
     const int opus_packet_frames =
         low_profile      ? opus_network_clock::LOW_LATENCY_FRAME_COUNT
@@ -5931,8 +6518,9 @@ bool apply_startup_latency_profile(Client& client,
     if (!startup_options.startup_opus_packet_frames.has_value()) {
         client.set_opus_network_frame_count(opus_packet_frames);
     }
-    if (!startup_options.startup_jitter_packets.has_value()) {
-        client.set_opus_jitter_buffer_packets(jitter_packets);
+    if (!startup_options.startup_jitter_packets.has_value() &&
+        !startup_options.startup_jitter_ms.has_value()) {
+        client.set_opus_jitter_buffer_ms(jitter_ms);
     }
     if (!startup_options.startup_queue_limit_packets.has_value()) {
         client.set_opus_queue_limit_packets(queue_limit_packets);
@@ -6325,6 +6913,14 @@ int main(int argc, char** argv) {
         }
         Log::info("Runtime: role=client platform={} arch={}", runtime_platform_name(),
                   runtime_arch_name());
+        if (startup_options.startup_jitter_packets.has_value() &&
+            startup_options.startup_jitter_ms.has_value()) {
+            Log::error(
+                "Cannot combine packet jitter override (--jitter/--opus-jitter) with "
+                "millisecond jitter override (--jitter-ms/--opus-jitter-ms)");
+            log.flush();
+            return 2;
+        }
 
         if (startup_options.list_audio_devices) {
             print_audio_backend_inventory();
@@ -6381,6 +6977,28 @@ int main(int argc, char** argv) {
             log.flush();
             return 0;
         }
+        if (startup_options.opus_playout_policy_smoke) {
+            std::string failure;
+            if (!Client::run_opus_playout_policy_smoke(failure)) {
+                Log::error("Opus playout policy smoke failed: {}", failure);
+                log.flush();
+                return 2;
+            }
+            Log::info("Opus playout policy smoke passed");
+            log.flush();
+            return 0;
+        }
+        if (startup_options.opus_redundancy_policy_smoke) {
+            std::string failure;
+            if (!Client::run_opus_redundancy_policy_smoke(failure)) {
+                Log::error("Opus redundancy policy smoke failed: {}", failure);
+                log.flush();
+                return 2;
+            }
+            Log::info("Opus redundancy policy smoke passed");
+            log.flush();
+            return 0;
+        }
 
         asio::io_context io_context;
         const auto audio_preferences_path =
@@ -6416,6 +7034,18 @@ int main(int argc, char** argv) {
             Log::info("Startup codec override: {}",
                       *startup_options.startup_codec == AudioCodec::Opus ? "Opus" : "PCM");
         }
+        if (startup_options.startup_opus_packet_frames.has_value()) {
+            client_instance.set_opus_network_frame_count(
+                *startup_options.startup_opus_packet_frames);
+            Log::info("Startup Opus packet override: {} frames",
+                      *startup_options.startup_opus_packet_frames);
+        }
+        if (startup_options.startup_jitter_ms.has_value()) {
+            client_instance.set_opus_jitter_buffer_ms(
+                std::max(*startup_options.startup_jitter_ms, 0));
+            Log::info("Startup Opus jitter override: {} ms",
+                      *startup_options.startup_jitter_ms);
+        }
         if (startup_options.startup_jitter_packets.has_value()) {
             client_instance.set_opus_jitter_buffer_packets(
                 static_cast<size_t>(std::max(*startup_options.startup_jitter_packets, 0)));
@@ -6428,16 +7058,18 @@ int main(int argc, char** argv) {
             Log::info("Startup Opus queue limit override: {} packets",
                       *startup_options.startup_queue_limit_packets);
         }
+        if (startup_options.startup_redundancy_depth_packets.has_value()) {
+            client_instance.set_opus_redundancy_depth(
+                *startup_options.startup_redundancy_depth_packets);
+            const int depth = client_instance.get_opus_redundancy_depth_setting();
+            Log::info("Startup Opus redundancy depth override: {}",
+                      depth == OPUS_REDUNDANCY_DEPTH_AUTO ? "auto"
+                                                          : std::to_string(depth));
+        }
         if (startup_options.startup_age_limit_ms.has_value()) {
             client_instance.set_jitter_packet_age_limit_ms(*startup_options.startup_age_limit_ms);
             Log::info("Startup packet age limit override: {} ms",
                       *startup_options.startup_age_limit_ms);
-        }
-        if (startup_options.startup_opus_packet_frames.has_value()) {
-            client_instance.set_opus_network_frame_count(
-                *startup_options.startup_opus_packet_frames);
-            Log::info("Startup Opus packet override: {} frames",
-                      *startup_options.startup_opus_packet_frames);
         }
         if (startup_options.startup_disable_auto_jitter) {
             client_instance.set_opus_auto_jitter_default(false);
@@ -6449,18 +7081,25 @@ int main(int argc, char** argv) {
         if (startup_options.startup_config_smoke) {
             Log::info(
                 "Startup config smoke: codec={} frames={} opus_packet={} jitter_floor={} "
-                "auto_start_jitter={} queue_limit={} age_limit_ms={} auto_jitter={} "
+                "jitter_ms={} auto_start_jitter={} queue_limit={} age_limit_ms={} auto_jitter={} "
+                "redundancy_depth={} effective_redundancy_depth={} "
                 "broadcast_ipc_port={} app_version={}",
                 client_instance.get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
                 client_instance.get_audio_config().frames_per_buffer,
                 client_instance.get_opus_network_frame_count(),
                 client_instance.get_opus_jitter_buffer_packets(),
+                client_instance.get_opus_jitter_buffer_ms(),
                 client_instance.get_opus_auto_jitter_default()
                     ? std::to_string(client_instance.get_opus_auto_start_jitter_packets())
                     : "disabled",
                 client_instance.get_opus_queue_limit_packets(),
                 client_instance.get_jitter_packet_age_limit_ms(),
                 client_instance.get_opus_auto_jitter_default() ? "true" : "false",
+                client_instance.get_opus_redundancy_depth_setting() ==
+                        OPUS_REDUNDANCY_DEPTH_AUTO
+                    ? "auto"
+                    : std::to_string(client_instance.get_opus_redundancy_depth_setting()),
+                client_instance.get_effective_opus_redundancy_depth(),
                 startup_options.broadcast_ipc_port.has_value()
                     ? std::to_string(*startup_options.broadcast_ipc_port)
                     : "disabled",

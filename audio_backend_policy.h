@@ -20,8 +20,15 @@ inline int rank_api_for_platform(Platform platform, const std::string& api_name)
         if (api_name == "ASIO") {
             return 0;
         }
-        if (api_name.find("WASAPI") != std::string::npos) {
+        if (api_name == "Windows Audio (Low Latency Mode)") {
             return 1;
+        }
+        if (api_name == "Windows Audio (Exclusive Mode)") {
+            return 2;
+        }
+        if (api_name == "Windows Audio" ||
+            api_name.find("WASAPI") != std::string::npos) {
+            return 3;
         }
         return 100;
     case Platform::macos:

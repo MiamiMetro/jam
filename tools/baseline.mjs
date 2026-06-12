@@ -16,8 +16,8 @@ const DEV = {
   codec: "opus",
   frames: "120",
   ttlMs: 10 * 60 * 1000,
-  serverExe: "build/Debug/server.exe",
-  clientExe: "build/Debug/client.exe",
+  serverExe: process.env.JAM_SERVER_EXE ?? "build/Debug/server.exe",
+  clientExe: process.env.JAM_CLIENT_EXE ?? "build/Debug/client.exe",
   clients: {
     a: { room: "room-a", user: "user-a1", displayName: "User A1" },
     b: { room: "room-a", user: "user-a2", displayName: "User A2" },

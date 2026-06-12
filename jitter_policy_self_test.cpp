@@ -48,6 +48,54 @@ void test_auto_start_jitter_respects_higher_configured_floor() {
             "auto-start jitter should still be clamped to the user-facing maximum");
 }
 
+void test_jitter_ms_converts_to_packets_for_supported_frame_sizes() {
+    require(opus_jitter_packets_for_ms(DEFAULT_OPUS_JITTER_MS,
+                                       opus_network_clock::SAMPLE_RATE,
+                                       opus_network_clock::LOW_LATENCY_FRAME_COUNT) == 8,
+            "20 ms jitter should be 8 packets at 2.5 ms");
+    require(opus_jitter_packets_for_ms(DEFAULT_OPUS_JITTER_MS,
+                                       opus_network_clock::SAMPLE_RATE,
+                                       opus_network_clock::FAST_FRAME_COUNT) == 4,
+            "20 ms jitter should be 4 packets at 5 ms");
+    require(opus_jitter_packets_for_ms(DEFAULT_OPUS_JITTER_MS,
+                                       opus_network_clock::SAMPLE_RATE,
+                                       opus_network_clock::BALANCED_FRAME_COUNT) == 2,
+            "20 ms jitter should be 2 packets at 10 ms");
+    require(opus_jitter_packets_for_ms(DEFAULT_OPUS_JITTER_MS,
+                                       opus_network_clock::SAMPLE_RATE,
+                                       opus_network_clock::STABLE_FRAME_COUNT) == 1,
+            "20 ms jitter should be 1 packet at 20 ms");
+}
+
+void test_jitter_age_limit_uses_floor_packet_count() {
+    require(opus_jitter_packets_within_ms(85, opus_network_clock::SAMPLE_RATE,
+                                          opus_network_clock::BALANCED_FRAME_COUNT) == 8,
+            "85 ms age limit should allow only 8 complete 10 ms packets");
+    require(opus_jitter_packets_within_ms(85, opus_network_clock::SAMPLE_RATE,
+                                          opus_network_clock::STABLE_FRAME_COUNT) == 4,
+            "85 ms age limit should allow only 4 complete 20 ms packets");
+}
+
+void test_auto_start_jitter_ms_converts_to_packets_for_stable_frames() {
+    require(opus_auto_start_jitter_packets_for_audio(
+                DEFAULT_OPUS_JITTER_PACKETS, opus_network_clock::SAMPLE_RATE,
+                opus_network_clock::BALANCED_FRAME_COUNT) == 4,
+            "40 ms auto-start should be 4 packets at 10 ms");
+    require(opus_auto_start_jitter_packets_for_audio(
+                1, opus_network_clock::SAMPLE_RATE,
+                opus_network_clock::STABLE_FRAME_COUNT) == 2,
+            "40 ms auto-start should be 2 packets at 20 ms");
+}
+
+void test_jitter_packet_count_round_trips_to_effective_ms() {
+    require(opus_jitter_ms_for_packets(2, opus_network_clock::SAMPLE_RATE,
+                                       opus_network_clock::BALANCED_FRAME_COUNT) == 20,
+            "2 balanced packets should be 20 ms");
+    require(opus_jitter_ms_for_packets(2, opus_network_clock::SAMPLE_RATE,
+                                       opus_network_clock::STABLE_FRAME_COUNT) == 40,
+            "2 stable packets should be 40 ms");
+}
+
 void test_auto_start_target_does_not_snap_to_floor_before_ready() {
     require(!jitter_target_should_snap_to_floor(
                 AudioCodec::Opus, false, true, false,
@@ -89,6 +137,10 @@ int main() {
     test_configured_opus_jitter_is_clamped();
     test_auto_start_jitter_uses_larger_startup_cushion();
     test_auto_start_jitter_respects_higher_configured_floor();
+    test_jitter_ms_converts_to_packets_for_supported_frame_sizes();
+    test_jitter_age_limit_uses_floor_packet_count();
+    test_auto_start_jitter_ms_converts_to_packets_for_stable_frames();
+    test_jitter_packet_count_round_trips_to_effective_ms();
     test_auto_start_target_does_not_snap_to_floor_before_ready();
     test_non_auto_target_snaps_to_floor_before_ready();
     test_target_raises_when_floor_increases();
