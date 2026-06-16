@@ -11,6 +11,13 @@ include(FetchContent)
 option(JAM_BUILD_CLIENT "Build the desktop GUI client" ON)
 option(JAM_BUILD_TESTS "Build and register jam self-tests" ON)
 
+# Release binaries are bundled inside Electron and must not depend on
+# build-machine dylib paths.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build dependencies as static libraries" FORCE)
+set(GLFW_LIBRARY_TYPE STATIC CACHE STRING "Build GLFW as a static library" FORCE)
+set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "Build spdlog as a static library" FORCE)
+set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "Build opus as a static library" FORCE)
+
 include(cmake/server.cmake)
 
 if(JAM_BUILD_CLIENT)
