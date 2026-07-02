@@ -16,7 +16,7 @@ Detailed plans:
 
 - Release build passes; full test suite passes 32/32 (verified 2026-07-02).
 - Receive-side jitter/playout policy is in good shape and regression-tested.
-- Top remaining risk: real-time safety of the audio callback.
+- Top remaining risk: Phase 2 callback access to `ParticipantManager::mutex_`.
 - CI exists and is green for the Phase 0+1 PR.
 
 ## Phase 0: CI (do this first)
