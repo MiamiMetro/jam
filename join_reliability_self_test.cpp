@@ -47,6 +47,9 @@ int main() {
     require(state.participant_id() == 43, "extended join ack should update participant id");
     require(state.server_supports(AUDIO_CAP_REDUNDANCY),
             "extended join ack should store server capabilities");
+    state.mark_join_ack(43, AUDIO_SUPPORTED_CAPABILITIES);
+    require(state.server_supports(AUDIO_CAP_CAPTURE_TIMESTAMP),
+            "join state should report capture timestamp capability");
 
     state.mark_join_required();
     require(!state.is_join_confirmed(), "join required should clear confirmation");

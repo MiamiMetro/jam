@@ -390,6 +390,14 @@ private:
             data.packet_age_avg_ns.load(std::memory_order_relaxed) / 1e6;
         info.packet_age_max_ms =
             data.packet_age_max_ns.load(std::memory_order_relaxed) / 1e6;
+        info.capture_to_playout_latency_last_ms =
+            data.capture_to_playout_latency_last_ns.load(std::memory_order_relaxed) / 1e6;
+        info.capture_to_playout_latency_avg_ms =
+            data.capture_to_playout_latency_avg_ns.load(std::memory_order_relaxed) / 1e6;
+        info.capture_to_playout_latency_max_ms =
+            data.capture_to_playout_latency_max_ns.load(std::memory_order_relaxed) / 1e6;
+        info.capture_to_playout_latency_samples =
+            data.capture_to_playout_latency_samples.load(std::memory_order_relaxed);
         info.sequence_gaps = data.sequence_gaps.load(std::memory_order_relaxed);
         info.sequence_gap_recoveries =
             data.sequence_gap_recoveries.load(std::memory_order_relaxed);

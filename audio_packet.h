@@ -17,8 +17,78 @@ inline constexpr size_t v2_header_size() {
     return sizeof(AudioHdrV2) - AUDIO_BUF_SIZE;
 }
 
+inline constexpr size_t v3_header_size() {
+    return sizeof(AudioHdrV3) - AUDIO_BUF_SIZE;
+}
+
 inline constexpr size_t redundant_header_size() {
     return sizeof(AudioRedundantHdr);
+}
+
+struct ParsedAudioHeader {
+    bool valid = false;
+    uint32_t magic = 0;
+    uint32_t sender_id = 0;
+    uint32_t sequence = 0;
+    uint32_t sample_rate = 0;
+    uint16_t frame_count = 0;
+    uint16_t payload_bytes = 0;
+    uint8_t channels = 0;
+    AudioCodec codec = AudioCodec::Opus;
+    bool capture_timestamp_valid = false;
+    int64_t capture_server_time_ns = 0;
+    size_t header_size = 0;
+};
+
+inline ParsedAudioHeader parse_audio_header(const unsigned char* data, size_t len) {
+    ParsedAudioHeader parsed{};
+    if (data == nullptr || len < sizeof(MsgHdr)) {
+        return parsed;
+    }
+
+    MsgHdr msg{};
+    std::memcpy(&msg, data, sizeof(MsgHdr));
+    if (msg.magic == AUDIO_V2_MAGIC) {
+        if (len < v2_header_size()) {
+            return parsed;
+        }
+        AudioHdrV2 hdr{};
+        std::memcpy(&hdr, data, v2_header_size());
+        parsed.valid = true;
+        parsed.magic = hdr.magic;
+        parsed.sender_id = hdr.sender_id;
+        parsed.sequence = hdr.sequence;
+        parsed.sample_rate = hdr.sample_rate;
+        parsed.frame_count = hdr.frame_count;
+        parsed.payload_bytes = hdr.payload_bytes;
+        parsed.channels = hdr.channels;
+        parsed.codec = hdr.codec;
+        parsed.header_size = v2_header_size();
+        return parsed;
+    }
+
+    if (msg.magic == AUDIO_V3_MAGIC) {
+        if (len < v3_header_size()) {
+            return parsed;
+        }
+        AudioHdrV3 hdr{};
+        std::memcpy(&hdr, data, v3_header_size());
+        parsed.valid = true;
+        parsed.magic = hdr.magic;
+        parsed.sender_id = hdr.sender_id;
+        parsed.sequence = hdr.sequence;
+        parsed.sample_rate = hdr.sample_rate;
+        parsed.frame_count = hdr.frame_count;
+        parsed.payload_bytes = hdr.payload_bytes;
+        parsed.channels = hdr.channels;
+        parsed.codec = hdr.codec;
+        parsed.capture_timestamp_valid = hdr.capture_server_time_ns > 0;
+        parsed.capture_server_time_ns = hdr.capture_server_time_ns;
+        parsed.header_size = v3_header_size();
+        return parsed;
+    }
+
+    return parsed;
 }
 
 inline bool validate_audio_packet_v2_shape(const AudioHdrV2& hdr,
@@ -65,6 +135,51 @@ inline bool validate_audio_packet_v2_shape(const AudioHdrV2& hdr,
     return false;
 }
 
+inline bool validate_audio_packet_shape(const ParsedAudioHeader& hdr,
+                                        std::string* reason = nullptr) {
+    AudioHdrV2 v2{};
+    v2.magic = AUDIO_V2_MAGIC;
+    v2.sender_id = hdr.sender_id;
+    v2.sequence = hdr.sequence;
+    v2.sample_rate = hdr.sample_rate;
+    v2.frame_count = hdr.frame_count;
+    v2.payload_bytes = hdr.payload_bytes;
+    v2.channels = hdr.channels;
+    v2.codec = hdr.codec;
+    return validate_audio_packet_v2_shape(v2, reason);
+}
+
+inline bool validate_audio_packet_bytes(const unsigned char* data, size_t len,
+                                        std::string* reason = nullptr) {
+    const auto hdr = parse_audio_header(data, len);
+    if (!hdr.valid) {
+        if (reason != nullptr) {
+            *reason = "short header";
+        }
+        return false;
+    }
+    if (hdr.payload_bytes > AUDIO_BUF_SIZE) {
+        if (reason != nullptr) {
+            *reason = "payload too large";
+        }
+        return false;
+    }
+
+    const size_t expected = hdr.header_size + hdr.payload_bytes;
+    if (len != expected) {
+        if (reason != nullptr) {
+            *reason = "length mismatch";
+        }
+        return false;
+    }
+    return validate_audio_packet_shape(hdr, reason);
+}
+
+inline const unsigned char* audio_payload(const unsigned char* data, size_t len) {
+    const auto hdr = parse_audio_header(data, len);
+    return hdr.valid ? data + hdr.header_size : nullptr;
+}
+
 inline bool validate_audio_packet_v2_bytes(const unsigned char* data, size_t len,
                                            std::string* reason = nullptr) {
     if (data == nullptr) {
@@ -108,7 +223,7 @@ inline bool validate_audio_packet_v2_bytes(const unsigned char* data, size_t len
 inline bool next_redundant_child(const unsigned char* data, size_t len, size_t& offset,
                                  const unsigned char*& child, size_t& child_len,
                                  std::string* reason = nullptr) {
-    if (offset + v2_header_size() > len) {
+    if (offset + sizeof(MsgHdr) > len) {
         if (reason != nullptr) {
             *reason = "short redundant child header";
         }
@@ -116,11 +231,19 @@ inline bool next_redundant_child(const unsigned char* data, size_t len, size_t& 
     }
 
     child = data + offset;
-    AudioHdrV2 child_hdr{};
-    std::memcpy(&child_hdr, child, v2_header_size());
-    if (child_hdr.magic != AUDIO_V2_MAGIC) {
+    MsgHdr msg{};
+    std::memcpy(&msg, child, sizeof(MsgHdr));
+    if (msg.magic != AUDIO_V2_MAGIC && msg.magic != AUDIO_V3_MAGIC) {
         if (reason != nullptr) {
             *reason = "redundant child wrong magic";
+        }
+        return false;
+    }
+
+    const auto child_hdr = parse_audio_header(child, len - offset);
+    if (!child_hdr.valid) {
+        if (reason != nullptr) {
+            *reason = "short redundant child header";
         }
         return false;
     }
@@ -131,14 +254,14 @@ inline bool next_redundant_child(const unsigned char* data, size_t len, size_t& 
         return false;
     }
 
-    child_len = v2_header_size() + child_hdr.payload_bytes;
+    child_len = child_hdr.header_size + child_hdr.payload_bytes;
     if (offset + child_len > len) {
         if (reason != nullptr) {
             *reason = "truncated redundant child";
         }
         return false;
     }
-    if (!validate_audio_packet_v2_bytes(child, child_len, reason)) {
+    if (!validate_audio_packet_bytes(child, child_len, reason)) {
         return false;
     }
 
@@ -278,7 +401,7 @@ inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet
     selected_packets.reserve(packets.size());
     for (const auto* packet: packets) {
         if (packet == nullptr ||
-            !validate_audio_packet_v2_bytes(packet->data(), packet->size())) {
+            !validate_audio_packet_bytes(packet->data(), packet->size())) {
             return nullptr;
         }
         if (max_packet_bytes > 0 &&
@@ -359,6 +482,51 @@ inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v2(
         std::memcpy(packet->data() + v2_header_size(), payload, payload_bytes);
     }
 
+    return packet;
+}
+
+inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v3(
+    AudioCodec codec, uint32_t sequence, uint32_t sample_rate, uint16_t frame_count,
+    uint8_t channels, const unsigned char* payload, uint16_t payload_bytes,
+    int64_t capture_server_time_ns) {
+    auto packet = std::make_shared<std::vector<unsigned char>>();
+    packet->resize(v3_header_size() + payload_bytes);
+
+    AudioHdrV3 hdr{};
+    hdr.magic = AUDIO_V3_MAGIC;
+    hdr.sender_id = 0;
+    hdr.sequence = sequence;
+    hdr.sample_rate = sample_rate;
+    hdr.frame_count = frame_count;
+    hdr.payload_bytes = payload_bytes;
+    hdr.channels = channels;
+    hdr.codec = codec;
+    hdr.capture_server_time_ns = capture_server_time_ns;
+
+    std::memcpy(packet->data(), &hdr, v3_header_size());
+    if (payload_bytes > 0) {
+        std::memcpy(packet->data() + v3_header_size(), payload, payload_bytes);
+    }
+
+    return packet;
+}
+
+inline std::shared_ptr<std::vector<unsigned char>> strip_audio_v3_timestamp(
+    const unsigned char* data, size_t len) {
+    const auto parsed = parse_audio_header(data, len);
+    if (!parsed.valid || parsed.magic != AUDIO_V3_MAGIC ||
+        len != parsed.header_size + parsed.payload_bytes) {
+        return nullptr;
+    }
+
+    const unsigned char* payload = audio_payload(data, len);
+    auto packet = create_audio_packet_v2(parsed.codec, parsed.sequence, parsed.sample_rate,
+                                         parsed.frame_count, parsed.channels, payload,
+                                         parsed.payload_bytes);
+    AudioHdrV2 hdr{};
+    std::memcpy(&hdr, packet->data(), v2_header_size());
+    hdr.sender_id = parsed.sender_id;
+    std::memcpy(packet->data(), &hdr, v2_header_size());
     return packet;
 }
 

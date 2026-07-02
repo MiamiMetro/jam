@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "audio_packet.h"
 #include "protocol.h"
 
 // Helper utilities for building network packets
@@ -52,26 +53,29 @@ inline void write_fixed(Bytes<N>& target, const std::string& value) {
 }
 
 inline std::shared_ptr<std::vector<unsigned char>> create_participant_info_packet(
-    uint32_t participant_id, const std::string& profile_id, const std::string& display_name) {
-    ParticipantInfoHdr info{};
+    uint32_t participant_id, const std::string& profile_id, const std::string& display_name,
+    uint32_t capabilities = 0) {
+    ParticipantInfoCapsHdr info{};
     info.magic          = CTRL_MAGIC;
     info.type           = CtrlHdr::Cmd::PARTICIPANT_INFO;
     info.participant_id = participant_id;
     write_fixed(info.profile_id, profile_id);
     write_fixed(info.display_name, display_name);
+    info.capabilities = capabilities & AUDIO_SUPPORTED_CAPABILITIES;
 
-    auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(ParticipantInfoHdr));
-    std::memcpy(buf->data(), &info, sizeof(ParticipantInfoHdr));
+    auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(ParticipantInfoCapsHdr));
+    std::memcpy(buf->data(), &info, sizeof(ParticipantInfoCapsHdr));
     return buf;
 }
 
 inline uint16_t extract_v2_payload_bytes(const unsigned char* packet_data) {
-    uint16_t payload_bytes;
-    std::memcpy(&payload_bytes,
-                packet_data + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint32_t) +
-                    sizeof(uint32_t) + sizeof(uint16_t),
-                sizeof(uint16_t));
-    return payload_bytes;
+    const auto parsed = audio_packet::parse_audio_header(packet_data, audio_packet::v3_header_size());
+    return parsed.valid ? parsed.payload_bytes : 0;
+}
+
+inline uint16_t extract_audio_payload_bytes(const unsigned char* packet_data, size_t len) {
+    const auto parsed = audio_packet::parse_audio_header(packet_data, len);
+    return parsed.valid ? parsed.payload_bytes : 0;
 }
 
 inline const unsigned char* audio_v1_payload(const unsigned char* packet_data) {
@@ -79,7 +83,11 @@ inline const unsigned char* audio_v1_payload(const unsigned char* packet_data) {
 }
 
 inline const unsigned char* audio_v2_payload(const unsigned char* packet_data) {
-    return packet_data + sizeof(AudioHdrV2) - AUDIO_BUF_SIZE;
+    return packet_data + audio_packet::v2_header_size();
+}
+
+inline const unsigned char* audio_payload(const unsigned char* packet_data, size_t len) {
+    return audio_packet::audio_payload(packet_data, len);
 }
 
 }  // namespace packet_builder

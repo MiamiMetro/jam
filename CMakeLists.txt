@@ -26,6 +26,9 @@ endif()
 
 add_executable(latency_probe latency_probe.cpp)
 target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog opus token_crypto)
+if(WIN32)
+    target_link_libraries(latency_probe PRIVATE winmm)
+endif()
 
 add_executable(udp_path_probe udp_path_probe.cpp)
 target_link_libraries(udp_path_probe PRIVATE asio token_crypto)
@@ -121,6 +124,10 @@ if(JAM_BUILD_TESTS)
              COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test)
     add_test(NAME server_redundancy_relay_smoke
              COMMAND $<TARGET_FILE:server> --redundancy-relay-smoke)
+    add_test(NAME server_timestamp_relay_smoke
+             COMMAND $<TARGET_FILE:server> --timestamp-relay-smoke)
+    add_test(NAME latency_probe_v3_receive_smoke
+             COMMAND $<TARGET_FILE:latency_probe> --v3-receive-smoke)
     if(NODE_EXECUTABLE)
         add_test(NAME server_audio_path_feedback_smoke
                  COMMAND ${NODE_EXECUTABLE}
@@ -148,6 +155,11 @@ if(JAM_BUILD_TESTS)
                          --allow-loss
                          --max-gap-plc-run 2
                          --min-decoder-resets 1)
+        add_test(NAME e2e_latency_loopback_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/e2e-latency-smoke.mjs
+                         --server-exe $<TARGET_FILE:server>
+                         --probe-exe $<TARGET_FILE:latency_probe>)
     endif()
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
@@ -160,6 +172,10 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --opus-playout-policy-smoke)
         add_test(NAME client_opus_redundancy_policy_smoke
                  COMMAND $<TARGET_FILE:client> --opus-redundancy-policy-smoke)
+        add_test(NAME client_audio_v3_receive_smoke
+                 COMMAND $<TARGET_FILE:client> --audio-v3-receive-smoke)
+        add_test(NAME client_e2e_latency_metric_smoke
+                 COMMAND $<TARGET_FILE:client> --e2e-latency-metric-smoke)
         add_test(NAME client_startup_config_adaptive_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES

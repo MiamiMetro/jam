@@ -10,6 +10,9 @@ const CTRL_JOIN_ACK = 8;
 const CTRL_AUDIO_PATH_STATS = 10;
 const AUDIO_CODEC_OPUS = 1;
 const AUDIO_CAP_REDUNDANCY = 1;
+const AUDIO_CAP_CAPTURE_TIMESTAMP = 2;
+const AUDIO_SUPPORTED_CAPABILITIES =
+  AUDIO_CAP_REDUNDANCY | AUDIO_CAP_CAPTURE_TIMESTAMP;
 const AUDIO_REDUNDANT_MAGIC = 0x41555244;
 const CTRL_HDR_SIZE = 9;
 const JOIN_HDR_SIZE = CTRL_HDR_SIZE + 64 + 64 + 64 + 64 + 512 + 1 + 4;
@@ -125,7 +128,7 @@ function createJoinPacket() {
   offset += 512;
   packet.writeUInt8(1, offset);
   offset += 1;
-  packet.writeUInt32LE(AUDIO_CAP_REDUNDANCY, offset);
+  packet.writeUInt32LE(AUDIO_SUPPORTED_CAPABILITIES, offset);
   return packet;
 }
 

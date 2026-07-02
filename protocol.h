@@ -9,6 +9,7 @@ constexpr uint32_t PING_MAGIC  = 0x50494E47;  // 'PING'
 constexpr uint32_t CTRL_MAGIC  = 0x4354524C;  // 'CTRL'
 constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
 constexpr uint32_t AUDIO_V2_MAGIC = 0x41553249;  // 'AU2I'
+constexpr uint32_t AUDIO_V3_MAGIC = 0x41553349;  // 'AU3I'
 constexpr uint32_t AUDIO_REDUNDANT_MAGIC = 0x41555244;  // 'AURD'
 
 // Buffer sizes
@@ -41,6 +42,9 @@ constexpr int    MAX_OPUS_REDUNDANCY_DEPTH_PACKETS =
 
 // Endpoint capabilities negotiated in extended JOIN/JOIN_ACK packets.
 constexpr uint32_t AUDIO_CAP_REDUNDANCY = 1U << 0;
+constexpr uint32_t AUDIO_CAP_CAPTURE_TIMESTAMP = 1U << 1;
+constexpr uint32_t AUDIO_SUPPORTED_CAPABILITIES =
+    AUDIO_CAP_REDUNDANCY | AUDIO_CAP_CAPTURE_TIMESTAMP;
 
 // Type aliases
 template <size_t N>
@@ -100,6 +104,10 @@ struct ParticipantInfoHdr : CtrlHdr {
     Bytes<64> display_name;
 };
 
+struct ParticipantInfoCapsHdr : ParticipantInfoHdr {
+    uint32_t capabilities = 0;
+};
+
 constexpr uint8_t METRONOME_FLAG_RUNNING = 1 << 0;
 
 struct MetronomeSyncHdr : CtrlHdr {
@@ -130,6 +138,18 @@ struct AudioHdrV2 : MsgHdr {
     uint16_t              payload_bytes;  // Audio payload bytes
     uint8_t               channels;       // Channel count in payload
     AudioCodec            codec;          // Payload codec
+    Bytes<AUDIO_BUF_SIZE> buf;
+};
+
+struct AudioHdrV3 : MsgHdr {
+    uint32_t              sender_id;      // Server-owned sender identifier
+    uint32_t              sequence;       // Sender-local packet sequence
+    uint32_t              sample_rate;    // Packet sample rate
+    uint16_t              frame_count;    // Frames per packet
+    uint16_t              payload_bytes;  // Audio payload bytes
+    uint8_t               channels;       // Channel count in payload
+    AudioCodec            codec;          // Payload codec
+    int64_t               capture_server_time_ns; // Capture time in server-clock domain
     Bytes<AUDIO_BUF_SIZE> buf;
 };
 

@@ -29,11 +29,35 @@
 #include "protocol.h"
 #include "udp_port.h"
 
+#ifdef _WIN32
+#include <timeapi.h>
+#endif
+
 using asio::ip::udp;
 using clock_type = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
 namespace {
+
+#ifdef _WIN32
+class ScopedTimerResolution {
+public:
+    ScopedTimerResolution() : active_(timeBeginPeriod(1) == TIMERR_NOERROR) {}
+    ~ScopedTimerResolution() {
+        if (active_) {
+            timeEndPeriod(1);
+        }
+    }
+
+private:
+    bool active_ = false;
+};
+#else
+class ScopedTimerResolution {
+public:
+    ScopedTimerResolution() = default;
+};
+#endif
 
 constexpr int   SAMPLE_RATE = 48000;
 constexpr int   CHANNELS = 1;
@@ -86,6 +110,9 @@ struct Args {
     int invalid_flood_interval_us = 0;
     int duration_seconds = 0;
     double playout_ppm = 0.0;
+    double max_e2e_latency_ms = -1.0;
+    double e2e_margin_ms = 8.0;
+    bool v3_receive_smoke = false;
     ProbeConfig config;
 };
 
@@ -115,6 +142,11 @@ struct ProbeMetrics {
     int non_finite_samples = 0;
     int out_of_range_samples = 0;
     int repeated_blocks = 0;
+    int e2e_latency_samples = 0;
+    double e2e_latency_last_ms = 0.0;
+    double e2e_latency_avg_ms = 0.0;
+    double e2e_latency_max_ms = 0.0;
+    double e2e_latency_steady_max_ms = 0.0;
     int queue_depth_observations = 0;
     long long queue_depth_sum = 0;
     int min_queue_depth_after_ready = std::numeric_limits<int>::max();
@@ -143,6 +175,15 @@ public:
 
     void start() {
         do_receive();
+    }
+
+    bool handle_test_packet(const std::vector<unsigned char>& packet) {
+        if (packet.size() > recv_buf_.size()) {
+            return false;
+        }
+        std::memcpy(recv_buf_.data(), packet.data(), packet.size());
+        handle_receive(packet.size());
+        return true;
     }
 
     void send_join() {
@@ -217,7 +258,7 @@ private:
         JoinHdr hdr{};
         hdr.magic = CTRL_MAGIC;
         hdr.type = CtrlHdr::Cmd::JOIN;
-        hdr.capabilities = AUDIO_CAP_REDUNDANCY;
+        hdr.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
         packet_builder::write_fixed(hdr.room_id, room);
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
@@ -256,16 +297,18 @@ private:
             audio_packet::for_each_redundant_audio_child_reverse(
                 packet_data, bytes,
                 [this](const unsigned char* child, size_t child_len, uint8_t) {
-                    handle_v2_audio_packet(child, child_len);
+                    handle_audio_packet(child, child_len);
                 });
             return;
         }
 
-        if (hdr.magic == AUDIO_V2_MAGIC) {
+        if (hdr.magic == AUDIO_V2_MAGIC || hdr.magic == AUDIO_V3_MAGIC) {
             raw_audio_count_.fetch_add(1, std::memory_order_relaxed);
-            v2_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            if (hdr.magic == AUDIO_V2_MAGIC) {
+                v2_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            }
             const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
-            handle_v2_audio_packet(packet_data, bytes);
+            handle_audio_packet(packet_data, bytes);
             return;
         }
 
@@ -313,15 +356,20 @@ private:
         }
     }
 
-    void handle_v2_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
+    void handle_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
         std::string reason;
-        if (!audio_packet::validate_audio_packet_v2_bytes(packet_data, bytes, &reason)) {
+        if (!audio_packet::validate_audio_packet_bytes(packet_data, bytes, &reason)) {
             invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
-        AudioHdrV2 audio{};
-        std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
+        const auto audio = audio_packet::parse_audio_header(packet_data, bytes);
+        if (!audio.valid ||
+            (audio.magic != AUDIO_V2_MAGIC && audio.magic != AUDIO_V3_MAGIC)) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         const auto sequence_delta = sequence_tracker_.record(audio.sequence);
         if (sequence_delta.gaps_detected > 0) {
             sequence_gap_count_.fetch_add(static_cast<int>(sequence_delta.gaps_detected),
@@ -341,8 +389,12 @@ private:
         }
 
         OpusPacket packet;
-        std::memcpy(packet.data.data(), packet_builder::audio_v2_payload(packet_data),
-                    audio.payload_bytes);
+        const unsigned char* payload = packet_builder::audio_payload(packet_data, bytes);
+        if (payload == nullptr) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::memcpy(packet.data.data(), payload, audio.payload_bytes);
         packet.size = audio.payload_bytes;
         packet.timestamp = clock_type::now();
         packet.codec = audio.codec;
@@ -351,6 +403,8 @@ private:
         packet.sample_rate = audio.sample_rate;
         packet.frame_count = audio.frame_count;
         packet.channels = audio.channels;
+        packet.capture_timestamp_valid = audio.capture_timestamp_valid;
+        packet.capture_server_time_ns = audio.capture_server_time_ns;
 
         if (queue_.enqueue(packet)) {
             received_count_.fetch_add(1, std::memory_order_relaxed);
@@ -410,9 +464,14 @@ public:
 
         const AudioCodec audio_codec =
             codec == ProbeCodec::Opus ? AudioCodec::Opus : AudioCodec::PcmInt16;
-        auto packet = audio_packet::create_audio_packet_v2(
+        const int64_t capture_server_time_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clock_type::now().time_since_epoch())
+                .count();
+        auto packet = audio_packet::create_audio_packet_v3(
             audio_codec, sequence, SAMPLE_RATE, static_cast<uint16_t>(frame_count),
-            CHANNELS, payload, static_cast<uint16_t>(payload_bytes));
+            CHANNELS, payload, static_cast<uint16_t>(payload_bytes),
+            capture_server_time_ns);
         std::vector<const std::vector<unsigned char>*> children{packet.get()};
         for (const auto& previous_packet: recent_audio_packets_) {
             if (previous_packet != nullptr) {
@@ -453,7 +512,7 @@ private:
         JoinHdr hdr{};
         hdr.magic = CTRL_MAGIC;
         hdr.type = CtrlHdr::Cmd::JOIN;
-        hdr.capabilities = AUDIO_CAP_REDUNDANCY;
+        hdr.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
         packet_builder::write_fixed(hdr.room_id, room);
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
@@ -586,6 +645,39 @@ void inspect_samples(const std::array<float, MAX_FRAME_SAMPLES>& pcm, int decode
     }
 }
 
+void observe_probe_e2e_latency(const OpusPacket& packet, ProbeMetrics& metrics,
+                               int tick, int warmup_ticks) {
+    if (!packet.capture_timestamp_valid || packet.capture_server_time_ns <= 0) {
+        return;
+    }
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock_type::now().time_since_epoch())
+            .count();
+    if (now_ns <= packet.capture_server_time_ns) {
+        return;
+    }
+    const double latency_ms =
+        static_cast<double>(now_ns - packet.capture_server_time_ns) / 1'000'000.0;
+    metrics.e2e_latency_last_ms = latency_ms;
+    metrics.e2e_latency_max_ms = std::max(metrics.e2e_latency_max_ms, latency_ms);
+    metrics.e2e_latency_avg_ms =
+        metrics.e2e_latency_samples == 0
+            ? latency_ms
+            : ((metrics.e2e_latency_avg_ms * 31.0) + latency_ms) / 32.0;
+    ++metrics.e2e_latency_samples;
+    if (tick >= warmup_ticks) {
+        metrics.e2e_latency_steady_max_ms =
+            std::max(metrics.e2e_latency_steady_max_ms, latency_ms);
+    }
+}
+
+struct ProbeDecodedChunk {
+    int frames = 0;
+    bool capture_timestamp_valid = false;
+    int64_t capture_server_time_ns = 0;
+};
+
 void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeMetrics& metrics,
                       clock_type::time_point start_time, double playout_ppm) {
     OpusDecoderWrapper decoder;
@@ -596,6 +688,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
     bool buffer_ready = false;
     std::array<float, MAX_FRAME_SAMPLES> pcm{};
     std::vector<float> decoded_pcm_fifo;
+    std::vector<ProbeDecodedChunk> decoded_chunks;
     std::vector<float> previous_block(static_cast<size_t>(config.frame_size), 0.0F);
     bool have_previous_block = false;
     const double playout_rate =
@@ -603,24 +696,51 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
     auto frame_duration = std::chrono::duration_cast<clock_type::duration>(
         std::chrono::duration<double>(static_cast<double>(config.frame_size) / playout_rate));
 
-    auto output_decoded_fifo = [&](int output_base_sample) {
+    auto consume_decoded_chunks = [&](int frames, int tick, int warmup_ticks) {
+        int remaining = frames;
+        while (remaining > 0 && !decoded_chunks.empty()) {
+            auto& chunk = decoded_chunks.front();
+            if (chunk.capture_timestamp_valid && chunk.capture_server_time_ns > 0) {
+                OpusPacket marker;
+                marker.capture_timestamp_valid = true;
+                marker.capture_server_time_ns = chunk.capture_server_time_ns;
+                observe_probe_e2e_latency(marker, metrics, tick, warmup_ticks);
+            }
+
+            const int consumed = std::min(remaining, chunk.frames);
+            chunk.frames -= consumed;
+            remaining -= consumed;
+            if (chunk.frames <= 0) {
+                decoded_chunks.erase(decoded_chunks.begin());
+            }
+        }
+    };
+
+    auto output_decoded_fifo = [&](int output_base_sample, int tick) {
         if (decoded_pcm_fifo.size() < static_cast<size_t>(config.frame_size)) {
             return false;
         }
+        constexpr int E2E_WARMUP_TICKS = 30;
         std::copy_n(decoded_pcm_fifo.begin(), static_cast<size_t>(config.frame_size),
                     pcm.begin());
         decoded_pcm_fifo.erase(decoded_pcm_fifo.begin(),
                                decoded_pcm_fifo.begin() + config.frame_size);
+        consume_decoded_chunks(config.frame_size, tick, E2E_WARMUP_TICKS);
         inspect_samples(pcm, config.frame_size, output_base_sample, config, metrics,
                         previous_block, have_previous_block);
         return true;
     };
 
-    auto append_decoded_fifo = [&](const float* samples, int sample_count) {
+    auto append_decoded_fifo = [&](const float* samples, int sample_count,
+                                   const OpusPacket& packet) {
         if (sample_count <= 0) {
             return;
         }
         decoded_pcm_fifo.insert(decoded_pcm_fifo.end(), samples, samples + sample_count);
+        decoded_chunks.push_back(ProbeDecodedChunk{
+            sample_count,
+            !packet.loss_concealment && packet.capture_timestamp_valid,
+            packet.capture_server_time_ns});
     };
     int current_gap_plc_run = 0;
     auto note_gap_plc = [&]() {
@@ -660,7 +780,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
         metrics.min_queue_depth_after_ready =
             std::min(metrics.min_queue_depth_after_ready, current_queue_depth);
 
-        if (output_decoded_fifo(output_base_sample)) {
+        if (output_decoded_fifo(output_base_sample, tick)) {
             continue;
         }
 
@@ -672,6 +792,7 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             if (packet.reset_decoder && packet.codec == AudioCodec::Opus) {
                 decoder.reset();
                 decoded_pcm_fifo.clear();
+                decoded_chunks.clear();
                 metrics.decoder_resets++;
                 note_real_audio();
             }
@@ -706,8 +827,8 @@ void run_playout_loop(const ProbeConfig& config, ProbeReceiver& receiver, ProbeM
             if (decoded_samples != config.frame_size) {
                 metrics.decoded_size_mismatches++;
             }
-            append_decoded_fifo(pcm.data(), decoded_samples);
-            output_decoded_fifo(output_base_sample);
+            append_decoded_fifo(pcm.data(), decoded_samples, packet);
+            output_decoded_fifo(output_base_sample, tick);
         } else if (dequeue_status == ParticipantOpusDequeueStatus::WaitingForGap) {
             metrics.gap_waits++;
             continue;
@@ -908,6 +1029,14 @@ void print_result(const Args& args, const ProbeResult& result) {
     std::cout << "detected_output_sample: " << m.detected_output_sample << "\n";
     std::cout << "latency_samples: " << result.latency_samples << "\n";
     std::cout << "latency_ms: " << result.latency_ms << "\n";
+    std::cout << "e2e_latency_samples: " << m.e2e_latency_samples << "\n";
+    std::cout << "e2e_latency_ms last/avg/max/steady_max: "
+              << m.e2e_latency_last_ms << "/" << m.e2e_latency_avg_ms << "/"
+              << m.e2e_latency_max_ms << "/" << m.e2e_latency_steady_max_ms << "\n";
+    if (args.max_e2e_latency_ms >= 0.0) {
+        std::cout << "e2e_latency_budget_ms: " << args.max_e2e_latency_ms << "\n";
+        std::cout << "e2e_latency_margin_ms: " << args.e2e_margin_ms << "\n";
+    }
     std::cout << "avg_queue_depth: " << avg_queue << "\n";
     std::cout << "queue_drift_from_jitter: "
               << (avg_queue - static_cast<double>(c.jitter_min_packets)) << "\n";
@@ -1018,6 +1147,12 @@ Args parse_args(int argc, char** argv) {
             args.duration_seconds = std::stoi(argv[++i]);
         } else if (arg == "--playout-ppm" && i + 1 < argc) {
             args.playout_ppm = std::stod(argv[++i]);
+        } else if (arg == "--max-e2e-latency-ms" && i + 1 < argc) {
+            args.max_e2e_latency_ms = std::stod(argv[++i]);
+        } else if (arg == "--e2e-margin-ms" && i + 1 < argc) {
+            args.e2e_margin_ms = std::stod(argv[++i]);
+        } else if (arg == "--v3-receive-smoke") {
+            args.v3_receive_smoke = true;
         } else if (arg == "--invalid-flood-packets" && i + 1 < argc) {
             args.invalid_flood_packets = std::stoi(argv[++i]);
         } else if (arg == "--invalid-flood-interval-us" && i + 1 < argc) {
@@ -1033,6 +1168,8 @@ Args parse_args(int argc, char** argv) {
             }
         } else if (arg == "--sweep") {
             args.sweep = true;
+        } else {
+            throw std::runtime_error("unknown argument: " + arg);
         }
     }
     if (args.duration_seconds > 0) {
@@ -1049,11 +1186,90 @@ Args parse_args(int argc, char** argv) {
     return args;
 }
 
+bool run_v3_receive_smoke() {
+    auto require = [](bool condition, const std::string& message) {
+        if (!condition) {
+            std::cerr << message << "\n";
+            return false;
+        }
+        return true;
+    };
+    auto make_v3 = [](uint32_t sequence, uint8_t first_byte) {
+        const std::array<unsigned char, 3> payload{
+            first_byte, static_cast<uint8_t>(first_byte + 1),
+            static_cast<uint8_t>(first_byte + 2)};
+        return audio_packet::create_audio_packet_v3(
+            AudioCodec::Opus, sequence, SAMPLE_RATE,
+            opus_network_clock::DEFAULT_FRAME_COUNT, CHANNELS, payload.data(),
+            static_cast<uint16_t>(payload.size()), 987654321LL + sequence);
+    };
+    auto expect_packet = [&](ProbeReceiver& receiver, uint32_t sequence,
+                             uint8_t first_byte, const std::string& label) {
+        OpusPacket packet{};
+        if (!require(receiver.pop_packet(packet, 0) == ParticipantOpusDequeueStatus::Packet,
+                     label + ": packet was not queued")) {
+            return false;
+        }
+        return require(packet.codec == AudioCodec::Opus, label + ": codec mismatch") &&
+               require(packet.sequence_valid, label + ": sequence not marked valid") &&
+               require(packet.sequence == sequence, label + ": sequence mismatch") &&
+               require(packet.sample_rate == SAMPLE_RATE, label + ": sample rate mismatch") &&
+               require(packet.frame_count == opus_network_clock::DEFAULT_FRAME_COUNT,
+                       label + ": frame count mismatch") &&
+               require(packet.channels == CHANNELS, label + ": channel count mismatch") &&
+               require(packet.size == 3, label + ": payload size mismatch") &&
+               require(packet.data[0] == first_byte, label + ": payload mismatch");
+    };
+
+    asio::io_context io_context;
+    const udp::endpoint endpoint(asio::ip::make_address("127.0.0.1"), 9);
+    ProbeReceiver receiver(io_context, endpoint, "v3-receive-smoke", "receiver", "");
+
+    auto direct = make_v3(30, 0x21);
+    if (!require(direct != nullptr, "failed to build direct V3 packet") ||
+        !require(receiver.handle_test_packet(*direct), "failed to inject direct V3 packet")) {
+        return false;
+    }
+
+    auto current = make_v3(32, 0x31);
+    auto previous = make_v3(31, 0x41);
+    auto redundant =
+        audio_packet::create_redundant_audio_packet({current.get(), previous.get()});
+    if (!require(current != nullptr && previous != nullptr,
+                 "failed to build redundant V3 children") ||
+        !require(redundant != nullptr, "failed to build redundant V3 packet") ||
+        !require(receiver.handle_test_packet(*redundant),
+                 "failed to inject redundant V3 packet")) {
+        return false;
+    }
+
+    if (!expect_packet(receiver, 30, 0x21, "direct V3") ||
+        !expect_packet(receiver, 31, 0x41, "redundant previous V3") ||
+        !expect_packet(receiver, 32, 0x31, "redundant current V3")) {
+        return false;
+    }
+
+    return require(receiver.raw_audio_count() == 2, "raw packet count mismatch") &&
+           require(receiver.redundant_audio_count() == 1, "redundant packet count mismatch") &&
+           require(receiver.v2_audio_count() == 0, "V3 packets should not increment V2 count") &&
+           require(receiver.invalid_audio_count() == 0, "V3 smoke had invalid packet drops") &&
+           require(receiver.received_count() == 3, "received packet count mismatch");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
+        ScopedTimerResolution timer_resolution;
         Args args = parse_args(argc, argv);
+
+        if (args.v3_receive_smoke) {
+            if (!run_v3_receive_smoke()) {
+                return 2;
+            }
+            std::cout << "latency probe V3 receive smoke passed\n";
+            return 0;
+        }
 
         if (args.sweep) {
             const std::vector<int> frame_sizes{240, 120, 96, 64};
@@ -1072,6 +1288,18 @@ int main(int argc, char** argv) {
 
         ProbeResult result = run_probe(args, args.config);
         print_result(args, result);
+        if (args.max_e2e_latency_ms >= 0.0) {
+            if (result.metrics.e2e_latency_samples == 0) {
+                std::cerr << "latency_probe failed: no E2E latency samples\n";
+                return 6;
+            }
+            if (result.metrics.e2e_latency_steady_max_ms > args.max_e2e_latency_ms) {
+                std::cerr << "latency_probe failed: steady E2E latency "
+                          << result.metrics.e2e_latency_steady_max_ms
+                          << " ms exceeds budget " << args.max_e2e_latency_ms << " ms\n";
+                return 7;
+            }
+        }
         if (args.require_clean && has_clean_failure_indicators(result)) {
             return 3;
         }
