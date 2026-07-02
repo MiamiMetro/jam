@@ -2063,7 +2063,10 @@ private:
         frame.frame_count = frame_count;
         frame.sample_rate = sample_rate;
         frame.capture_time = capture_time;
-        pcm_send_queue_.enqueue(frame);
+        if (!pcm_send_queue_.try_enqueue(frame)) {
+            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         wake_pcm_sender_thread();
     }
 
@@ -2088,7 +2091,10 @@ private:
         frame.frame_count = frame_count;
         frame.sample_rate = sample_rate;
         frame.capture_time = capture_time;
-        opus_send_queue_.enqueue(frame);
+        if (!opus_send_queue_.try_enqueue(frame)) {
+            opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         wake_pcm_sender_thread();
     }
 
@@ -4975,8 +4981,10 @@ private:
     std::atomic<int>         opus_redundancy_depth_packets_{
         DEFAULT_OPUS_REDUNDANCY_DEPTH_PACKETS};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
-    moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
-    moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
+    // Pre-sized so the audio callback's try_enqueue never allocates
+    // (max_send_queue_frames caps useful depth at 8; 64 gives block-pool slack).
+    moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_{64};
+    moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_{64};
     std::array<float, 960>                     opus_tx_accumulator_{};
     size_t                                     opus_tx_accumulated_frames_ = 0;
     std::chrono::steady_clock::time_point      opus_tx_accumulator_capture_time_{};

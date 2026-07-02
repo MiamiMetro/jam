@@ -24,6 +24,11 @@ public:
     };
 
     static constexpr size_t MAX_FRAMES_PER_BLOCK = 960;
+    // Bounded so the pre-sized queue's try_enqueue never allocates on the
+    // audio thread. 1024 blocks (~4 MB) is several seconds of drain headroom
+    // for the writer thread; overflow drops are counted, which is preferable
+    // to allocating in the callback. (Was a function-local 4096.)
+    static constexpr size_t MAX_QUEUED_BLOCKS = 1024;
 
     struct Block {
         TrackKind kind = TrackKind::Master;
@@ -110,7 +115,6 @@ public:
             return;
         }
 
-        constexpr size_t MAX_QUEUED_BLOCKS = 4096;
         size_t queued = queued_blocks_.load(std::memory_order_acquire);
         if (queued >= MAX_QUEUED_BLOCKS) {
             dropped_blocks_.fetch_add(1, std::memory_order_relaxed);
@@ -123,7 +127,10 @@ public:
         block.sample_rate = sample_rate;
         block.frame_count = static_cast<uint16_t>(frame_count);
         std::copy_n(samples, frame_count, block.samples.begin());
-        queue_.enqueue(block);
+        if (!queue_.try_enqueue(block)) {
+            dropped_blocks_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         queued_blocks_.fetch_add(1, std::memory_order_release);
     }
 
@@ -291,7 +298,7 @@ private:
         write_manifest(tracks);
     }
 
-    moodycamel::ConcurrentQueue<Block> queue_;
+    moodycamel::ConcurrentQueue<Block> queue_{MAX_QUEUED_BLOCKS};
     std::thread writer_thread_;
     std::atomic<bool> active_{false};
     std::atomic<bool> stop_requested_{true};
