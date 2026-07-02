@@ -26,6 +26,9 @@ endif()
 
 add_executable(latency_probe latency_probe.cpp)
 target_link_libraries(latency_probe PRIVATE asio concurrentqueue spdlog::spdlog opus token_crypto)
+if(WIN32)
+    target_link_libraries(latency_probe PRIVATE winmm)
+endif()
 
 add_executable(udp_path_probe udp_path_probe.cpp)
 target_link_libraries(udp_path_probe PRIVATE asio token_crypto)
@@ -152,6 +155,11 @@ if(JAM_BUILD_TESTS)
                          --allow-loss
                          --max-gap-plc-run 2
                          --min-decoder-resets 1)
+        add_test(NAME e2e_latency_loopback_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/e2e-latency-smoke.mjs
+                         --server-exe $<TARGET_FILE:server>
+                         --probe-exe $<TARGET_FILE:latency_probe>)
     endif()
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
