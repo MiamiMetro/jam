@@ -177,9 +177,12 @@ void Logger::rebuild_logger_locked() {
         return;
     }
 
-    logger_ = std::make_shared<spdlog::async_logger>("core", sinks.begin(), sinks.end(),
-                                                     spdlog::thread_pool(),
-                                                     spdlog::async_overflow_policy::block);
+    // Never block a caller on the logging worker: real-time audio threads may
+    // reach this path indirectly; dropping old log lines is always preferable
+    // to stalling audio.
+    logger_ = std::make_shared<spdlog::async_logger>(
+        "core", sinks.begin(), sinks.end(), spdlog::thread_pool(),
+        spdlog::async_overflow_policy::overrun_oldest);
     logger_->set_level(level_);
     logger_->flush_on(spdlog::level::warn);
 }

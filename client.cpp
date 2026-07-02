@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -8,7 +10,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -1631,6 +1632,10 @@ private:
     }
 
     void clear_audio_path_queues() {
+        // Precondition: the audio stream must be stopped. This resets decoder
+        // and PCM state that the audio callback mutates without locks; running
+        // it concurrently with the callback is undefined behavior.
+        assert(!audio_.is_stream_active());
         PcmSendFrame discarded_pcm;
         while (pcm_send_queue_.try_dequeue(discarded_pcm)) {
         }
@@ -2063,7 +2068,10 @@ private:
         frame.frame_count = frame_count;
         frame.sample_rate = sample_rate;
         frame.capture_time = capture_time;
-        pcm_send_queue_.enqueue(frame);
+        if (!pcm_send_queue_.try_enqueue(frame)) {
+            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         wake_pcm_sender_thread();
     }
 
@@ -2088,7 +2096,10 @@ private:
         frame.frame_count = frame_count;
         frame.sample_rate = sample_rate;
         frame.capture_time = capture_time;
-        opus_send_queue_.enqueue(frame);
+        if (!opus_send_queue_.try_enqueue(frame)) {
+            opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         wake_pcm_sender_thread();
     }
 
@@ -3655,6 +3666,27 @@ private:
         participant_manager_.remove_participant(participant_id);
     }
 
+    void log_rt_callback_diagnostics() {
+        const uint64_t shape = rt_diag_pcm_shape_mismatches_.load(std::memory_order_relaxed);
+        const uint64_t size = rt_diag_pcm_size_mismatches_.load(std::memory_order_relaxed);
+        const uint64_t mix = rt_diag_mix_size_mismatches_.load(std::memory_order_relaxed);
+        const uint64_t decode = rt_diag_decode_failures_.load(std::memory_order_relaxed);
+        if (shape == rt_diag_logged_pcm_shape_mismatches_ &&
+            size == rt_diag_logged_pcm_size_mismatches_ &&
+            mix == rt_diag_logged_mix_size_mismatches_ &&
+            decode == rt_diag_logged_decode_failures_) {
+            return;
+        }
+        Log::warn(
+            "Audio callback diagnostics: pcm_shape_mismatches={} pcm_size_mismatches={} "
+            "mix_size_mismatches={} decode_failures={}",
+            shape, size, mix, decode);
+        rt_diag_logged_pcm_shape_mismatches_ = shape;
+        rt_diag_logged_pcm_size_mismatches_ = size;
+        rt_diag_logged_mix_size_mismatches_ = mix;
+        rt_diag_logged_decode_failures_ = decode;
+    }
+
     void cleanup_timer_callback() {
         // Remove participants who haven't sent packets in a while (backup cleanup)
         auto           now                 = std::chrono::steady_clock::now();
@@ -3668,6 +3700,9 @@ private:
                 "Removed stale participant {} (no packets for {}s)", id,
                 std::chrono::duration_cast<std::chrono::seconds>(PARTICIPANT_TIMEOUT).count());
         }
+
+        log_rt_callback_diagnostics();
+        participant_manager_.reap_retired_participants();
     }
 
     void handle_audio_path_stats_message(std::size_t bytes, const char* recv_data) {
@@ -4356,8 +4391,6 @@ private:
                     participant.buffer_ready.store(true, std::memory_order_relaxed);
                     participant.opus_consecutive_empty_callbacks.store(0,
                                                                        std::memory_order_relaxed);
-                    Log::info("Jitter buffer ready for participant {} ({} packets)",
-                              participant_id, queue_size);
                 } else {
                     return;
                 }
@@ -4461,23 +4494,16 @@ private:
                         opus_packet.channels > 0 ? opus_packet.channels : 1;
                     if (packet_channels != 1 ||
                         packet_frame_count > participant.pcm_buffer.size()) {
-                        static int pcm_shape_mismatch_count = 0;
-                        if (++pcm_shape_mismatch_count % 100 == 0) {
-                            Log::warn(
-                                "PCM shape mismatch for participant {}: frames={}, channels={}",
-                                participant_id, packet_frame_count, packet_channels);
-                        }
+                        client->rt_diag_pcm_shape_mismatches_.fetch_add(
+                            1, std::memory_order_relaxed);
                         return;
                     }
 
                     const size_t expected_bytes =
                         packet_frame_count * packet_channels * sizeof(int16_t);
                     if (opus_packet.get_size() != expected_bytes) {
-                        static int pcm_size_mismatch_count = 0;
-                        if (++pcm_size_mismatch_count % 100 == 0) {
-                            Log::warn("PCM size mismatch for participant {}: got {}, expected {}",
-                                      participant_id, opus_packet.get_size(), expected_bytes);
-                        }
+                        client->rt_diag_pcm_size_mismatches_.fetch_add(
+                            1, std::memory_order_relaxed);
                         return;
                     }
                     for (size_t i = 0; i < packet_frame_count; ++i) {
@@ -4502,11 +4528,7 @@ private:
 
                 if (decoded_samples <= 0) {
                     // Decode failed - use silence
-                    static int decode_fail_count = 0;
-                    if (++decode_fail_count % 100 == 0) {
-                        Log::warn("Decode failed for participant {} ({} times)", participant_id,
-                                  decode_fail_count);
-                    }
+                    client->rt_diag_decode_failures_.fetch_add(1, std::memory_order_relaxed);
                     observe_auto_jitter_instability(participant);
                     return;
                 }
@@ -4611,8 +4633,6 @@ private:
                                                               decoded_samples);
                     participant.current_level.store(rms, std::memory_order_relaxed);
 
-                    const bool was_speaking =
-                        participant.is_speaking.load(std::memory_order_relaxed);
                     const bool is_speaking = audio_analysis::detect_voice_activity(rms);
                     participant.is_speaking.store(is_speaking, std::memory_order_relaxed);
 
@@ -4637,13 +4657,6 @@ private:
                         active_count++;
                     }
 
-                    if (is_speaking && !was_speaking) {
-                        Log::debug("Participant {} started speaking (level: {:.4f})",
-                                   participant_id, rms);
-                    } else if (!is_speaking && was_speaking) {
-                        Log::debug("Participant {} stopped speaking", participant_id);
-                    }
-
                     observe_participant_queue_depth(participant,
                                                     participant.opus_queue.size_approx());
                     observe_opus_pcm_depth(participant);
@@ -4665,17 +4678,8 @@ private:
                 participant.current_level.store(rms, std::memory_order_relaxed);
 
                 // Voice Activity Detection (simple threshold-based)
-                const bool was_speaking =
-                    participant.is_speaking.load(std::memory_order_relaxed);
                 const bool is_speaking = audio_analysis::detect_voice_activity(rms);
                 participant.is_speaking.store(is_speaking, std::memory_order_relaxed);
-
-                if (is_speaking && !was_speaking) {
-                    Log::debug("Participant {} started speaking (level: {:.4f})", participant_id,
-                               rms);
-                } else if (!is_speaking && was_speaking) {
-                    Log::debug("Participant {} stopped speaking", participant_id);
-                }
 
                 // Mix into output with participant's gain
                 size_t expected_samples = frame_count * out_channels;
@@ -4690,13 +4694,8 @@ private:
                                                        participant_gain);
                     active_count++;
                 } else {
-                    // Size mismatch - log warning occasionally
-                    static int mismatch_count = 0;
-                    if (++mismatch_count % 100 == 0) {
-                        Log::warn(
-                            "Audio size mismatch: participant {}, got {} samples, expected {}",
-                            participant_id, decoded_samples, expected_samples);
-                    }
+                    client->rt_diag_mix_size_mismatches_.fetch_add(1,
+                                                                   std::memory_order_relaxed);
                 }
 
                 // Track queue size history for diagnostics. Opus trims old backlog down to the
@@ -4807,18 +4806,11 @@ private:
                         1;
                     if (empty_callbacks >=
                         static_cast<int>(opus_rebuffer_empty_callback_threshold(participant))) {
-                        const int underruns =
-                            participant.underrun_count.fetch_add(1, std::memory_order_relaxed) +
-                            1;
+                        participant.underrun_count.fetch_add(1, std::memory_order_relaxed);
                         observe_auto_jitter_instability(participant);
                         participant.buffer_ready.store(false, std::memory_order_relaxed);
                         participant.opus_consecutive_empty_callbacks.store(
                             0, std::memory_order_relaxed);
-                        if (underruns == 1 || underruns % 10 == 0) {
-                            Log::info("Participant {} rebuffering (underruns: {}, PLC: {})",
-                                      participant_id, underruns,
-                                      participant.plc_count.load(std::memory_order_relaxed));
-                        }
                     }
                 }
             }
@@ -4995,8 +4987,10 @@ private:
     std::atomic<int>         opus_redundancy_depth_packets_{
         DEFAULT_OPUS_REDUNDANCY_DEPTH_PACKETS};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
-    moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_;
-    moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_;
+    // Pre-sized so the audio callback's try_enqueue never allocates
+    // (max_send_queue_frames caps useful depth at 8; 64 gives block-pool slack).
+    moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_{64};
+    moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_{64};
     std::array<float, 960>                     opus_tx_accumulator_{};
     size_t                                     opus_tx_accumulated_frames_ = 0;
     std::chrono::steady_clock::time_point      opus_tx_accumulator_capture_time_{};
@@ -5009,6 +5003,16 @@ private:
     std::atomic<bool>                         pcm_sender_wake_{false};
     std::atomic<uint64_t>                     pcm_send_drops_{0};
     std::atomic<uint64_t>                     opus_send_drops_{0};
+    // Written by the audio callback (relaxed atomics), drained and logged by
+    // the io-thread cleanup timer. The callback itself must never log.
+    std::atomic<uint64_t> rt_diag_pcm_shape_mismatches_{0};
+    std::atomic<uint64_t> rt_diag_pcm_size_mismatches_{0};
+    std::atomic<uint64_t> rt_diag_mix_size_mismatches_{0};
+    std::atomic<uint64_t> rt_diag_decode_failures_{0};
+    uint64_t              rt_diag_logged_pcm_shape_mismatches_ = 0;  // io thread only
+    uint64_t              rt_diag_logged_pcm_size_mismatches_  = 0;  // io thread only
+    uint64_t              rt_diag_logged_mix_size_mismatches_  = 0;  // io thread only
+    uint64_t              rt_diag_logged_decode_failures_      = 0;  // io thread only
     std::atomic<uint64_t>                     outbound_malformed_audio_drops_{0};
     std::atomic<uint64_t>                     inbound_malformed_audio_drops_{0};
     std::atomic<uint64_t>                     stray_udp_packets_{0};

@@ -62,17 +62,12 @@ public:
         sample_rate_ = 0;
     }
 
+    // RT-safe: called from the audio callback; must not log or allocate.
     bool reset() {
         if (decoder_ == nullptr) {
-            Log::error("Opus decoder not initialized.");
             return false;
         }
-        const int err = opus_decoder_ctl(decoder_, OPUS_RESET_STATE);
-        if (err != OPUS_OK) {
-            Log::error("Failed to reset Opus decoder: {}", opus_strerror(err));
-            return false;
-        }
-        return true;
+        return opus_decoder_ctl(decoder_, OPUS_RESET_STATE) == OPUS_OK;
     }
 
     bool decode(const unsigned char* input, int input_size, int frame_size,
@@ -97,10 +92,11 @@ public:
         return true;
     }
 
-    // Decode directly into caller-provided buffer (zero-allocation)
+    // Decode directly into caller-provided buffer (zero-allocation).
+    // RT-safe: called from the audio callback; must not log or allocate.
+    // Callers count failures via the return value.
     int decode_into(const unsigned char* input, int input_size, float* output, int frame_size) {
         if (decoder_ == nullptr) {
-            Log::error("Opus decoder not initialized.");
             return -1;
         }
 
@@ -108,7 +104,6 @@ public:
             opus_decode_float(decoder_, input, input_size, output, frame_size, 0);
 
         if (decoded_samples_per_channel < 0) {
-            Log::error("Opus decoding failed: {}", opus_strerror(decoded_samples_per_channel));
             return -1;
         }
 
