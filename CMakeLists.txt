@@ -166,6 +166,8 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --opus-redundancy-policy-smoke)
         add_test(NAME client_audio_v3_receive_smoke
                  COMMAND $<TARGET_FILE:client> --audio-v3-receive-smoke)
+        add_test(NAME client_e2e_latency_metric_smoke
+                 COMMAND $<TARGET_FILE:client> --e2e-latency-metric-smoke)
         add_test(NAME client_startup_config_adaptive_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES

@@ -28,6 +28,8 @@ struct OpusPacket {
     uint32_t                              sample_rate = 48000;
     uint16_t                              frame_count = 0;
     uint8_t                               channels = 1;
+    bool                                  capture_timestamp_valid = false;
+    int64_t                               capture_server_time_ns = 0;
 
     // Helper to get data pointer and size (compatible with old vector API)
     const uint8_t* get_data() const {
@@ -418,6 +420,12 @@ private:
     std::atomic<uint32_t> next_playout_sequence_snapshot_{0};
 };
 
+struct OpusPcmCaptureChunk {
+    size_t frames = 0;
+    int64_t capture_server_time_ns = 0;
+    bool valid = false;
+};
+
 // Per-participant audio data and state
 struct ParticipantData {
     // Audio processing - store OPUS packets, decode in audio callback
@@ -426,6 +434,9 @@ struct ParticipantData {
     std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
     std::array<float, 1920>                 opus_pcm_buffer{};
     size_t                                  opus_pcm_buffered_frames = 0;
+    std::array<OpusPcmCaptureChunk, MAX_OPUS_QUEUE_SIZE> opus_pcm_capture_chunks{};
+    size_t                                  opus_pcm_capture_chunk_head = 0;
+    size_t                                  opus_pcm_capture_chunk_count = 0;
     double                                  opus_resample_phase = 0.0;
     uint64_t                                opus_rate_last_queue_limit_drops = 0;
     int                                     opus_rate_correction_callbacks = 0;
@@ -476,6 +487,10 @@ struct ParticipantData {
     std::atomic<int64_t>   packet_age_last_ns{0};
     std::atomic<int64_t>   packet_age_max_ns{0};
     std::atomic<int64_t>   packet_age_avg_ns{0};
+    std::atomic<int64_t>   capture_to_playout_latency_last_ns{0};
+    std::atomic<int64_t>   capture_to_playout_latency_max_ns{0};
+    std::atomic<int64_t>   capture_to_playout_latency_avg_ns{0};
+    std::atomic<uint64_t>  capture_to_playout_latency_samples{0};
     std::atomic<size_t>    queue_depth_max{0};
     std::atomic<size_t>    queue_depth_avg{0};
     std::atomic<int64_t>   queue_depth_drift_milli{0};
@@ -536,6 +551,10 @@ struct ParticipantInfo {
     double   packet_age_last_ms;
     double   packet_age_avg_ms;
     double   packet_age_max_ms;
+    double   capture_to_playout_latency_last_ms;
+    double   capture_to_playout_latency_avg_ms;
+    double   capture_to_playout_latency_max_ms;
+    uint64_t capture_to_playout_latency_samples;
     uint64_t sequence_gaps;
     uint64_t sequence_gap_recoveries;
     uint64_t sequence_unresolved_gaps;

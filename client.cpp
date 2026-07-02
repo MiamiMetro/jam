@@ -328,6 +328,7 @@ public:
             server_endpoint_ = resolved_endpoint;
         }
         join_state_.reset();
+        reset_server_clock_and_ping_state();
         receive_generation_.fetch_add(1, std::memory_order_acq_rel);
         receiving_enabled_.store(true, std::memory_order_release);
         outbound_enabled_.store(true, std::memory_order_release);
@@ -1487,6 +1488,24 @@ public:
         uint64_t generation = 0;
     };
 
+    void reset_server_clock_and_ping_state() {
+        server_clock_ready_.store(false, std::memory_order_release);
+        server_clock_offset_ns_.store(0, std::memory_order_release);
+        have_ping_reply_sequence_.store(false, std::memory_order_release);
+        ping_tx_sequence_.store(0, std::memory_order_release);
+        last_ping_reply_sequence_.store(0, std::memory_order_release);
+        ping_path_interval_received_.store(0, std::memory_order_relaxed);
+        ping_path_interval_missing_.store(0, std::memory_order_relaxed);
+        ping_path_total_received_.store(0, std::memory_order_relaxed);
+        ping_path_total_missing_.store(0, std::memory_order_relaxed);
+        ping_path_consecutive_missing_.store(0, std::memory_order_relaxed);
+        rtt_ms_.store(0.0, std::memory_order_relaxed);
+        rtt_last_ns_.store(0, std::memory_order_relaxed);
+        rtt_min_ns_.store(0, std::memory_order_relaxed);
+        rtt_avg_ns_.store(0, std::memory_order_relaxed);
+        rtt_max_ns_.store(0, std::memory_order_relaxed);
+    }
+
     void on_receive(const std::shared_ptr<ReceiveState>& state,
                     std::error_code error_code, std::size_t bytes) {
         if (state->generation != receive_generation_.load(std::memory_order_acquire)) {
@@ -1654,6 +1673,7 @@ private:
         participant_manager_.for_each([](uint32_t, ParticipantData& participant) {
             participant.opus_queue.clear();
             participant.opus_pcm_buffered_frames = 0;
+            clear_opus_capture_chunks(participant);
             participant.opus_pcm_buffered_frames_observed.store(
                 0, std::memory_order_relaxed);
             participant.last_pcm_valid = false;
@@ -1748,23 +1768,10 @@ private:
         }
 
         join_state_.reset();
-        have_ping_reply_sequence_.store(false, std::memory_order_release);
-        ping_tx_sequence_.store(0, std::memory_order_release);
-        last_ping_reply_sequence_.store(0, std::memory_order_release);
-        ping_path_interval_received_.store(0, std::memory_order_relaxed);
-        ping_path_interval_missing_.store(0, std::memory_order_relaxed);
-        ping_path_total_received_.store(0, std::memory_order_relaxed);
-        ping_path_total_missing_.store(0, std::memory_order_relaxed);
-        ping_path_consecutive_missing_.store(0, std::memory_order_relaxed);
+        reset_server_clock_and_ping_state();
         audio_path_interval_received_.store(0, std::memory_order_relaxed);
         audio_path_interval_sequence_gaps_.store(0, std::memory_order_relaxed);
         audio_path_interval_gaps_.store(0, std::memory_order_relaxed);
-        server_clock_ready_.store(false, std::memory_order_release);
-        rtt_ms_.store(0.0, std::memory_order_relaxed);
-        rtt_last_ns_.store(0, std::memory_order_relaxed);
-        rtt_min_ns_.store(0, std::memory_order_relaxed);
-        rtt_avg_ns_.store(0, std::memory_order_relaxed);
-        rtt_max_ns_.store(0, std::memory_order_relaxed);
         recent_opus_audio_packets_.clear();
 
         receive_generation_.fetch_add(1, std::memory_order_acq_rel);
@@ -1820,13 +1827,13 @@ private:
 
         MsgHdr hdr{};
         std::memcpy(&hdr, data, sizeof(MsgHdr));
-        if (hdr.magic != AUDIO_V2_MAGIC) {
+        if (hdr.magic != AUDIO_V2_MAGIC && hdr.magic != AUDIO_V3_MAGIC) {
             return true;
         }
 
         std::string reason;
         const auto* packet_bytes = reinterpret_cast<const unsigned char*>(data);
-        if (audio_packet::validate_audio_packet_v2_bytes(packet_bytes, len, &reason)) {
+        if (audio_packet::validate_audio_packet_bytes(packet_bytes, len, &reason)) {
             return true;
         }
 
@@ -1835,19 +1842,18 @@ private:
         uint32_t sequence = 0;
         uint16_t payload_bytes = 0;
         AudioCodec codec = AudioCodec::Opus;
-        if (len >= audio_packet::v2_header_size()) {
-            AudioHdrV2 audio{};
-            std::memcpy(&audio, data, audio_packet::v2_header_size());
-            sequence = audio.sequence;
-            payload_bytes = audio.payload_bytes;
-            codec = audio.codec;
+        const auto parsed = audio_packet::parse_audio_header(packet_bytes, len);
+        if (parsed.valid) {
+            sequence = parsed.sequence;
+            payload_bytes = parsed.payload_bytes;
+            codec = parsed.codec;
         }
 
         Log::error(
-            "BUG: refusing malformed outbound V2 audio: reason={} len={} expected={} "
-            "payload_bytes={} codec={} seq={}",
-            reason, len, audio_packet::v2_header_size() + payload_bytes, payload_bytes,
-            static_cast<int>(codec), sequence);
+            "BUG: refusing malformed outbound versioned audio: reason={} len={} magic=0x{:08x} "
+            "header_size={} payload_bytes={} codec={} seq={}",
+            reason, len, hdr.magic, parsed.header_size, payload_bytes, static_cast<int>(codec),
+            sequence);
         return false;
     }
 
@@ -1879,10 +1885,43 @@ private:
         std::chrono::steady_clock::time_point capture_time;
     };
 
-    static int64_t steady_now_ns() {
-        const auto now = std::chrono::steady_clock::now();
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch())
+    static int64_t steady_time_ns(std::chrono::steady_clock::time_point time) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch())
             .count();
+    }
+
+    int64_t server_time_for_steady_time_ns(std::chrono::steady_clock::time_point time) const {
+        return steady_time_ns(time) +
+               server_clock_offset_ns_.load(std::memory_order_acquire);
+    }
+
+    std::optional<int64_t> server_time_for_steady_time_ns_if_ready(
+        std::chrono::steady_clock::time_point time) const {
+        if (!server_clock_ready_.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        const int64_t offset_ns = server_clock_offset_ns_.load(std::memory_order_acquire);
+        if (!server_clock_ready_.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        return steady_time_ns(time) + offset_ns;
+    }
+
+    std::optional<int64_t> capture_timestamp_for_steady_time_if_ready(
+        std::chrono::steady_clock::time_point time) const {
+        if (!join_state_.server_supports(AUDIO_CAP_CAPTURE_TIMESTAMP)) {
+            return std::nullopt;
+        }
+        return server_time_for_steady_time_ns_if_ready(time);
+    }
+
+    bool can_send_capture_timestamps() const {
+        return join_state_.server_supports(AUDIO_CAP_CAPTURE_TIMESTAMP) &&
+               server_clock_ready_.load(std::memory_order_acquire);
+    }
+
+    static int64_t steady_now_ns() {
+        return steady_time_ns(std::chrono::steady_clock::now());
     }
 
     uint32_t next_metronome_boundary_beat() const {
@@ -1952,9 +1991,19 @@ private:
                 }
                 observe_pcm_send_queue_age(frame.capture_time);
                 uint32_t seq = audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
-                auto packet = audio_packet::create_audio_packet_v2(
-                    AudioCodec::PcmInt16, seq, frame.sample_rate, frame.frame_count, 1,
-                    frame.payload.data(), frame.payload_bytes);
+                std::shared_ptr<std::vector<unsigned char>> packet;
+                const auto capture_server_time_ns =
+                    capture_timestamp_for_steady_time_if_ready(frame.capture_time);
+                if (capture_server_time_ns.has_value()) {
+                    packet = audio_packet::create_audio_packet_v3(
+                        AudioCodec::PcmInt16, seq, frame.sample_rate, frame.frame_count, 1,
+                        frame.payload.data(), frame.payload_bytes,
+                        *capture_server_time_ns);
+                } else {
+                    packet = audio_packet::create_audio_packet_v2(
+                        AudioCodec::PcmInt16, seq, frame.sample_rate, frame.frame_count, 1,
+                        frame.payload.data(), frame.payload_bytes);
+                }
                 observe_audio_packet_send_pacing();
                 send(packet->data(), packet->size(), packet);
                 continue;
@@ -1973,9 +2022,21 @@ private:
                     encoded_data.size() <= AUDIO_BUF_SIZE) {
                     observe_tx_encode_time(std::chrono::steady_clock::now() - encode_start);
                     uint32_t seq = audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
-                    auto packet = audio_packet::create_audio_packet_v2(
-                        AudioCodec::Opus, seq, opus_frame.sample_rate, opus_frame.frame_count, 1,
-                        encoded_data.data(), static_cast<uint16_t>(encoded_data.size()));
+                    std::shared_ptr<std::vector<unsigned char>> packet;
+                    const auto capture_server_time_ns =
+                        capture_timestamp_for_steady_time_if_ready(opus_frame.capture_time);
+                    if (capture_server_time_ns.has_value()) {
+                        packet = audio_packet::create_audio_packet_v3(
+                            AudioCodec::Opus, seq, opus_frame.sample_rate,
+                            opus_frame.frame_count, 1, encoded_data.data(),
+                            static_cast<uint16_t>(encoded_data.size()),
+                            *capture_server_time_ns);
+                    } else {
+                        packet = audio_packet::create_audio_packet_v2(
+                            AudioCodec::Opus, seq, opus_frame.sample_rate,
+                            opus_frame.frame_count, 1, encoded_data.data(),
+                            static_cast<uint16_t>(encoded_data.size()));
+                    }
                     auto send_packet = maybe_wrap_opus_packet_with_redundancy(packet);
                     observe_audio_packet_send_pacing();
                     send(send_packet->data(), send_packet->size(), send_packet);
@@ -2000,22 +2061,21 @@ private:
             return packet;
         }
 
-        if (packet->size() < audio_packet::v2_header_size()) {
+        const auto parsed = audio_packet::parse_audio_header(packet->data(), packet->size());
+        if (!parsed.valid) {
             return packet;
         }
 
-        AudioHdrV2 audio{};
-        std::memcpy(&audio, packet->data(), audio_packet::v2_header_size());
         const int configured_depth = get_opus_redundancy_depth_setting();
         const int effective_depth =
-            effective_opus_redundancy_depth(configured_depth, audio.frame_count);
+            effective_opus_redundancy_depth(configured_depth, parsed.frame_count);
         if (effective_depth <= 0) {
             recent_opus_audio_packets_.clear();
             return packet;
         }
 
         const size_t child_count = opus_redundancy_child_count_for_policy(
-            configured_depth, audio.frame_count, recent_opus_audio_packets_.size());
+            configured_depth, parsed.frame_count, recent_opus_audio_packets_.size());
         std::vector<const std::vector<unsigned char>*> packets{packet.get()};
         for (const auto& previous_packet: recent_opus_audio_packets_) {
             if (packets.size() >= child_count) {
@@ -2186,11 +2246,12 @@ private:
         pcm_sender_cv_.notify_one();
     }
 
-    static void consume_opus_pcm_buffer(ParticipantData& participant, size_t frame_count) {
+    static size_t consume_opus_pcm_buffer(ParticipantData& participant, size_t frame_count) {
+        const size_t consumed = std::min(frame_count, participant.opus_pcm_buffered_frames);
         if (participant.opus_pcm_buffered_frames <= frame_count) {
             participant.opus_pcm_buffered_frames = 0;
             participant.opus_resample_phase = 0.0;
-            return;
+            return consumed;
         }
 
         const size_t remaining = participant.opus_pcm_buffered_frames - frame_count;
@@ -2199,6 +2260,7 @@ private:
                       static_cast<std::ptrdiff_t>(participant.opus_pcm_buffered_frames),
                   participant.opus_pcm_buffer.begin());
         participant.opus_pcm_buffered_frames = remaining;
+        return consumed;
     }
 
     static double opus_playout_rate_ratio(ParticipantData& participant) {
@@ -2258,11 +2320,11 @@ private:
         return static_cast<size_t>(std::floor(last_source)) + 1;
     }
 
-    static void mix_resampled_opus_pcm(ParticipantData& participant, float* output_buffer,
-                                       unsigned long output_frames, size_t output_channels,
-                                       float gain, double ratio) {
+    static size_t mix_resampled_opus_pcm(ParticipantData& participant, float* output_buffer,
+                                         unsigned long output_frames, size_t output_channels,
+                                         float gain, double ratio) {
         if (output_frames == 0 || output_buffer == nullptr) {
-            return;
+            return 0;
         }
 
         const double start_phase = participant.opus_resample_phase;
@@ -2291,17 +2353,17 @@ private:
         const auto consumed_frames = static_cast<size_t>(std::floor(consumed_exact));
         participant.opus_resample_phase =
             consumed_exact - static_cast<double>(consumed_frames);
-        consume_opus_pcm_buffer(participant, consumed_frames);
+        return consume_opus_pcm_buffer(participant, consumed_frames);
     }
 
-    static void mix_available_opus_pcm_with_tail(ParticipantData& participant,
-                                                 float* output_buffer,
-                                                 unsigned long output_frames,
-                                                 size_t output_channels, float gain,
-                                                 double ratio) {
+    static size_t mix_available_opus_pcm_with_tail(ParticipantData& participant,
+                                                   float* output_buffer,
+                                                   unsigned long output_frames,
+                                                   size_t output_channels, float gain,
+                                                   double ratio) {
         if (output_frames == 0 || output_buffer == nullptr ||
             participant.opus_pcm_buffered_frames == 0) {
-            return;
+            return 0;
         }
 
         const double start_phase = participant.opus_resample_phase;
@@ -2334,7 +2396,7 @@ private:
         const auto consumed_frames = std::min(
             static_cast<size_t>(std::floor(consumed_exact)),
             participant.opus_pcm_buffered_frames);
-        consume_opus_pcm_buffer(participant, consumed_frames);
+        return consume_opus_pcm_buffer(participant, consumed_frames);
     }
 
     static void observe_participant_queue_depth(ParticipantData& participant, size_t depth) {
@@ -2713,6 +2775,89 @@ private:
         const int64_t next_avg =
             previous_avg == 0 ? sample_ns : ((previous_avg * 31) + sample_ns) / 32;
         avg_ns.store(next_avg, std::memory_order_relaxed);
+    }
+
+    static void observe_capture_to_playout_latency(ParticipantData& participant,
+                                                   const OpusPacket& packet,
+                                                   int64_t playout_server_time_ns) {
+        if (!packet.capture_timestamp_valid || packet.capture_server_time_ns <= 0 ||
+            playout_server_time_ns <= packet.capture_server_time_ns) {
+            return;
+        }
+
+        observe_latency_sample(participant.capture_to_playout_latency_last_ns,
+                               participant.capture_to_playout_latency_avg_ns,
+                               participant.capture_to_playout_latency_max_ns,
+                               playout_server_time_ns - packet.capture_server_time_ns);
+        participant.capture_to_playout_latency_samples.fetch_add(1,
+                                                                 std::memory_order_relaxed);
+    }
+
+    void observe_capture_to_playout_latency_if_clock_ready(
+        ParticipantData& participant,
+        const OpusPacket& packet,
+        std::chrono::steady_clock::time_point playout_time) const {
+        const auto playout_server_time_ns =
+            server_time_for_steady_time_ns_if_ready(playout_time);
+        if (!playout_server_time_ns.has_value()) {
+            return;
+        }
+        observe_capture_to_playout_latency(participant, packet, *playout_server_time_ns);
+    }
+
+    static void append_opus_capture_chunk(ParticipantData& participant, size_t frames,
+                                          int64_t capture_server_time_ns, bool valid) {
+        if (frames == 0) {
+            return;
+        }
+        if (participant.opus_pcm_capture_chunk_count >=
+            participant.opus_pcm_capture_chunks.size()) {
+            participant.opus_pcm_capture_chunk_head =
+                (participant.opus_pcm_capture_chunk_head + 1) %
+                participant.opus_pcm_capture_chunks.size();
+            --participant.opus_pcm_capture_chunk_count;
+        }
+        const size_t index =
+            (participant.opus_pcm_capture_chunk_head +
+             participant.opus_pcm_capture_chunk_count) %
+            participant.opus_pcm_capture_chunks.size();
+        participant.opus_pcm_capture_chunks[index] =
+            OpusPcmCaptureChunk{frames, capture_server_time_ns, valid};
+        ++participant.opus_pcm_capture_chunk_count;
+    }
+
+    static void clear_opus_capture_chunks(ParticipantData& participant) {
+        participant.opus_pcm_capture_chunk_head = 0;
+        participant.opus_pcm_capture_chunk_count = 0;
+    }
+
+    static void observe_and_consume_opus_capture_chunks(ParticipantData& participant,
+                                                        size_t consumed_frames,
+                                                        std::optional<int64_t>
+                                                            playout_server_time_ns) {
+        size_t remaining = consumed_frames;
+        while (remaining > 0 && participant.opus_pcm_capture_chunk_count > 0) {
+            auto& chunk =
+                participant.opus_pcm_capture_chunks[participant.opus_pcm_capture_chunk_head];
+            if (chunk.valid && chunk.capture_server_time_ns > 0 &&
+                playout_server_time_ns.has_value()) {
+                OpusPacket marker;
+                marker.capture_timestamp_valid = true;
+                marker.capture_server_time_ns = chunk.capture_server_time_ns;
+                observe_capture_to_playout_latency(participant, marker,
+                                                   *playout_server_time_ns);
+            }
+
+            const size_t consumed_from_chunk = std::min(remaining, chunk.frames);
+            chunk.frames -= consumed_from_chunk;
+            remaining -= consumed_from_chunk;
+            if (chunk.frames == 0) {
+                participant.opus_pcm_capture_chunk_head =
+                    (participant.opus_pcm_capture_chunk_head + 1) %
+                    participant.opus_pcm_capture_chunks.size();
+                --participant.opus_pcm_capture_chunk_count;
+            }
+        }
     }
 
     void ping_timer_callback() {
@@ -3244,6 +3389,188 @@ public:
         }
 
         client.stop_connection();
+        return true;
+    }
+
+    static bool run_e2e_latency_metric_smoke(std::string& failure) {
+        ParticipantData participant;
+        const int64_t capture_ns = 10'000'000LL;
+        const int64_t playout_ns = 35'000'000LL;
+
+        OpusPacket packet;
+        packet.capture_server_time_ns = capture_ns;
+        packet.capture_timestamp_valid = true;
+        observe_capture_to_playout_latency(participant, packet, playout_ns);
+
+        const int64_t observed =
+            participant.capture_to_playout_latency_last_ns.load(std::memory_order_relaxed);
+        if (observed != 25'000'000LL) {
+            failure = "direct packet latency observation should be 25 ms";
+            return false;
+        }
+
+        {
+            asio::io_context io_context;
+            PerformerJoinOptions join_options{};
+            Client client(io_context, "127.0.0.1", 9, join_options);
+
+            constexpr uint32_t sender_id = 101;
+            std::array<unsigned char, 120 * sizeof(int16_t)> pcm_payload{};
+            auto timestamped_packet = audio_packet::create_audio_packet_v3(
+                AudioCodec::PcmInt16, 1, opus_network_clock::SAMPLE_RATE, 120, 1,
+                pcm_payload.data(), static_cast<uint16_t>(pcm_payload.size()), capture_ns);
+            if (timestamped_packet == nullptr ||
+                timestamped_packet->size() < sizeof(MsgHdr) + sizeof(sender_id)) {
+                failure = "failed to build timestamped V3 PCM packet";
+                client.stop_connection();
+                return false;
+            }
+            std::memcpy(timestamped_packet->data() + sizeof(MsgHdr), &sender_id,
+                        sizeof(sender_id));
+
+            client.handle_audio_message(
+                timestamped_packet->size(),
+                reinterpret_cast<const char*>(timestamped_packet->data()));
+
+            bool consumed = false;
+            if (!client.participant_manager_.with_participant(
+                    sender_id, [&](ParticipantData& data) {
+                        OpusPacket received;
+                        if (!data.opus_queue.try_dequeue(received)) {
+                            failure = "timestamped V3 packet should be queued";
+                            return;
+                        }
+                        if (received.codec != AudioCodec::PcmInt16 ||
+                            !received.capture_timestamp_valid ||
+                            received.capture_server_time_ns != capture_ns) {
+                            failure = "timestamped V3 packet metadata mismatch";
+                            return;
+                        }
+
+                        client.observe_capture_to_playout_latency_if_clock_ready(
+                            data, received, std::chrono::steady_clock::now());
+                        const uint64_t unsynced_samples =
+                            data.capture_to_playout_latency_samples.load(
+                                std::memory_order_relaxed);
+                        if (unsynced_samples != 0) {
+                            failure = "unsynced V3 packet should not observe E2E latency";
+                            return;
+                        }
+
+                        const auto synced_playout = std::chrono::steady_clock::now();
+                        client.server_clock_offset_ns_.store(
+                            (capture_ns + 25'000'000LL) -
+                                steady_time_ns(synced_playout),
+                            std::memory_order_release);
+                        client.server_clock_ready_.store(true, std::memory_order_release);
+                        client.observe_capture_to_playout_latency_if_clock_ready(
+                            data, received, synced_playout);
+
+                        const uint64_t synced_samples =
+                            data.capture_to_playout_latency_samples.load(
+                                std::memory_order_relaxed);
+                        const int64_t synced_latency =
+                            data.capture_to_playout_latency_last_ns.load(
+                                std::memory_order_relaxed);
+                        if (synced_samples != 1 || synced_latency != 25'000'000LL) {
+                            failure = "synced V3 packet should observe 25 ms E2E latency";
+                            return;
+                        }
+                        consumed = true;
+                    }) ||
+                !consumed) {
+                if (failure.empty()) {
+                    failure = "timestamped V3 sender was not registered";
+                }
+                client.stop_connection();
+                return false;
+            }
+
+            client.join_state_.mark_join_ack(22, AUDIO_CAP_CAPTURE_TIMESTAMP);
+            client.server_clock_offset_ns_.store(987'654'321LL,
+                                                 std::memory_order_release);
+            client.server_clock_ready_.store(true, std::memory_order_release);
+            client.rtt_ms_.store(12.5, std::memory_order_relaxed);
+            client.rtt_last_ns_.store(12'500'000LL, std::memory_order_relaxed);
+            client.rtt_min_ns_.store(11'000'000LL, std::memory_order_relaxed);
+            client.rtt_avg_ns_.store(12'000'000LL, std::memory_order_relaxed);
+            client.rtt_max_ns_.store(13'000'000LL, std::memory_order_relaxed);
+            client.have_ping_reply_sequence_.store(true, std::memory_order_release);
+            client.ping_tx_sequence_.store(44, std::memory_order_release);
+            client.last_ping_reply_sequence_.store(43, std::memory_order_release);
+            client.ping_path_interval_received_.store(5, std::memory_order_relaxed);
+            client.ping_path_interval_missing_.store(2, std::memory_order_relaxed);
+            client.ping_path_total_received_.store(7, std::memory_order_relaxed);
+            client.ping_path_total_missing_.store(3, std::memory_order_relaxed);
+            client.ping_path_consecutive_missing_.store(2, std::memory_order_relaxed);
+            if (!client.can_send_capture_timestamps()) {
+                failure = "synced timestamp-capable client should allow capture timestamps";
+                client.stop_connection();
+                return false;
+            }
+
+            client.start_connection("127.0.0.1", 10);
+            if (client.server_clock_ready_.load(std::memory_order_acquire) ||
+                client.server_clock_offset_ns_.load(std::memory_order_acquire) != 0 ||
+                client.have_ping_reply_sequence_.load(std::memory_order_acquire) ||
+                client.ping_tx_sequence_.load(std::memory_order_acquire) != 0 ||
+                client.last_ping_reply_sequence_.load(std::memory_order_acquire) != 0 ||
+                client.ping_path_interval_received_.load(std::memory_order_relaxed) != 0 ||
+                client.ping_path_interval_missing_.load(std::memory_order_relaxed) != 0 ||
+                client.ping_path_total_received_.load(std::memory_order_relaxed) != 0 ||
+                client.ping_path_total_missing_.load(std::memory_order_relaxed) != 0 ||
+                client.ping_path_consecutive_missing_.load(std::memory_order_relaxed) != 0 ||
+                client.rtt_ms_.load(std::memory_order_relaxed) != 0.0 ||
+                client.rtt_last_ns_.load(std::memory_order_relaxed) != 0 ||
+                client.rtt_min_ns_.load(std::memory_order_relaxed) != 0 ||
+                client.rtt_avg_ns_.load(std::memory_order_relaxed) != 0 ||
+                client.rtt_max_ns_.load(std::memory_order_relaxed) != 0) {
+                failure = "new start_connection should clear stale clock and ping state";
+                client.stop_connection();
+                return false;
+            }
+            if (client.can_send_capture_timestamps() ||
+                client.server_time_for_steady_time_ns_if_ready(
+                    std::chrono::steady_clock::now())
+                    .has_value()) {
+                failure = "new start_connection should gate capture timestamps until sync";
+                client.stop_connection();
+                return false;
+            }
+
+            ParticipantData reset_participant;
+            OpusPacket reset_packet;
+            reset_packet.capture_server_time_ns = capture_ns;
+            reset_packet.capture_timestamp_valid = true;
+            client.observe_capture_to_playout_latency_if_clock_ready(
+                reset_participant, reset_packet, std::chrono::steady_clock::now());
+            if (reset_participant.capture_to_playout_latency_samples.load(
+                    std::memory_order_relaxed) != 0) {
+                failure = "new start_connection should gate E2E latency samples until sync";
+                client.stop_connection();
+                return false;
+            }
+
+            client.stop_connection();
+        }
+
+        append_opus_capture_chunk(participant, 120, capture_ns, true);
+        append_opus_capture_chunk(participant, 120, 20'000'000LL, true);
+        observe_and_consume_opus_capture_chunks(participant, 120, 40'000'000LL);
+        const int64_t first_chunk =
+            participant.capture_to_playout_latency_last_ns.load(std::memory_order_relaxed);
+        if (first_chunk != 30'000'000LL) {
+            failure = "first Opus capture chunk should observe 30 ms";
+            return false;
+        }
+        observe_and_consume_opus_capture_chunks(participant, 120, 45'000'000LL);
+        const int64_t second_chunk =
+            participant.capture_to_playout_latency_last_ns.load(std::memory_order_relaxed);
+        if (second_chunk != 25'000'000LL) {
+            failure = "second Opus capture chunk should observe 25 ms";
+            return false;
+        }
+
         return true;
     }
 
@@ -3957,8 +4284,9 @@ private:
                                                   std::memory_order_relaxed)) {
         }
         observe_ping_path_feedback(hdr.seq, rtt_ms);
-        if (!server_clock_ready_.exchange(true, std::memory_order_acq_rel)) {
+        if (!server_clock_ready_.load(std::memory_order_acquire)) {
             server_clock_offset_ns_.store(offset, std::memory_order_release);
+            server_clock_ready_.store(true, std::memory_order_release);
         } else {
             const int64_t previous = server_clock_offset_ns_.load(std::memory_order_relaxed);
             server_clock_offset_ns_.store(((previous * 15) + offset) / 16,
@@ -3978,27 +4306,28 @@ private:
             return;
         }
 
-        const bool is_structured_audio =
-            msg_hdr.magic == AUDIO_V2_MAGIC || msg_hdr.magic == AUDIO_V3_MAGIC;
+        const bool is_audio_v2 = msg_hdr.magic == AUDIO_V2_MAGIC;
+        const bool is_audio_v3 = msg_hdr.magic == AUDIO_V3_MAGIC;
+        const bool is_versioned_audio = is_audio_v2 || is_audio_v3;
         const auto parsed_audio =
-            is_structured_audio
+            is_versioned_audio
                 ? audio_packet::parse_audio_header(
                       reinterpret_cast<const unsigned char*>(recv_data), bytes)
                 : audio_packet::ParsedAudioHeader{};
         const size_t min_packet_size =
-            is_structured_audio && parsed_audio.valid
-                ? parsed_audio.header_size
-                : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+            is_audio_v3 ? audio_packet::v3_header_size()
+                        : (is_audio_v2 ? audio_packet::v2_header_size()
+                                       : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
 
         if (!message_validator::is_valid_audio_packet(bytes, min_packet_size)) {
             return;
         }
 
         const auto* packet_bytes = reinterpret_cast<const unsigned char*>(recv_data);
-        uint32_t sender_id = is_structured_audio ? parsed_audio.sender_id
+        uint32_t sender_id = is_versioned_audio ? parsed_audio.sender_id
                                                  : packet_builder::extract_sender_id(packet_bytes);
         uint16_t payload_bytes =
-            is_structured_audio ? parsed_audio.payload_bytes
+            is_versioned_audio ? parsed_audio.payload_bytes
                                 : packet_builder::extract_encoded_bytes(packet_bytes);
 
         size_t expected_size = min_packet_size + payload_bytes;
@@ -4015,20 +4344,18 @@ private:
             return;
         }
 
-        if (is_structured_audio) {
+        if (is_versioned_audio) {
             std::string reason;
             if (!audio_packet::validate_audio_packet_bytes(packet_bytes, bytes, &reason)) {
                 const uint64_t count =
                     inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (count == 1 || count % 100 == 0) {
                     Log::warn(
-                        "Dropping invalid inbound V2/V3 audio: reason={} magic=0x{:08x} "
-                        "sender={} seq={} "
+                        "Dropping invalid versioned audio: reason={} sender={} seq={} "
                         "sample_rate={} frame_count={} channels={} payload_bytes={} drops={}",
-                        reason, msg_hdr.magic, sender_id, parsed_audio.sequence,
-                        parsed_audio.sample_rate, parsed_audio.frame_count,
-                        static_cast<int>(parsed_audio.channels), parsed_audio.payload_bytes,
-                        count);
+                        reason, sender_id, parsed_audio.sequence, parsed_audio.sample_rate,
+                        parsed_audio.frame_count, static_cast<int>(parsed_audio.channels),
+                        parsed_audio.payload_bytes, count);
                 }
                 return;
             }
@@ -4038,10 +4365,10 @@ private:
         if (!participant_manager_.exists(sender_id)) {
             // Validate audio_config_ before using it
             const int decoder_sample_rate =
-                is_structured_audio ? static_cast<int>(parsed_audio.sample_rate)
+                is_versioned_audio ? static_cast<int>(parsed_audio.sample_rate)
                                     : current_audio_sample_rate();
             const int decoder_channels =
-                is_structured_audio ? static_cast<int>(parsed_audio.channels) : 1;
+                is_versioned_audio ? static_cast<int>(parsed_audio.channels) : 1;
             if (decoder_sample_rate == 0 || current_audio_frames_per_buffer() == 0 ||
                 decoder_channels == 0) {
                 Log::error(
@@ -4066,7 +4393,7 @@ private:
         total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
 
         const unsigned char* audio_data =
-            is_structured_audio ? audio_packet::audio_payload(packet_bytes, bytes)
+            is_versioned_audio ? packet_builder::audio_payload(packet_bytes, bytes)
                                 : packet_builder::audio_v1_payload(packet_bytes);
         if (audio_data == nullptr) {
             return;
@@ -4081,13 +4408,17 @@ private:
                 std::memcpy(packet.data.data(), audio_data, payload_bytes);
                 packet.size      = payload_bytes;
                 packet.timestamp = std::chrono::steady_clock::now();
-                if (is_structured_audio) {
+                if (is_versioned_audio) {
                     packet.codec       = parsed_audio.codec;
                     packet.sequence    = parsed_audio.sequence;
                     packet.sequence_valid = true;
                     packet.sample_rate = parsed_audio.sample_rate;
                     packet.frame_count = parsed_audio.frame_count;
                     packet.channels    = parsed_audio.channels;
+                    packet.capture_timestamp_valid =
+                        parsed_audio.capture_timestamp_valid;
+                    packet.capture_server_time_ns =
+                        parsed_audio.capture_server_time_ns;
                     const auto sequence_delta =
                         participant.sequence_tracker.record(packet.sequence);
                     if (sequence_delta.gaps_detected > 0) {
@@ -4525,8 +4856,13 @@ private:
                 participant.opus_pcm_buffered_frames >=
                     opus_resample_required_input_frames(
                         participant, frame_count, playout_ratio)) {
-                mix_resampled_opus_pcm(participant, output_buffer, frame_count, out_channels,
-                                       participant_gain, playout_ratio);
+                const auto playout_server_time_ns =
+                    client->server_time_for_steady_time_ns_if_ready(playout_start);
+                const size_t consumed_frames = mix_resampled_opus_pcm(
+                    participant, output_buffer, frame_count, out_channels,
+                    participant_gain, playout_ratio);
+                observe_and_consume_opus_capture_chunks(participant, consumed_frames,
+                                                        playout_server_time_ns);
                 observe_opus_pcm_depth(participant);
                 observe_auto_jitter_stable(participant);
                 participant.opus_consecutive_empty_callbacks.store(0,
@@ -4587,6 +4923,7 @@ private:
                 if (opus_packet.reset_decoder && opus_packet.codec == AudioCodec::Opus) {
                     participant.decoder->reset();
                     participant.opus_pcm_buffered_frames = 0;
+                    clear_opus_capture_chunks(participant);
                     participant.opus_resample_phase = 0.0;
                     observe_auto_jitter_instability(participant);
                 }
@@ -4667,10 +5004,15 @@ private:
                                         static_cast<std::ptrdiff_t>(
                                             participant.opus_pcm_buffered_frames));
                         participant.opus_pcm_buffered_frames += decoded_frames;
+                        append_opus_capture_chunk(
+                            participant, decoded_frames,
+                            opus_packet.capture_server_time_ns,
+                            opus_packet.capture_timestamp_valid);
                         participant.opus_packets_decoded_in_callback.fetch_add(
                             1, std::memory_order_relaxed);
                     } else {
                         participant.opus_pcm_buffered_frames = 0;
+                        clear_opus_capture_chunks(participant);
                         participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
                         participant.opus_decode_buffer_overflow_drops.fetch_add(
                             1, std::memory_order_relaxed);
@@ -4696,6 +5038,7 @@ private:
                         if (next_packet.reset_decoder) {
                             participant.decoder->reset();
                             participant.opus_pcm_buffered_frames = 0;
+                            clear_opus_capture_chunks(participant);
                             participant.opus_resample_phase = 0.0;
                             observe_auto_jitter_instability(participant);
                         }
@@ -4729,6 +5072,7 @@ private:
                         if (participant.opus_pcm_buffered_frames + next_decoded_frames >
                             participant.opus_pcm_buffer.size()) {
                             participant.opus_pcm_buffered_frames = 0;
+                            clear_opus_capture_chunks(participant);
                             participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
                             participant.opus_decode_buffer_overflow_drops.fetch_add(
                                 1, std::memory_order_relaxed);
@@ -4740,6 +5084,10 @@ private:
                                         static_cast<std::ptrdiff_t>(
                                             participant.opus_pcm_buffered_frames));
                         participant.opus_pcm_buffered_frames += next_decoded_frames;
+                        append_opus_capture_chunk(
+                            participant, next_decoded_frames,
+                            next_packet.capture_server_time_ns,
+                            next_packet.capture_timestamp_valid);
                         participant.opus_packets_decoded_in_callback.fetch_add(
                             1, std::memory_order_relaxed);
                         playout_ratio = opus_playout_rate_ratio(participant);
@@ -4758,17 +5106,26 @@ private:
                     required_input_frames = opus_resample_required_input_frames(
                         participant, frame_count, playout_ratio);
                     if (participant.opus_pcm_buffered_frames >= required_input_frames) {
-                        mix_resampled_opus_pcm(participant, output_buffer, frame_count,
-                                               out_channels, participant_gain, playout_ratio);
+                        const auto playout_server_time_ns =
+                            client->server_time_for_steady_time_ns_if_ready(playout_start);
+                        const size_t consumed_frames = mix_resampled_opus_pcm(
+                            participant, output_buffer, frame_count, out_channels,
+                            participant_gain, playout_ratio);
+                        observe_and_consume_opus_capture_chunks(participant, consumed_frames,
+                                                                playout_server_time_ns);
                         observe_opus_pcm_depth(participant);
                         observe_auto_jitter_stable(participant);
                         participant.opus_consecutive_empty_callbacks.store(
                             0, std::memory_order_relaxed);
                         active_count++;
                     } else if (participant.opus_pcm_buffered_frames > 0) {
-                        mix_available_opus_pcm_with_tail(participant, output_buffer, frame_count,
-                                                        out_channels, participant_gain,
-                                                        playout_ratio);
+                        const auto playout_server_time_ns =
+                            client->server_time_for_steady_time_ns_if_ready(playout_start);
+                        const size_t consumed_frames = mix_available_opus_pcm_with_tail(
+                            participant, output_buffer, frame_count, out_channels,
+                            participant_gain, playout_ratio);
+                        observe_and_consume_opus_capture_chunks(participant, consumed_frames,
+                                                                playout_server_time_ns);
                         observe_opus_pcm_depth(participant);
                         participant.opus_consecutive_empty_callbacks.store(
                             0, std::memory_order_relaxed);
@@ -4788,6 +5145,11 @@ private:
                     participant.last_pcm_samples = static_cast<size_t>(decoded_samples);
                     participant.last_pcm_valid = true;
                     participant.pcm_concealment_used = false;
+                }
+
+                if (opus_packet.codec == AudioCodec::PcmInt16) {
+                    client->observe_capture_to_playout_latency_if_clock_ready(
+                        participant, opus_packet, playout_start);
                 }
 
                 // Calculate audio level (RMS) for voice activity detection
@@ -4843,9 +5205,13 @@ private:
                     if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::Opus &&
                         participant.opus_pcm_buffered_frames > 0) {
                         const double playout_ratio = opus_playout_rate_ratio(participant);
-                        mix_available_opus_pcm_with_tail(participant, output_buffer, frame_count,
-                                                        out_channels, participant_gain,
-                                                        playout_ratio);
+                        const auto playout_server_time_ns =
+                            client->server_time_for_steady_time_ns_if_ready(playout_start);
+                        const size_t consumed_frames = mix_available_opus_pcm_with_tail(
+                            participant, output_buffer, frame_count, out_channels,
+                            participant_gain, playout_ratio);
+                        observe_and_consume_opus_capture_chunks(participant, consumed_frames,
+                                                                playout_server_time_ns);
                         observe_opus_pcm_depth(participant);
                         participant.opus_consecutive_empty_callbacks.store(
                             0, std::memory_order_relaxed);
@@ -4857,9 +5223,13 @@ private:
                 if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::Opus &&
                     participant.opus_pcm_buffered_frames > 0) {
                     const double playout_ratio = opus_playout_rate_ratio(participant);
-                    mix_available_opus_pcm_with_tail(participant, output_buffer, frame_count,
-                                                    out_channels, participant_gain,
-                                                    playout_ratio);
+                    const auto playout_server_time_ns =
+                        client->server_time_for_steady_time_ns_if_ready(playout_start);
+                    const size_t consumed_frames = mix_available_opus_pcm_with_tail(
+                        participant, output_buffer, frame_count, out_channels, participant_gain,
+                        playout_ratio);
+                    observe_and_consume_opus_capture_chunks(participant, consumed_frames,
+                                                            playout_server_time_ns);
                     observe_opus_pcm_depth(participant);
                     participant.opus_consecutive_empty_callbacks.store(0,
                                                                        std::memory_order_relaxed);
@@ -6576,6 +6946,7 @@ struct ClientStartupOptions {
     bool opus_playout_policy_smoke = false;
     bool opus_redundancy_policy_smoke = false;
     bool audio_v3_receive_smoke = false;
+    bool e2e_latency_metric_smoke = false;
     int baseline_snapshot_seconds = 0;
     int baseline_snapshot_interval_seconds = 5;
     std::string baseline_snapshot_label = "manual";
@@ -6678,6 +7049,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.opus_redundancy_policy_smoke = true;
         } else if (arg == "--audio-v3-receive-smoke") {
             options.audio_v3_receive_smoke = true;
+        } else if (arg == "--e2e-latency-metric-smoke") {
+            options.e2e_latency_metric_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
         } else if (arg == "--baseline-snapshot-seconds" && i + 1 < argc) {
@@ -7235,6 +7608,17 @@ int main(int argc, char** argv) {
                 return 2;
             }
             Log::info("Audio V3 receive smoke passed");
+            log.flush();
+            return 0;
+        }
+        if (startup_options.e2e_latency_metric_smoke) {
+            std::string failure;
+            if (!Client::run_e2e_latency_metric_smoke(failure)) {
+                Log::error("E2E latency metric smoke failed: {}", failure);
+                log.flush();
+                return 16;
+            }
+            Log::info("E2E latency metric smoke passed");
             log.flush();
             return 0;
         }
