@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -8,7 +10,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -1631,6 +1632,10 @@ private:
     }
 
     void clear_audio_path_queues() {
+        // Precondition: the audio stream must be stopped. This resets decoder
+        // and PCM state that the audio callback mutates without locks; running
+        // it concurrently with the callback is undefined behavior.
+        assert(!audio_.is_stream_active());
         PcmSendFrame discarded_pcm;
         while (pcm_send_queue_.try_dequeue(discarded_pcm)) {
         }
