@@ -53,6 +53,38 @@ void test_join_leave_timeout_update_audio_snapshot() {
     require(ids.empty(), "audio snapshot empty after timeout");
 }
 
+void test_metadata_and_info_snapshot_are_published() {
+    ParticipantManager manager;
+
+    manager.set_participant_metadata(20, "profile-before", "Name Before");
+    require(manager.register_participant(20, 48000, 1), "register participant 20");
+
+    auto infos = manager.get_all_info();
+    require(infos.size() == 1, "info snapshot has joined participant");
+    require(infos[0].id == 20, "info snapshot has participant id");
+    require(infos[0].profile_id == "profile-before", "pending profile metadata published");
+    require(infos[0].display_name == "Name Before", "pending display metadata published");
+
+    manager.set_participant_metadata(20, "profile-after", "Name After");
+    infos = manager.get_all_info();
+    require(infos.size() == 1, "info snapshot still has participant after metadata update");
+    require(infos[0].profile_id == "profile-after", "updated profile metadata published");
+    require(infos[0].display_name == "Name After", "updated display metadata published");
+
+    manager.with_participant(20, [](ParticipantData& participant) {
+        participant.gain.store(1.5F, std::memory_order_relaxed);
+        participant.is_muted.store(true, std::memory_order_relaxed);
+    });
+    infos = manager.get_all_info();
+    require(infos[0].gain > 1.49F && infos[0].gain < 1.51F,
+            "info snapshot read reflects live gain atomics");
+    require(infos[0].is_muted, "info snapshot read reflects live mute atomics");
+
+    manager.remove_participant(20);
+    require(manager.get_all_info().empty(), "info snapshot empty after leave");
+    require(manager.count() == 0, "count reads published snapshot after leave");
+}
+
 void test_immediate_reap_without_snapshot() {
     ParticipantManager manager;
     require(manager.register_participant(1, 48000, 1), "register participant");
@@ -117,6 +149,7 @@ void test_timeout_and_clear_route_through_graveyard() {
 
 int main() {
     test_join_leave_timeout_update_audio_snapshot();
+    test_metadata_and_info_snapshot_are_published();
     test_immediate_reap_without_snapshot();
     test_snapshot_defers_reclamation();
     test_timeout_and_clear_route_through_graveyard();
