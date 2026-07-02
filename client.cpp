@@ -602,6 +602,9 @@ public:
         double total_network_ms = 0.0;
         double total_jitter_ms = 0.0;
         double total_output_ms = 0.0;
+        double e2e_latency_avg_max_ms = 0.0;
+        double e2e_latency_peak_ms = 0.0;
+        uint64_t e2e_latency_samples = 0;
         double tx_pace_avg_ms = 0.0;
         double tx_pace_max_ms = 0.0;
         size_t rx_queue_current = 0;
@@ -701,6 +704,14 @@ public:
                 std::max(diagnostics.rx_queue_peak, participant.queue_size_max);
             diagnostics.underruns += participant.underrun_count;
             diagnostics.plc_frames += participant.plc_count;
+            diagnostics.e2e_latency_avg_max_ms =
+                std::max(diagnostics.e2e_latency_avg_max_ms,
+                         participant.capture_to_playout_latency_avg_ms);
+            diagnostics.e2e_latency_peak_ms =
+                std::max(diagnostics.e2e_latency_peak_ms,
+                         participant.capture_to_playout_latency_max_ms);
+            diagnostics.e2e_latency_samples +=
+                participant.capture_to_playout_latency_samples;
         }
         return diagnostics;
     }
@@ -3024,13 +3035,15 @@ private:
 
             Log::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
-                "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/recovered/unresolved/late={}/{}/{}/{} "
+                "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} e2e_avg_ms={:.1f} e2e_max_ms={:.1f} drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/recovered/unresolved/late={}/{}/{}/{} "
                 "target_trim={} drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.jitter_buffer_min_packets,
                 p.opus_queue_limit_packets, p.last_packet_frame_count,
                 p.last_callback_frame_count, p.opus_pcm_buffered_frames,
                 p.opus_packets_decoded_in_callback, p.packet_age_avg_ms,
+                p.capture_to_playout_latency_avg_ms,
+                p.capture_to_playout_latency_max_ms,
                 p.receiver_drift_ppm_last, p.receiver_drift_ppm_avg,
                 p.receiver_drift_ppm_abs_max,
                 p.underrun_count, p.pcm_concealment_frames, p.pcm_drift_drops,
@@ -3554,6 +3567,28 @@ public:
             client.stop_connection();
         }
 
+        ParticipantManager manager;
+        if (!manager.register_participant(99, 48000, 1)) {
+            failure = "participant registration should succeed";
+            return false;
+        }
+        manager.with_participant(99, [](ParticipantData& data) {
+            data.capture_to_playout_latency_last_ns.store(11'000'000LL,
+                                                          std::memory_order_relaxed);
+            data.capture_to_playout_latency_avg_ns.store(12'000'000LL,
+                                                         std::memory_order_relaxed);
+            data.capture_to_playout_latency_max_ns.store(13'000'000LL,
+                                                         std::memory_order_relaxed);
+            data.capture_to_playout_latency_samples.store(3,
+                                                          std::memory_order_relaxed);
+        });
+        const auto infos = manager.get_all_info();
+        if (infos.empty() || infos.front().capture_to_playout_latency_avg_ms != 12.0 ||
+            infos.front().capture_to_playout_latency_samples != 3) {
+            failure = "participant info should publish E2E latency fields";
+            return false;
+        }
+
         append_opus_capture_chunk(participant, 120, capture_ns, true);
         append_opus_capture_chunk(participant, 120, 20'000'000LL, true);
         observe_and_consume_opus_capture_chunks(participant, 120, 40'000'000LL);
@@ -3954,6 +3989,7 @@ public:
                 "jitter_buffer={} jitter_floor={} queue_limit={} auto_jitter={} "
                 "auto_increases={} auto_decreases={} pkt_frames={} cb_frames={} "
                 "decoded_frames={} decoded_packets={} age_ms last/avg/max={:.1f}/{:.1f}/{:.1f} "
+                "e2e_ms last/avg/max={:.1f}/{:.1f}/{:.1f} e2e_samples={} "
                 "drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} "
                 "pcm_hold={} pcm_drift_drops={} drops jitter_depth/jitter_age={}/{} "
                 "drop_detail limit/age/overflow/target={}/{}/{}/{} "
@@ -3981,6 +4017,10 @@ public:
                 p.packet_age_last_ms,
                 p.packet_age_avg_ms,
                 p.packet_age_max_ms,
+                p.capture_to_playout_latency_last_ms,
+                p.capture_to_playout_latency_avg_ms,
+                p.capture_to_playout_latency_max_ms,
+                p.capture_to_playout_latency_samples,
                 p.receiver_drift_ppm_last,
                 p.receiver_drift_ppm_avg,
                 p.receiver_drift_ppm_abs_max,
@@ -5997,6 +6037,15 @@ static void draw_master_strip(Client& client, float available_height) {
                       path.total_output_ms, path.opus_send_queue_avg_ms);
         JamGui::ShowTooltipOnHover(total_tooltip);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+        if (path.e2e_latency_samples > 0) {
+            ImGui::Text("E2E %.1f/%.1f ms",
+                        path.e2e_latency_avg_max_ms, path.e2e_latency_peak_ms);
+            JamGui::ShowTooltipOnHover("Capture-to-playout average max / peak across participants");
+        } else {
+            ImGui::Text("E2E waiting");
+            JamGui::ShowTooltipOnHover("Waiting for timestamped packets and server clock sync");
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("TX q %.2f/%.2f ms",
                     path.opus_send_queue_avg_ms, path.opus_send_queue_max_ms);
         JamGui::ShowTooltipOnHover("Opus sender queue age average / max");
@@ -6373,6 +6422,14 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
             ImGui::Text("Age: %.1f ms", p.packet_age_avg_ms);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Max age: %.1f ms", p.packet_age_max_ms);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+            if (p.capture_to_playout_latency_samples > 0) {
+                ImGui::Text("E2E: %.1f ms", p.capture_to_playout_latency_avg_ms);
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
+                ImGui::Text("Max E2E: %.1f ms", p.capture_to_playout_latency_max_ms);
+            } else {
+                ImGui::Text("E2E: waiting");
+            }
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
             ImGui::Text("Drift ppm: %.1f avg", p.receiver_drift_ppm_avg);
             if (p.sequence_gaps > 0 || p.sequence_late_or_reordered > 0 ||
