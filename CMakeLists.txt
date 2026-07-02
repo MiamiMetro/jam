@@ -55,6 +55,9 @@ if(JAM_BUILD_TESTS)
     add_executable(participant_packet_queue_self_test participant_packet_queue_self_test.cpp)
     target_link_libraries(participant_packet_queue_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 
+    add_executable(participant_manager_self_test participant_manager_self_test.cpp)
+    target_link_libraries(participant_manager_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
+
     add_executable(sequence_tracker_self_test sequence_tracker_self_test.cpp)
 
     add_executable(udp_port_self_test udp_port_self_test.cpp)
@@ -104,6 +107,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(opus_network_clock_self_test)
     jam_add_executable_test(audio_packet_self_test)
     jam_add_executable_test(participant_packet_queue_self_test)
+    jam_add_executable_test(participant_manager_self_test)
     jam_add_executable_test(sequence_tracker_self_test)
     jam_add_executable_test(udp_port_self_test)
     jam_add_executable_test(jitter_policy_self_test)

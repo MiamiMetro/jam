@@ -62,11 +62,12 @@ public:
         }
     }
 
-    // Remove a participant
+    // Remove a participant (destruction is deferred; see graveyard_)
     void remove_participant(uint32_t id) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = participants_.find(id);
         if (it != participants_.end()) {
+            graveyard_.push_back(std::move(it->second));
             participants_.erase(it);
             Log::info("Participant {} left", id);
         }
@@ -195,6 +196,7 @@ public:
                 Log::info("Participant {} timed out ({}s since last packet)", it->first,
                           elapsed.count());
                 removed_ids.push_back(it->first);
+                graveyard_.push_back(std::move(it->second));
                 it = participants_.erase(it);
             } else {
                 ++it;
@@ -210,10 +212,40 @@ public:
         return participants_.size();
     }
 
-    // Clear all participants
+    // Clear all participants (destruction is deferred; see graveyard_)
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& [id, participant]: participants_) {
+            graveyard_.push_back(std::move(participant));
+        }
         participants_.clear();
+    }
+
+    // Destroy retired participants that no snapshot references anymore.
+    // Call from the io thread only. Destruction runs outside the lock so a
+    // concurrent for_each() in the audio callback is never blocked on frees.
+    // Safety: a graveyard-only entry can never gain new references (for_each
+    // snapshots map entries only), so use_count()==1 observed under the lock
+    // cannot race upward.
+    size_t reap_retired_participants() {
+        std::vector<std::shared_ptr<ParticipantData>> to_destroy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = graveyard_.begin(); it != graveyard_.end();) {
+                if (it->use_count() == 1) {
+                    to_destroy.push_back(std::move(*it));
+                    it = graveyard_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        return to_destroy.size();
+    }
+
+    size_t retired_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return graveyard_.size();
     }
 
     // Iterate over all participants (thread-safe, for audio mixing)
@@ -247,5 +279,10 @@ private:
 
     mutable std::mutex                                             mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<ParticipantData>> participants_;
+    // Removed participants are parked here and destroyed only by
+    // reap_retired_participants() on the io thread, once no audio-callback
+    // snapshot references them. Destruction frees heap memory and destroys the
+    // Opus decoder, so it must never run on the audio thread.
+    std::vector<std::shared_ptr<ParticipantData>>                  graveyard_;
     std::unordered_map<uint32_t, ParticipantMetadata>               pending_metadata_;
 };
