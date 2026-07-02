@@ -121,6 +121,10 @@ if(JAM_BUILD_TESTS)
              COMMAND $<TARGET_FILE:opus_receiver_harness> --self-test)
     add_test(NAME server_redundancy_relay_smoke
              COMMAND $<TARGET_FILE:server> --redundancy-relay-smoke)
+    add_test(NAME server_timestamp_relay_smoke
+             COMMAND $<TARGET_FILE:server> --timestamp-relay-smoke)
+    add_test(NAME latency_probe_v3_receive_smoke
+             COMMAND $<TARGET_FILE:latency_probe> --v3-receive-smoke)
     if(NODE_EXECUTABLE)
         add_test(NAME server_audio_path_feedback_smoke
                  COMMAND ${NODE_EXECUTABLE}
@@ -160,6 +164,8 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --opus-playout-policy-smoke)
         add_test(NAME client_opus_redundancy_policy_smoke
                  COMMAND $<TARGET_FILE:client> --opus-redundancy-policy-smoke)
+        add_test(NAME client_audio_v3_receive_smoke
+                 COMMAND $<TARGET_FILE:client> --audio-v3-receive-smoke)
         add_test(NAME client_startup_config_adaptive_smoke
                  COMMAND $<TARGET_FILE:client> --startup-config-smoke)
         set_tests_properties(client_startup_config_adaptive_smoke PROPERTIES

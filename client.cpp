@@ -348,7 +348,7 @@ public:
         write_fixed(join.profile_id, performer_join_options_.user_id);
         write_fixed(join.display_name, performer_join_options_.display_name);
         write_fixed(join.join_token, performer_join_options_.join_token);
-        join.capabilities = AUDIO_CAP_REDUNDANCY;
+        join.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinHdr));
         std::memcpy(buf->data(), &join, sizeof(JoinHdr));
         join_state_.mark_join_sent(std::chrono::steady_clock::now());
@@ -1537,7 +1537,10 @@ public:
             handle_audio_message(bytes, state->buffer.data());
         } else if ((hdr.magic == AUDIO_MAGIC &&
                     bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) ||
-                   (hdr.magic == AUDIO_V2_MAGIC && bytes >= sizeof(AudioHdrV2) - AUDIO_BUF_SIZE)) {
+                   (hdr.magic == AUDIO_V2_MAGIC &&
+                    bytes >= audio_packet::v2_header_size()) ||
+                   (hdr.magic == AUDIO_V3_MAGIC &&
+                    bytes >= audio_packet::v3_header_size())) {
             handle_audio_message(bytes, state->buffer.data());
         } else {
             // Log unknown message with hex dump for debugging
@@ -3145,6 +3148,105 @@ public:
                                "explicit depth clamps to protocol max");
     }
 
+    static bool run_audio_v3_receive_smoke(std::string& failure) {
+        auto stamp_sender = [](const std::shared_ptr<std::vector<unsigned char>>& packet,
+                               uint32_t sender_id) {
+            if (packet == nullptr || packet->size() < sizeof(MsgHdr) + sizeof(sender_id)) {
+                return false;
+            }
+            std::memcpy(packet->data() + sizeof(MsgHdr), &sender_id, sizeof(sender_id));
+            return true;
+        };
+        auto make_v3 = [&](uint32_t sender_id, uint32_t sequence, uint8_t value) {
+            const std::array<unsigned char, 3> payload{value, static_cast<uint8_t>(value + 1),
+                                                       static_cast<uint8_t>(value + 2)};
+            auto packet = audio_packet::create_audio_packet_v3(
+                AudioCodec::Opus, sequence, opus_network_clock::SAMPLE_RATE,
+                opus_network_clock::DEFAULT_FRAME_COUNT, 1, payload.data(),
+                static_cast<uint16_t>(payload.size()), 123456789LL + sequence);
+            return stamp_sender(packet, sender_id) ? packet : nullptr;
+        };
+        auto expect_next_packet = [&](ParticipantData& participant, uint32_t sequence,
+                                      uint8_t first_byte, const char* label) {
+            OpusPacket packet{};
+            if (!participant.opus_queue.try_dequeue(packet)) {
+                failure = std::string(label) + ": no packet queued";
+                return false;
+            }
+            if (packet.codec != AudioCodec::Opus || !packet.sequence_valid ||
+                packet.sequence != sequence ||
+                packet.sample_rate != opus_network_clock::SAMPLE_RATE ||
+                packet.frame_count != opus_network_clock::DEFAULT_FRAME_COUNT ||
+                packet.channels != 1 || packet.size != 3 || packet.data[0] != first_byte) {
+                failure = std::string(label) + ": queued packet metadata mismatch";
+                return false;
+            }
+            return true;
+        };
+
+        asio::io_context io_context;
+        PerformerJoinOptions join_options{};
+        Client client(io_context, "127.0.0.1", 9, join_options);
+
+        constexpr uint32_t direct_sender = 77;
+        auto direct = make_v3(direct_sender, 7, 0x31);
+        if (direct == nullptr) {
+            failure = "failed to build direct V3 packet";
+            return false;
+        }
+        client.handle_audio_message(direct->size(),
+                                    reinterpret_cast<const char*>(direct->data()));
+
+        bool direct_ok = false;
+        if (!client.participant_manager_.with_participant(
+                direct_sender, [&](ParticipantData& participant) {
+                    direct_ok = expect_next_packet(participant, 7, 0x31, "direct V3");
+                }) ||
+            !direct_ok) {
+            if (failure.empty()) {
+                failure = "direct V3 sender was not registered";
+            }
+            client.stop_connection();
+            return false;
+        }
+
+        constexpr uint32_t redundant_sender = 78;
+        auto current = make_v3(redundant_sender, 21, 0x41);
+        auto previous = make_v3(redundant_sender, 20, 0x51);
+        if (current == nullptr || previous == nullptr) {
+            failure = "failed to build redundant V3 children";
+            client.stop_connection();
+            return false;
+        }
+        auto redundant =
+            audio_packet::create_redundant_audio_packet({current.get(), previous.get()});
+        if (redundant == nullptr) {
+            failure = "failed to build redundant V3 packet";
+            client.stop_connection();
+            return false;
+        }
+        client.handle_audio_message(redundant->size(),
+                                    reinterpret_cast<const char*>(redundant->data()));
+
+        bool redundant_ok = false;
+        if (!client.participant_manager_.with_participant(
+                redundant_sender, [&](ParticipantData& participant) {
+                    redundant_ok =
+                        expect_next_packet(participant, 20, 0x51, "redundant previous V3") &&
+                        expect_next_packet(participant, 21, 0x41, "redundant current V3");
+                }) ||
+            !redundant_ok) {
+            if (failure.empty()) {
+                failure = "redundant V3 sender was not registered";
+            }
+            client.stop_connection();
+            return false;
+        }
+
+        client.stop_connection();
+        return true;
+    }
+
     static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
         auto initialize_auto_participant = [](ParticipantData& target) {
             target.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
@@ -3598,6 +3700,13 @@ private:
                 }
                 ParticipantInfoHdr info{};
                 std::memcpy(&info, recv_data, sizeof(ParticipantInfoHdr));
+                uint32_t participant_capabilities = 0;
+                if (bytes >= sizeof(ParticipantInfoCapsHdr)) {
+                    ParticipantInfoCapsHdr caps_info{};
+                    std::memcpy(&caps_info, recv_data, sizeof(ParticipantInfoCapsHdr));
+                    participant_capabilities =
+                        caps_info.capabilities & AUDIO_SUPPORTED_CAPABILITIES;
+                }
                 const auto profile_id = fixed_string(info.profile_id);
                 const auto display_name = fixed_string(info.display_name);
                 if (!join_state_.is_join_confirmed()) {
@@ -3609,8 +3718,9 @@ private:
                                                               display_name);
                 recording_writer_.set_participant_metadata(info.participant_id, profile_id,
                                                            display_name);
-                Log::info("Participant {} metadata: user='{}' display='{}'", info.participant_id,
-                          profile_id, display_name);
+                Log::info("Participant {} metadata: user='{}' display='{}' capabilities=0x{:08x}",
+                          info.participant_id, profile_id, display_name,
+                          participant_capabilities);
                 break;
             }
             case CtrlHdr::Cmd::JOIN_ACK: {
@@ -3868,20 +3978,28 @@ private:
             return;
         }
 
-        const bool is_v2 = msg_hdr.magic == AUDIO_V2_MAGIC;
+        const bool is_structured_audio =
+            msg_hdr.magic == AUDIO_V2_MAGIC || msg_hdr.magic == AUDIO_V3_MAGIC;
+        const auto parsed_audio =
+            is_structured_audio
+                ? audio_packet::parse_audio_header(
+                      reinterpret_cast<const unsigned char*>(recv_data), bytes)
+                : audio_packet::ParsedAudioHeader{};
         const size_t min_packet_size =
-            is_v2 ? sizeof(AudioHdrV2) - AUDIO_BUF_SIZE
-                  : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
+            is_structured_audio && parsed_audio.valid
+                ? parsed_audio.header_size
+                : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
 
         if (!message_validator::is_valid_audio_packet(bytes, min_packet_size)) {
             return;
         }
 
         const auto* packet_bytes = reinterpret_cast<const unsigned char*>(recv_data);
-        uint32_t sender_id = packet_builder::extract_sender_id(packet_bytes);
+        uint32_t sender_id = is_structured_audio ? parsed_audio.sender_id
+                                                 : packet_builder::extract_sender_id(packet_bytes);
         uint16_t payload_bytes =
-            is_v2 ? packet_builder::extract_v2_payload_bytes(packet_bytes)
-                  : packet_builder::extract_encoded_bytes(packet_bytes);
+            is_structured_audio ? parsed_audio.payload_bytes
+                                : packet_builder::extract_encoded_bytes(packet_bytes);
 
         size_t expected_size = min_packet_size + payload_bytes;
         if (!message_validator::has_complete_payload(bytes, expected_size, 0)) {
@@ -3897,20 +4015,20 @@ private:
             return;
         }
 
-        if (is_v2) {
+        if (is_structured_audio) {
             std::string reason;
-            if (!audio_packet::validate_audio_packet_v2_bytes(packet_bytes, bytes, &reason)) {
+            if (!audio_packet::validate_audio_packet_bytes(packet_bytes, bytes, &reason)) {
                 const uint64_t count =
                     inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (count == 1 || count % 100 == 0) {
-                    AudioHdrV2 audio_hdr{};
-                    std::memcpy(&audio_hdr, packet_bytes, audio_packet::v2_header_size());
                     Log::warn(
-                        "Dropping invalid inbound V2 audio: reason={} sender={} seq={} "
+                        "Dropping invalid inbound V2/V3 audio: reason={} magic=0x{:08x} "
+                        "sender={} seq={} "
                         "sample_rate={} frame_count={} channels={} payload_bytes={} drops={}",
-                        reason, sender_id, audio_hdr.sequence, audio_hdr.sample_rate,
-                        audio_hdr.frame_count, static_cast<int>(audio_hdr.channels),
-                        audio_hdr.payload_bytes, count);
+                        reason, msg_hdr.magic, sender_id, parsed_audio.sequence,
+                        parsed_audio.sample_rate, parsed_audio.frame_count,
+                        static_cast<int>(parsed_audio.channels), parsed_audio.payload_bytes,
+                        count);
                 }
                 return;
             }
@@ -3919,14 +4037,11 @@ private:
         // Register participant if not known
         if (!participant_manager_.exists(sender_id)) {
             // Validate audio_config_ before using it
-            AudioHdrV2 audio_hdr{};
-            if (is_v2) {
-                std::memcpy(&audio_hdr, packet_bytes, audio_packet::v2_header_size());
-            }
             const int decoder_sample_rate =
-                is_v2 ? static_cast<int>(audio_hdr.sample_rate) : current_audio_sample_rate();
+                is_structured_audio ? static_cast<int>(parsed_audio.sample_rate)
+                                    : current_audio_sample_rate();
             const int decoder_channels =
-                is_v2 ? static_cast<int>(audio_hdr.channels) : 1;
+                is_structured_audio ? static_cast<int>(parsed_audio.channels) : 1;
             if (decoder_sample_rate == 0 || current_audio_frames_per_buffer() == 0 ||
                 decoder_channels == 0) {
                 Log::error(
@@ -3951,8 +4066,11 @@ private:
         total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
 
         const unsigned char* audio_data =
-            is_v2 ? packet_builder::audio_v2_payload(packet_bytes)
-                  : packet_builder::audio_v1_payload(packet_bytes);
+            is_structured_audio ? audio_packet::audio_payload(packet_bytes, bytes)
+                                : packet_builder::audio_v1_payload(packet_bytes);
+        if (audio_data == nullptr) {
+            return;
+        }
 
         // CRITICAL: Enqueue audio packet, DON'T decode here
         // Decoding happens in time-driven audio_callback
@@ -3963,15 +4081,13 @@ private:
                 std::memcpy(packet.data.data(), audio_data, payload_bytes);
                 packet.size      = payload_bytes;
                 packet.timestamp = std::chrono::steady_clock::now();
-                if (is_v2) {
-                    AudioHdrV2 audio_hdr{};
-                    std::memcpy(&audio_hdr, packet_bytes, audio_packet::v2_header_size());
-                    packet.codec       = audio_hdr.codec;
-                    packet.sequence    = audio_hdr.sequence;
+                if (is_structured_audio) {
+                    packet.codec       = parsed_audio.codec;
+                    packet.sequence    = parsed_audio.sequence;
                     packet.sequence_valid = true;
-                    packet.sample_rate = audio_hdr.sample_rate;
-                    packet.frame_count = audio_hdr.frame_count;
-                    packet.channels    = audio_hdr.channels;
+                    packet.sample_rate = parsed_audio.sample_rate;
+                    packet.frame_count = parsed_audio.frame_count;
+                    packet.channels    = parsed_audio.channels;
                     const auto sequence_delta =
                         participant.sequence_tracker.record(packet.sequence);
                     if (sequence_delta.gaps_detected > 0) {
@@ -6459,6 +6575,7 @@ struct ClientStartupOptions {
     bool audio_path_feedback_smoke = false;
     bool opus_playout_policy_smoke = false;
     bool opus_redundancy_policy_smoke = false;
+    bool audio_v3_receive_smoke = false;
     int baseline_snapshot_seconds = 0;
     int baseline_snapshot_interval_seconds = 5;
     std::string baseline_snapshot_label = "manual";
@@ -6559,6 +6676,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.opus_playout_policy_smoke = true;
         } else if (arg == "--opus-redundancy-policy-smoke") {
             options.opus_redundancy_policy_smoke = true;
+        } else if (arg == "--audio-v3-receive-smoke") {
+            options.audio_v3_receive_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
         } else if (arg == "--baseline-snapshot-seconds" && i + 1 < argc) {
@@ -7105,6 +7224,17 @@ int main(int argc, char** argv) {
                 return 2;
             }
             Log::info("Opus redundancy policy smoke passed");
+            log.flush();
+            return 0;
+        }
+        if (startup_options.audio_v3_receive_smoke) {
+            std::string failure;
+            if (!Client::run_audio_v3_receive_smoke(failure)) {
+                Log::error("Audio V3 receive smoke failed: {}", failure);
+                log.flush();
+                return 2;
+            }
+            Log::info("Audio V3 receive smoke passed");
             log.flush();
             return 0;
         }

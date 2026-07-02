@@ -86,6 +86,7 @@ struct Args {
     int invalid_flood_interval_us = 0;
     int duration_seconds = 0;
     double playout_ppm = 0.0;
+    bool v3_receive_smoke = false;
     ProbeConfig config;
 };
 
@@ -143,6 +144,15 @@ public:
 
     void start() {
         do_receive();
+    }
+
+    bool handle_test_packet(const std::vector<unsigned char>& packet) {
+        if (packet.size() > recv_buf_.size()) {
+            return false;
+        }
+        std::memcpy(recv_buf_.data(), packet.data(), packet.size());
+        handle_receive(packet.size());
+        return true;
     }
 
     void send_join() {
@@ -217,7 +227,7 @@ private:
         JoinHdr hdr{};
         hdr.magic = CTRL_MAGIC;
         hdr.type = CtrlHdr::Cmd::JOIN;
-        hdr.capabilities = AUDIO_CAP_REDUNDANCY;
+        hdr.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
         packet_builder::write_fixed(hdr.room_id, room);
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
@@ -256,16 +266,18 @@ private:
             audio_packet::for_each_redundant_audio_child_reverse(
                 packet_data, bytes,
                 [this](const unsigned char* child, size_t child_len, uint8_t) {
-                    handle_v2_audio_packet(child, child_len);
+                    handle_audio_packet(child, child_len);
                 });
             return;
         }
 
-        if (hdr.magic == AUDIO_V2_MAGIC) {
+        if (hdr.magic == AUDIO_V2_MAGIC || hdr.magic == AUDIO_V3_MAGIC) {
             raw_audio_count_.fetch_add(1, std::memory_order_relaxed);
-            v2_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            if (hdr.magic == AUDIO_V2_MAGIC) {
+                v2_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            }
             const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
-            handle_v2_audio_packet(packet_data, bytes);
+            handle_audio_packet(packet_data, bytes);
             return;
         }
 
@@ -313,15 +325,20 @@ private:
         }
     }
 
-    void handle_v2_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
+    void handle_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
         std::string reason;
-        if (!audio_packet::validate_audio_packet_v2_bytes(packet_data, bytes, &reason)) {
+        if (!audio_packet::validate_audio_packet_bytes(packet_data, bytes, &reason)) {
             invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
-        AudioHdrV2 audio{};
-        std::memcpy(&audio, packet_data, audio_packet::v2_header_size());
+        const auto audio = audio_packet::parse_audio_header(packet_data, bytes);
+        if (!audio.valid ||
+            (audio.magic != AUDIO_V2_MAGIC && audio.magic != AUDIO_V3_MAGIC)) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         const auto sequence_delta = sequence_tracker_.record(audio.sequence);
         if (sequence_delta.gaps_detected > 0) {
             sequence_gap_count_.fetch_add(static_cast<int>(sequence_delta.gaps_detected),
@@ -341,8 +358,12 @@ private:
         }
 
         OpusPacket packet;
-        std::memcpy(packet.data.data(), packet_builder::audio_v2_payload(packet_data),
-                    audio.payload_bytes);
+        const unsigned char* payload = audio_packet::audio_payload(packet_data, bytes);
+        if (payload == nullptr) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::memcpy(packet.data.data(), payload, audio.payload_bytes);
         packet.size = audio.payload_bytes;
         packet.timestamp = clock_type::now();
         packet.codec = audio.codec;
@@ -453,7 +474,7 @@ private:
         JoinHdr hdr{};
         hdr.magic = CTRL_MAGIC;
         hdr.type = CtrlHdr::Cmd::JOIN;
-        hdr.capabilities = AUDIO_CAP_REDUNDANCY;
+        hdr.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
         packet_builder::write_fixed(hdr.room_id, room);
         packet_builder::write_fixed(hdr.room_handle, room);
         packet_builder::write_fixed(hdr.profile_id, user);
@@ -1018,6 +1039,8 @@ Args parse_args(int argc, char** argv) {
             args.duration_seconds = std::stoi(argv[++i]);
         } else if (arg == "--playout-ppm" && i + 1 < argc) {
             args.playout_ppm = std::stod(argv[++i]);
+        } else if (arg == "--v3-receive-smoke") {
+            args.v3_receive_smoke = true;
         } else if (arg == "--invalid-flood-packets" && i + 1 < argc) {
             args.invalid_flood_packets = std::stoi(argv[++i]);
         } else if (arg == "--invalid-flood-interval-us" && i + 1 < argc) {
@@ -1049,11 +1072,89 @@ Args parse_args(int argc, char** argv) {
     return args;
 }
 
+bool run_v3_receive_smoke() {
+    auto require = [](bool condition, const std::string& message) {
+        if (!condition) {
+            std::cerr << message << "\n";
+            return false;
+        }
+        return true;
+    };
+    auto make_v3 = [](uint32_t sequence, uint8_t first_byte) {
+        const std::array<unsigned char, 3> payload{
+            first_byte, static_cast<uint8_t>(first_byte + 1),
+            static_cast<uint8_t>(first_byte + 2)};
+        return audio_packet::create_audio_packet_v3(
+            AudioCodec::Opus, sequence, SAMPLE_RATE,
+            opus_network_clock::DEFAULT_FRAME_COUNT, CHANNELS, payload.data(),
+            static_cast<uint16_t>(payload.size()), 987654321LL + sequence);
+    };
+    auto expect_packet = [&](ProbeReceiver& receiver, uint32_t sequence,
+                             uint8_t first_byte, const std::string& label) {
+        OpusPacket packet{};
+        if (!require(receiver.pop_packet(packet, 0) == ParticipantOpusDequeueStatus::Packet,
+                     label + ": packet was not queued")) {
+            return false;
+        }
+        return require(packet.codec == AudioCodec::Opus, label + ": codec mismatch") &&
+               require(packet.sequence_valid, label + ": sequence not marked valid") &&
+               require(packet.sequence == sequence, label + ": sequence mismatch") &&
+               require(packet.sample_rate == SAMPLE_RATE, label + ": sample rate mismatch") &&
+               require(packet.frame_count == opus_network_clock::DEFAULT_FRAME_COUNT,
+                       label + ": frame count mismatch") &&
+               require(packet.channels == CHANNELS, label + ": channel count mismatch") &&
+               require(packet.size == 3, label + ": payload size mismatch") &&
+               require(packet.data[0] == first_byte, label + ": payload mismatch");
+    };
+
+    asio::io_context io_context;
+    const udp::endpoint endpoint(asio::ip::make_address("127.0.0.1"), 9);
+    ProbeReceiver receiver(io_context, endpoint, "v3-receive-smoke", "receiver", "");
+
+    auto direct = make_v3(30, 0x21);
+    if (!require(direct != nullptr, "failed to build direct V3 packet") ||
+        !require(receiver.handle_test_packet(*direct), "failed to inject direct V3 packet")) {
+        return false;
+    }
+
+    auto current = make_v3(32, 0x31);
+    auto previous = make_v3(31, 0x41);
+    auto redundant =
+        audio_packet::create_redundant_audio_packet({current.get(), previous.get()});
+    if (!require(current != nullptr && previous != nullptr,
+                 "failed to build redundant V3 children") ||
+        !require(redundant != nullptr, "failed to build redundant V3 packet") ||
+        !require(receiver.handle_test_packet(*redundant),
+                 "failed to inject redundant V3 packet")) {
+        return false;
+    }
+
+    if (!expect_packet(receiver, 30, 0x21, "direct V3") ||
+        !expect_packet(receiver, 31, 0x41, "redundant previous V3") ||
+        !expect_packet(receiver, 32, 0x31, "redundant current V3")) {
+        return false;
+    }
+
+    return require(receiver.raw_audio_count() == 2, "raw packet count mismatch") &&
+           require(receiver.redundant_audio_count() == 1, "redundant packet count mismatch") &&
+           require(receiver.v2_audio_count() == 0, "V3 packets should not increment V2 count") &&
+           require(receiver.invalid_audio_count() == 0, "V3 smoke had invalid packet drops") &&
+           require(receiver.received_count() == 3, "received packet count mismatch");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+
+        if (args.v3_receive_smoke) {
+            if (!run_v3_receive_smoke()) {
+                return 2;
+            }
+            std::cout << "latency probe V3 receive smoke passed\n";
+            return 0;
+        }
 
         if (args.sweep) {
             const std::vector<int> frame_sizes{240, 120, 96, 64};
