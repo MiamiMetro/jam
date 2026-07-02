@@ -15,9 +15,9 @@ Detailed plans:
 
 ## Current State
 
-- Release build passes; full test suite passes 32/32 (verified 2026-07-02).
+- Release build passes; full test suite passes 37/37 (verified 2026-07-02).
 - Receive-side jitter/playout policy is in good shape and regression-tested.
-- Top remaining risk: Phase 3 end-to-end latency is still not measurable in real sessions.
+- Phase 3 end-to-end latency is measurable in loopback smoke and device-backed baseline logs.
 - CI exists and is green for the Phase 0+1 and Phase 2 PRs.
 
 ## Phase 0: CI (do this first)
@@ -83,7 +83,7 @@ build + full ctest + CI green.
 
 ## Phase 3: E2E Latency Measurement
 
-Status: Not started — plan doc written after Phase 2 lands.
+Status: Done (2026-07-02, Release build + full ctest green, E2E loopback smoke green)
 
 Goal: mouth-to-ear latency measurable in real sessions and asserted in tests.
 
@@ -100,6 +100,12 @@ Design decisions to make in the plan doc:
 Acceptance: per-participant one-way capture→playout latency in the Path panel and baseline
 snapshots; a loopback smoke asserting steady-state one-way latency ≤ jitter target +
 1 packet + callback + margin; build + full ctest.
+
+Baseline for Phase 4 comparison: 2026-07-02 local loopback E2E smoke,
+`node tools/e2e-latency-smoke.mjs --server-exe build/Release/server.exe --probe-exe build/Release/latency_probe.exe --frames 120 --jitter 4 --packets 650 --margin-ms 8`.
+Budget: 23.0 ms (10.0 ms jitter target + 2.5 ms packet + 2.5 ms callback + 8.0 ms margin).
+Phase 3 comparison baseline uses the first accepted direct smoke result: measured steady one-way capture-to-playout last 9.1425 ms, avg 9.90777 ms, max 11.5601 ms, steady_max 11.5601 ms; configured margin 8.0 ms, budget headroom 11.4399 ms. A logged rerun of the same command is recorded in `validation_logs/phase3-e2e-baseline/e2e-smoke.log`.
+Device-backed snapshot also passed with Release binaries using `JAM_SERVER_EXE=build/Release/server.exe` and `JAM_CLIENT_EXE=build/Release/client.exe`; `validation_logs/phase3-e2e-baseline/client-a.log` and `client-b.log` contain `Baseline participant` lines with `e2e_ms last/avg/max=`.
 
 ## Phase 4: TX Path Collapse
 
