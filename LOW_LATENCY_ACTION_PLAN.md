@@ -8,7 +8,8 @@ executed from this file directly.
 Detailed plans:
 
 - Phase 0 + 1: `docs/superpowers/plans/2026-07-02-phase0-1-ci-rt-safety.md` (written)
-- Phase 2–5: written when the preceding phase lands (their designs depend on earlier outcomes)
+- Phase 2: `docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md` (written)
+- Phase 3-5: written when the preceding phase lands (their designs depend on earlier outcomes)
 - Ready-to-paste prompts for the sessions that finish each phase:
   `docs/superpowers/plans/2026-07-02-session-prompts.md`
 
@@ -16,8 +17,8 @@ Detailed plans:
 
 - Release build passes; full test suite passes 32/32 (verified 2026-07-02).
 - Receive-side jitter/playout policy is in good shape and regression-tested.
-- Top remaining risk: Phase 2 callback access to `ParticipantManager::mutex_`.
-- CI exists and is green for the Phase 0+1 PR.
+- Top remaining risk: Phase 3 end-to-end latency is still not measurable in real sessions.
+- CI exists and is green for the Phase 0+1 and Phase 2 PRs.
 
 ## Phase 0: CI (do this first)
 
@@ -63,21 +64,22 @@ Acceptance (all mechanically checkable — see plan doc for exact commands):
 
 ## Phase 2: Participant Snapshot
 
-Status: Not started — plan doc written after Phase 1 lands.
+Status: Done (2026-07-02, 32/32 tests, CI green)
 
 Goal: the audio callback never acquires `ParticipantManager::mutex_`.
 
-Design decision to make in the plan doc (do not start coding without it): publication
-mechanism for the immutable participant snapshot — recommended: io thread rebuilds an
-immutable `std::shared_ptr<const std::vector<...>>` on every membership change and
-publishes via `std::atomic_store`; callback does `std::atomic_load` (lock-free reads,
-single-writer). GUI/stats read a separately published snapshot so they stop contending
-entirely. Also move decoder creation and `Log::*` calls out of registration critical
-sections (`participant_manager.h:24-50`).
+Work (summary - the plan doc is authoritative): the io/control thread rebuilds immutable
+participant snapshots on membership changes and publishes them via atomic `shared_ptr`
+store; the audio callback loads the callback snapshot without taking
+`ParticipantManager::mutex_`. GUI/stats read an uncapped published participant snapshot
+plus immutable metadata snapshot, so they no longer contend with manager membership locks.
+Decoder creation and registration logging now run outside the registration critical
+section, and the Phase 1 graveyard still defers destruction until no published snapshot can
+reference retired participants.
 
 Acceptance: scoped grep proves no mutex acquisition in the callback path; participant
 join/leave/timeout/metadata behavior covered by extending `participant_manager_self_test`;
-build + full ctest.
+build + full ctest + CI green.
 
 ## Phase 3: E2E Latency Measurement
 

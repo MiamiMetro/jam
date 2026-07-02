@@ -4354,6 +4354,8 @@ private:
             }
         } timing_scope{client, callback_start, frame_count, runtime_sample_rate};
 
+        ParticipantManager::AudioCallbackReadScope participant_snapshot_scope;
+
 #ifdef _WIN32
         // Boost thread priority on Windows for minimal audio latency
         static bool priority_set = false;
