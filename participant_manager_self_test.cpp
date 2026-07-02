@@ -1,7 +1,9 @@
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <vector>
 
 #include "participant_manager.h"
 
@@ -12,6 +14,43 @@ void require(bool condition, const char* message) {
         std::fprintf(stderr, "FAIL: %s\n", message);
         std::exit(1);
     }
+}
+
+std::vector<uint32_t> snapshot_ids(ParticipantManager& manager) {
+    std::vector<uint32_t> ids;
+    manager.for_each([&](uint32_t id, ParticipantData&) {
+        ids.push_back(id);
+    });
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+bool contains_id(const std::vector<uint32_t>& ids, uint32_t id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
+void test_join_leave_timeout_update_audio_snapshot() {
+    ParticipantManager manager;
+    require(manager.register_participant(10, 48000, 1), "register participant 10");
+    require(manager.register_participant(11, 48000, 1), "register participant 11");
+
+    auto ids = snapshot_ids(manager);
+    require(ids.size() == 2, "audio snapshot has two joined participants");
+    require(contains_id(ids, 10), "audio snapshot contains participant 10");
+    require(contains_id(ids, 11), "audio snapshot contains participant 11");
+
+    manager.remove_participant(10);
+    ids = snapshot_ids(manager);
+    require(ids.size() == 1, "audio snapshot shrinks after leave");
+    require(!contains_id(ids, 10), "audio snapshot drops participant 10");
+    require(contains_id(ids, 11), "audio snapshot keeps participant 11");
+
+    const auto removed = manager.remove_timed_out_participants(
+        std::chrono::steady_clock::now() + std::chrono::hours(1),
+        std::chrono::seconds(1));
+    require(removed.size() == 1 && removed[0] == 11, "timeout removes participant 11");
+    ids = snapshot_ids(manager);
+    require(ids.empty(), "audio snapshot empty after timeout");
 }
 
 void test_immediate_reap_without_snapshot() {
@@ -77,6 +116,7 @@ void test_timeout_and_clear_route_through_graveyard() {
 }  // namespace
 
 int main() {
+    test_join_leave_timeout_update_audio_snapshot();
     test_immediate_reap_without_snapshot();
     test_snapshot_defers_reclamation();
     test_timeout_and_clear_route_through_graveyard();

@@ -1,6 +1,8 @@
 #pragma once
 
-#include <array>
+#include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -14,13 +16,40 @@
 // Thread-safe participant lifecycle manager for client-side
 // Manages remote participants (other clients) and their audio state
 class ParticipantManager {
+    struct ParticipantEntry {
+        uint32_t                         id = 0;
+        std::shared_ptr<ParticipantData> data;
+    };
+
+    using ParticipantSnapshot = std::vector<ParticipantEntry>;
+    using ParticipantSnapshotPtr = std::shared_ptr<const ParticipantSnapshot>;
+
+    inline static thread_local bool in_audio_callback_ = false;
+
 public:
     static constexpr size_t MAX_AUDIO_CALLBACK_PARTICIPANTS = 32;
 
-    ParticipantManager() = default;
+    class AudioCallbackReadScope {
+    public:
+        AudioCallbackReadScope()
+            : previous_(in_audio_callback_) {
+            in_audio_callback_ = true;
+        }
+
+        ~AudioCallbackReadScope() {
+            in_audio_callback_ = previous_;
+        }
+
+    private:
+        bool previous_;
+    };
+
+    ParticipantManager()
+        : audio_snapshot_(std::make_shared<ParticipantSnapshot>()) {}
 
     // Register a new participant with decoder initialization
     bool register_participant(uint32_t id, int sample_rate, int channels) {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (participants_.contains(id)) {
@@ -44,7 +73,8 @@ public:
             new_participant->display_name = pending->second.display_name;
             pending_metadata_.erase(pending);
         }
-        participants_[id]                 = std::move(new_participant);
+        participants_[id] = std::move(new_participant);
+        publish_audio_snapshot_locked();
 
         Log::info("New participant {} joined (decoder: {}Hz, {}ch)", id, sample_rate, channels);
         return true;
@@ -52,6 +82,7 @@ public:
 
     void set_participant_metadata(uint32_t id, const std::string& profile_id,
                                   const std::string& display_name) {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = participants_.find(id);
         if (it != participants_.end()) {
@@ -64,17 +95,20 @@ public:
 
     // Remove a participant (destruction is deferred; see graveyard_)
     void remove_participant(uint32_t id) {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = participants_.find(id);
         if (it != participants_.end()) {
             graveyard_.push_back(std::move(it->second));
             participants_.erase(it);
+            publish_audio_snapshot_locked();
             Log::info("Participant {} left", id);
         }
     }
 
     // Check if participant exists
     bool exists(uint32_t id) const {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         return participants_.contains(id);
     }
@@ -82,6 +116,7 @@ public:
     // Access participant with lambda (thread-safe)
     template <typename Func>
     bool with_participant(uint32_t id, Func&& func) {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = participants_.find(id);
         if (it != participants_.end()) {
@@ -93,6 +128,7 @@ public:
 
     // Get snapshot of all participants for UI
     std::vector<ParticipantInfo> get_all_info() const {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex>  lock(mutex_);
         std::vector<ParticipantInfo> result;
         result.reserve(participants_.size());
@@ -185,8 +221,10 @@ public:
     // Remove timed-out participants
     std::vector<uint32_t> remove_timed_out_participants(std::chrono::steady_clock::time_point now,
                                                         std::chrono::seconds timeout) {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<uint32_t>       removed_ids;
+        bool                        changed = false;
 
         for (auto it = participants_.begin(); it != participants_.end();) {
             auto elapsed =
@@ -198,9 +236,14 @@ public:
                 removed_ids.push_back(it->first);
                 graveyard_.push_back(std::move(it->second));
                 it = participants_.erase(it);
+                changed = true;
             } else {
                 ++it;
             }
+        }
+
+        if (changed) {
+            publish_audio_snapshot_locked();
         }
 
         return removed_ids;
@@ -208,17 +251,20 @@ public:
 
     // Get participant count
     size_t count() const {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         return participants_.size();
     }
 
     // Clear all participants (destruction is deferred; see graveyard_)
     void clear() {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& [id, participant]: participants_) {
             graveyard_.push_back(std::move(participant));
         }
         participants_.clear();
+        publish_audio_snapshot_locked();
     }
 
     // Destroy retired participants that no snapshot references anymore.
@@ -230,6 +276,7 @@ public:
     size_t reap_retired_participants() {
         std::vector<std::shared_ptr<ParticipantData>> to_destroy;
         {
+            assert_not_audio_callback_lock();
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto it = graveyard_.begin(); it != graveyard_.end();) {
                 if (it->use_count() == 1) {
@@ -244,6 +291,7 @@ public:
     }
 
     size_t retired_count() const {
+        assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         return graveyard_.size();
     }
@@ -251,23 +299,11 @@ public:
     // Iterate over all participants (thread-safe, for audio mixing)
     template <typename Func>
     void for_each(Func&& func) {
-        std::array<std::pair<uint32_t, std::shared_ptr<ParticipantData>>,
-                   MAX_AUDIO_CALLBACK_PARTICIPANTS>
-            snapshot;
-        size_t snapshot_count = 0;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [id, participant]: participants_) {
-                if (snapshot_count >= snapshot.size()) {
-                    break;
-                }
-                snapshot[snapshot_count++] = {id, participant};
+        auto snapshot = load_audio_snapshot();
+        for (const auto& entry: *snapshot) {
+            if (entry.data) {
+                func(entry.id, *entry.data);
             }
-        }
-
-        for (size_t i = 0; i < snapshot_count; ++i) {
-            auto& [id, participant] = snapshot[i];
-            func(id, *participant);
         }
     }
 
@@ -277,8 +313,31 @@ private:
         std::string display_name;
     };
 
+    static void assert_not_audio_callback_lock() {
+        assert(!in_audio_callback_);
+    }
+
+    ParticipantSnapshotPtr load_audio_snapshot() const {
+        return std::atomic_load_explicit(&audio_snapshot_, std::memory_order_acquire);
+    }
+
+    void publish_audio_snapshot_locked() {
+        auto snapshot = std::make_shared<ParticipantSnapshot>();
+        snapshot->reserve(std::min(participants_.size(), MAX_AUDIO_CALLBACK_PARTICIPANTS));
+        for (const auto& [id, participant]: participants_) {
+            if (snapshot->size() >= MAX_AUDIO_CALLBACK_PARTICIPANTS) {
+                break;
+            }
+            snapshot->push_back({id, participant});
+        }
+        ParticipantSnapshotPtr published = std::move(snapshot);
+        std::atomic_store_explicit(&audio_snapshot_, std::move(published),
+                                   std::memory_order_release);
+    }
+
     mutable std::mutex                                             mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<ParticipantData>> participants_;
+    ParticipantSnapshotPtr                                          audio_snapshot_;
     // Removed participants are parked here and destroyed only by
     // reap_retired_participants() on the io thread, once no audio-callback
     // snapshot references them. Destruction frees heap memory and destroys the
