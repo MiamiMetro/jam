@@ -642,3 +642,12 @@ git commit -m "Mark Phase 2 participant snapshots done"
 - Spec coverage: audio callback lock-free participant read is Task 1; GUI/stats non-contending snapshot is Task 2; decoder creation and registration logs outside the critical section is Task 2; Phase 1 graveyard guarantee is preserved and tested in Tasks 1 and 2; mechanical mutex check, build, ctest, CI, and tracker status are Task 3.
 - Placeholder scan: no `TBD`, `TODO`, `implement later`, or unbounded "add tests" instructions remain.
 - Type consistency: `ParticipantSnapshotPtr`, `ParticipantMetadataSnapshotPtr`, `publish_all_snapshots_locked`, `load_audio_snapshot`, and `load_metadata_snapshot` are introduced before use.
+
+## Execution Evidence
+
+- Callback mutex check: brace-counted `audio_callback` body at `client.cpp:4316-4962`; no matches for `std::lock_guard`, `std::unique_lock`, `mutex_`, or participant-manager mutex-path calls.
+- Debug guard check: `ParticipantManager::AudioCallbackReadScope`, `assert_not_audio_callback_lock`, and lock-free `for_each` are present in `participant_manager.h`.
+- Focused participant manager test: `ctest --test-dir build -C Release -R participant_manager_self_test --output-on-failure` passed, 1/1.
+- Release build: `cmake --build build --config Release --parallel 8` passed.
+- Full ctest: `ctest --test-dir build -C Release --output-on-failure` passed, 32/32 tests in 22.00 seconds.
+- CI: GitHub Actions PR #11 run `28591058441` passed for the implementation commits; final PR checks are recorded in the PR description after the tracker commit.
