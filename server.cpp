@@ -27,6 +27,7 @@
 
 #include "audio_packet.h"
 #include "client_manager.h"
+#include "crash_reporter.h"
 #include "endpoint_hash.h"
 #include "logger.h"
 #include "message_validator.h"
@@ -81,6 +82,8 @@ struct ServerOptions {
     size_t      log_max_bytes = Logger::DEFAULT_ROTATING_LOG_MAX_BYTES;
     size_t      log_max_files = Logger::DEFAULT_ROTATING_LOG_MAX_FILES;
     std::string metrics_jsonl_path;
+    bool        crash_reports_enabled = true;
+    std::string crash_report_dir = "crash_reports/server";
 };
 
 template <size_t N>
@@ -2066,6 +2069,39 @@ int run_metrics_export_smoke() {
     return 0;
 }
 
+int run_crash_report_smoke() {
+    const auto dir =
+        std::filesystem::temp_directory_path() /
+        ("jam-server-crash-smoke-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    crash_reporter::Options options;
+    options.report_dir = dir;
+    options.process_name = "server";
+    options.platform = runtime_platform_name();
+    options.arch = runtime_arch_name();
+
+    std::filesystem::remove_all(dir);
+    const auto report = crash_reporter::write_report(options, "server crash smoke", nullptr);
+    require_smoke(std::filesystem::exists(report), "crash smoke report missing");
+
+    {
+        std::ifstream in(report, std::ios::binary);
+        std::string body((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        require_smoke(body.find("\"schema\":\"jam_crash_report_v1\"") != std::string::npos,
+                      "crash smoke missing schema");
+        require_smoke(body.find("\"process\":\"server\"") != std::string::npos,
+                      "crash smoke missing process");
+        require_smoke(body.find("\"reason\":\"server crash smoke\"") != std::string::npos,
+                      "crash smoke missing reason");
+    }
+
+    std::filesystem::remove_all(dir);
+    std::cout << "server crash report smoke passed\n";
+    return 0;
+}
+
 size_t parse_positive_size_arg(const std::string& value, const char* option_name) {
     try {
         size_t consumed = 0;
@@ -2098,6 +2134,10 @@ ServerOptions parse_server_options(int argc, char** argv) {
             options.log_max_files = parse_positive_size_arg(argv[++i], "--log-max-files");
         } else if (arg == "--metrics-jsonl" && i + 1 < argc) {
             options.metrics_jsonl_path = argv[++i];
+        } else if (arg == "--crash-report-dir" && i + 1 < argc) {
+            options.crash_report_dir = argv[++i];
+        } else if (arg == "--disable-crash-reports") {
+            options.crash_reports_enabled = false;
         } else if (arg == "--allow-insecure-dev-joins") {
             options.allow_insecure_dev_joins = true;
         }
@@ -2137,6 +2177,19 @@ int main(int argc, char** argv) {
         }
         if (has_arg(argc, argv, "--metrics-export-smoke")) {
             return run_metrics_export_smoke();
+        }
+        if (has_arg(argc, argv, "--crash-report-smoke")) {
+            return run_crash_report_smoke();
+        }
+
+        if (options.crash_reports_enabled) {
+            crash_reporter::Options crash_options;
+            crash_options.report_dir = options.crash_report_dir;
+            crash_options.process_name = "server";
+            crash_options.platform = runtime_platform_name();
+            crash_options.arch = runtime_arch_name();
+            crash_reporter::install(crash_options);
+            Log::info("Crash reports enabled: {}", options.crash_report_dir);
         }
 
         Log::info("Starting SFU server on [::]:{} (dual-stack preferred)", options.port);

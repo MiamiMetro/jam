@@ -57,6 +57,11 @@ if(JAM_BUILD_TESTS)
     add_executable(logger_self_test logger_self_test.cpp)
     target_link_libraries(logger_self_test PRIVATE spdlog::spdlog)
 
+    add_executable(crash_reporter_self_test crash_reporter_self_test.cpp)
+    if(WIN32)
+        target_link_libraries(crash_reporter_self_test PRIVATE Dbghelp)
+    endif()
+
     add_executable(join_reliability_self_test join_reliability_self_test.cpp)
 
     add_executable(opus_network_clock_self_test opus_network_clock_self_test.cpp)
@@ -129,6 +134,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(server_rate_limiter_self_test)
     jam_add_executable_test(server_metrics_self_test)
     jam_add_executable_test(logger_self_test)
+    jam_add_executable_test(crash_reporter_self_test)
     jam_add_executable_test(join_reliability_self_test)
     jam_add_executable_test(opus_network_clock_self_test)
     jam_add_executable_test(audio_packet_self_test)
@@ -157,6 +163,8 @@ if(JAM_BUILD_TESTS)
              COMMAND $<TARGET_FILE:server> --security-smoke)
     add_test(NAME server_metrics_export_smoke
              COMMAND $<TARGET_FILE:server> --metrics-export-smoke)
+    add_test(NAME server_crash_report_smoke
+             COMMAND $<TARGET_FILE:server> --crash-report-smoke)
     add_test(NAME latency_probe_v3_receive_smoke
              COMMAND $<TARGET_FILE:latency_probe> --v3-receive-smoke)
     if(NODE_EXECUTABLE)
