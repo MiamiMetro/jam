@@ -109,8 +109,9 @@ Device-backed snapshot also passed with Release binaries using `JAM_SERVER_EXE=b
 
 ## Phase 4: TX Path Collapse
 
-Status: Done (2026-07-03, Release build green, full `ctest` 39/39 passed, E2E
-loopback smoke green, CI: pending on PR/push)
+Status: Implemented locally - acceptance pending (2026-07-03, Release build
+green, full `ctest` 39/39 passed locally, E2E loopback smoke recorded locally,
+CI pending, required send-queue p99 improvement not yet proven)
 
 Goal: capture-to-wire without the `asio::post` hop; bounded allocations; prioritized sender.
 
@@ -127,7 +128,8 @@ no-notify validation regressed 30s Opus send-queue p99 from `0.211 ms` to
 `2.592 ms` on client A and from `0.203 ms` to `3.124 ms` on client B, so the
 callback wake was kept.
 
-Validation (2026-07-03):
+Local validation snapshot (2026-07-03; acceptance blocker: mixed p99 signal and
+CI pending):
 
 - Before baseline: pre-collapse commit `cd9a275`, built in
   `C:\Users\Berkay\Downloads\udpstuff-phase4-before`; logs in
@@ -141,10 +143,12 @@ Validation (2026-07-03):
   decreased on both clients (`0.453 ms -> 0.412 ms`, `0.518 ms -> 0.426 ms`).
 - Phase 3 accepted E2E baseline: last `9.1425 ms`, avg `9.90777 ms`, max
   `11.5601 ms`, steady_max `11.5601 ms`.
-- Phase 4 E2E rerun:
+- Phase 4 local E2E rerun:
   `validation_logs/phase4-tx-collapse/e2e-smoke.log` reports last
   `9.4238 ms`, avg `9.98548 ms`, max `11.5315 ms`, steady_max `11.5315 ms`
-  against the `23 ms` budget.
+  against the `23 ms` budget. This is recorded as a local snapshot, not final
+  accepted latency validation, because the required p99 before/after signal is
+  mixed and CI is still pending.
 - Release build command logged in
   `validation_logs/phase4-tx-collapse/release-build.log`.
 - Full test command logged in
@@ -154,9 +158,9 @@ Validation (2026-07-03):
 
 Acceptance: structural TX collapse items are complete (no audio `asio::post`,
 bounded packet reuse, sender-thread synchronous send on the original socket, and
-MMCSS priority). Local latency validation is recorded above; do not treat the
-send-queue p99 result as an unequivocal improvement because one client regressed
-slightly in the required before/after run.
+MMCSS priority). Acceptance is not closed: local latency validation is only a
+snapshot, the send-queue p99 result is mixed because one client regressed
+slightly in the required before/after run, and remote CI remains pending.
 
 ## Phase 5: Production Hardening
 

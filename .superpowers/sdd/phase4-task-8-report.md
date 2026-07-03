@@ -94,3 +94,18 @@ compared while both participants are connected.
 - The temporary before worktree was left at
   `C:\Users\Berkay\Downloads\udpstuff-phase4-before` for auditability instead
   of force-removing its untracked `build` directory.
+
+## Reviewer Fixes
+
+Date: 2026-07-03
+
+- Updated `LOW_LATENCY_ACTION_PLAN.md` Phase 4 status from `Done` to
+  `Implemented locally - acceptance pending`.
+- Reframed the Phase 4 validation as a local snapshot with explicit acceptance
+  blockers: mixed send-queue p99 signal and CI pending. The numeric p99 and E2E
+  values were left unchanged.
+- Added command/cwd and exit status metadata to
+  `validation_logs/phase4-tx-collapse/e2e-smoke.log` so the log is
+  self-contained.
+- No measurements or code tests were rerun; this fix changed tracker/report/log
+  documentation only. Ran focused `git diff --check`.
