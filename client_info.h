@@ -5,6 +5,7 @@
 #include <string>
 
 #include "protocol.h"
+#include "session_crypto.h"
 
 // Per-client state for SFU server
 struct ClientInfo {
@@ -17,4 +18,9 @@ struct ClientInfo {
     uint32_t                              capabilities = 0;
     ClientRole                            role = ClientRole::Performer;
     bool                                  joined_with_metadata = false;
+    bool                                  has_session_key = false;
+    session_crypto::SessionKey            session_key{};
+    std::string                           token_nonce_key;
+    session_crypto::ReplayWindow          audio_replay_window;
+    uint64_t                              secure_send_nonce = 1;
 };

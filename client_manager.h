@@ -26,9 +26,21 @@ public:
         std::vector<uint32_t> removed_client_ids;
     };
 
+    struct ClientSecurityConfig {
+        session_crypto::SessionKey session_key{};
+        std::string                token_nonce_key;
+    };
+
+    struct ClientSecuritySnapshot {
+        session_crypto::SessionKey session_key{};
+        std::string                token_nonce_key;
+    };
+
     RegistrationResult register_client(const endpoint& ep, time_point now, std::string room_id,
                                        std::string profile_id, std::string display_name,
-                                       ClientRole role, uint32_t capabilities = 0) {
+                                       ClientRole role, uint32_t capabilities = 0,
+                                       std::optional<ClientSecurityConfig> security =
+                                           std::nullopt) {
         std::lock_guard<std::mutex> lock(mutex_);
 
         RegistrationResult result;
@@ -44,6 +56,7 @@ public:
             client.role                 = role;
             client.capabilities         = capabilities;
             client.joined_with_metadata = true;
+            apply_security(client, security);
             result.client_id            = client.client_id;
         } else {
             if (existing != clients_.end()) {
@@ -63,6 +76,7 @@ public:
             client.capabilities = capabilities;
             client.role = role;
             client.joined_with_metadata = true;
+            apply_security(client, security);
             result.client_id = client.client_id;
             clients_[ep] = std::move(client);
         }
@@ -148,6 +162,48 @@ public:
 
     bool client_supports(const endpoint& ep, uint32_t capability) const {
         return (get_client_capabilities(ep) & capability) != 0;
+    }
+
+    std::optional<ClientSecuritySnapshot> get_security(const endpoint& ep) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        if (it == clients_.end() || !it->second.has_session_key) {
+            return std::nullopt;
+        }
+        return ClientSecuritySnapshot{it->second.session_key, it->second.token_nonce_key};
+    }
+
+    bool has_session_key(const endpoint& ep) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        return it != clients_.end() && it->second.has_session_key;
+    }
+
+    bool accept_audio_nonce(const endpoint& ep, uint64_t nonce) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        if (it == clients_.end() || !it->second.has_session_key) {
+            return false;
+        }
+        return it->second.audio_replay_window.accept(nonce);
+    }
+
+    uint64_t next_secure_send_nonce(const endpoint& ep) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        if (it == clients_.end() || !it->second.has_session_key) {
+            return 0;
+        }
+        return it->second.secure_send_nonce++;
+    }
+
+    std::optional<std::string> token_nonce_key_for(const endpoint& ep) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        if (it == clients_.end() || !it->second.has_session_key) {
+            return std::nullopt;
+        }
+        return it->second.token_nonce_key;
     }
 
     // Check if any clients exist
@@ -263,6 +319,28 @@ public:
     }
 
 private:
+    static void apply_security(ClientInfo& client,
+                               const std::optional<ClientSecurityConfig>& security) {
+        if (!security.has_value()) {
+            client.has_session_key = false;
+            client.session_key = {};
+            client.token_nonce_key.clear();
+            client.audio_replay_window.reset();
+            client.secure_send_nonce = 1;
+            return;
+        }
+
+        const bool same_session =
+            client.has_session_key && client.token_nonce_key == security->token_nonce_key;
+        client.has_session_key = true;
+        client.session_key = security->session_key;
+        client.token_nonce_key = security->token_nonce_key;
+        if (!same_session) {
+            client.audio_replay_window.reset();
+            client.secure_send_nonce = 1;
+        }
+    }
+
     mutable std::mutex                                      mutex_;
     std::unordered_map<endpoint, ClientInfo, endpoint_hash> clients_;
     uint32_t                                                next_client_id_;

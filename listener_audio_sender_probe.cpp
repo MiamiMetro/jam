@@ -5,6 +5,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,6 +19,7 @@
 #include "packet_builder.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "session_crypto.h"
 #include "udp_port.h"
 
 using asio::ip::udp;
@@ -69,6 +71,26 @@ void send_leave(udp::socket& socket, const udp::endpoint& server) {
     socket.send_to(asio::buffer(&leave, sizeof(leave)), server);
 }
 
+void send_maybe_secure(udp::socket& socket, const udp::endpoint& server,
+                       const unsigned char* data, size_t bytes,
+                       const std::optional<session_crypto::SessionKey>& key,
+                       uint64_t& nonce) {
+    if (!key.has_value()) {
+        socket.send_to(asio::buffer(data, bytes), server);
+        return;
+    }
+
+    std::vector<unsigned char> secure(
+        SECURE_PACKET_HEADER_BYTES + bytes + SECURE_PACKET_TAG_BYTES);
+    size_t secure_bytes = 0;
+    if (!session_crypto::seal_audio_packet(*key, nonce++, data, bytes,
+                                           secure.data(), secure.size(), secure_bytes)) {
+        return;
+    }
+    secure.resize(secure_bytes);
+    socket.send_to(asio::buffer(secure.data(), secure.size()), server);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -118,7 +140,11 @@ int main(int argc, char** argv) {
             *resolver.resolve(udp::v4(), server_address, std::to_string(server_port)).begin();
         udp::socket socket(io, udp::endpoint(udp::v4(), 0));
 
-        send_join(socket, server, room, profile, make_token(secret, server_id, room, profile));
+        const std::string token = make_token(secret, server_id, room, profile);
+        const auto session_key = session_crypto::derive_key_from_join_token_string(token);
+        uint64_t secure_nonce = 1;
+
+        send_join(socket, server, room, profile, token);
         std::this_thread::sleep_for(100ms);
 
         if (malformed_v2) {
@@ -131,7 +157,9 @@ int main(int argc, char** argv) {
             hdr.payload_bytes = AUDIO_BUF_SIZE + 1;
             hdr.channels = 1;
             hdr.codec = AudioCodec::Opus;
-            socket.send_to(asio::buffer(&hdr, sizeof(AudioHdrV2) - AUDIO_BUF_SIZE), server);
+            send_maybe_secure(socket, server, reinterpret_cast<const unsigned char*>(&hdr),
+                              sizeof(AudioHdrV2) - AUDIO_BUF_SIZE, session_key,
+                              secure_nonce);
             std::this_thread::sleep_for(100ms);
             send_leave(socket, server);
             std::cout << "sent_malformed_v2=1\n";
@@ -169,7 +197,8 @@ int main(int argc, char** argv) {
             auto packet = audio_packet::create_audio_packet_v2(
                 AudioCodec::Opus, sequence++, 48000, frame_count, 1, encoded.data(),
                 static_cast<uint16_t>(encoded.size()));
-            socket.send_to(asio::buffer(packet->data(), packet->size()), server);
+            send_maybe_secure(socket, server, packet->data(), packet->size(), session_key,
+                              secure_nonce);
             ++packets_sent;
             std::this_thread::sleep_for(5ms);
         }

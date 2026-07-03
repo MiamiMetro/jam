@@ -117,6 +117,7 @@ target_link_libraries(client PRIVATE
     concurrentqueue
     spdlog::spdlog
     opus
+    token_crypto
     imgui_lib
     juce::juce_audio_devices
     juce::juce_audio_basics

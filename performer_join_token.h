@@ -27,6 +27,14 @@ struct ValidationResult {
     std::string reason;
 };
 
+struct ValidatedToken {
+    bool        ok = false;
+    std::string reason;
+    Claims      claims;
+    std::string signature_hex;
+    std::string signing_input;
+};
+
 inline int64_t now_ms() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
@@ -121,54 +129,80 @@ inline bool constant_time_equal(const std::string& left, const std::string& righ
     return diff == 0;
 }
 
-inline ValidationResult validate(const std::string& token, const std::string& secret,
-                                 const std::string& expected_server_id,
-                                 const std::string& expected_room_id,
-                                 const std::string& expected_profile_id,
-                                 const std::string& expected_role = "performer") {
+inline ValidatedToken validate_with_claims(const std::string& token, const std::string& secret,
+                                           const std::string& expected_server_id,
+                                           const std::string& expected_room_id,
+                                           const std::string& expected_profile_id,
+                                           const std::string& expected_role = "performer") {
+    ValidatedToken detailed;
+
     if (secret.empty()) {
-        return {false, "join secret not configured"};
+        detailed.reason = "join secret not configured";
+        return detailed;
     }
 
     const auto parts = split(token, '.');
     if (parts.size() != 8 || parts[0] != "v1") {
-        return {false, "malformed token"};
+        detailed.reason = "malformed token";
+        return detailed;
     }
 
     Claims claims;
     try {
         claims.expires_at_ms = std::stoll(parts[1]);
     } catch (...) {
-        return {false, "malformed expiry"};
+        detailed.reason = "malformed expiry";
+        return detailed;
     }
     claims.server_id  = parts[2];
     claims.room_id    = parts[3];
     claims.profile_id = parts[4];
     claims.role       = parts[5];
     claims.nonce      = parts[6];
+    detailed.claims = claims;
+    detailed.signature_hex = parts[7];
+    detailed.signing_input = signing_message(claims);
 
     if (claims.expires_at_ms < now_ms()) {
-        return {false, "expired token"};
+        detailed.reason = "expired token";
+        return detailed;
     }
     if (claims.server_id != expected_server_id) {
-        return {false, "wrong server id"};
+        detailed.reason = "wrong server id";
+        return detailed;
     }
     if (claims.room_id != expected_room_id) {
-        return {false, "wrong room id"};
+        detailed.reason = "wrong room id";
+        return detailed;
     }
     if (claims.profile_id != expected_profile_id) {
-        return {false, "wrong profile id"};
+        detailed.reason = "wrong profile id";
+        return detailed;
     }
     if (claims.role != expected_role) {
-        return {false, "wrong role"};
+        detailed.reason = "wrong role";
+        return detailed;
     }
 
     const std::string expected_signature = sign(claims, secret);
     if (!constant_time_equal(expected_signature, parts[7])) {
-        return {false, "invalid signature"};
+        detailed.reason = "invalid signature";
+        return detailed;
     }
 
-    return {true, ""};
+    detailed.ok = true;
+    return detailed;
+}
+
+inline ValidationResult validate(const std::string& token, const std::string& secret,
+                                 const std::string& expected_server_id,
+                                 const std::string& expected_room_id,
+                                 const std::string& expected_profile_id,
+                                 const std::string& expected_role = "performer") {
+    const auto detailed = validate_with_claims(token, secret, expected_server_id,
+                                               expected_room_id, expected_profile_id,
+                                               expected_role);
+    return {detailed.ok, detailed.reason};
 }
 
 }  // namespace performer_join_token

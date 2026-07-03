@@ -14,6 +14,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <asio.hpp>
@@ -32,7 +33,9 @@
 #include "periodic_timer.h"
 #include "protocol.h"
 #include "sequence_tracker.h"
+#include "server_rate_limiter.h"
 #include "server_config.h"
+#include "session_crypto.h"
 #include "udp_port.h"
 
 using asio::ip::udp;
@@ -136,6 +139,8 @@ public:
         } else if (hdr.magic == AUDIO_MAGIC || hdr.magic == AUDIO_V2_MAGIC ||
                    hdr.magic == AUDIO_V3_MAGIC || hdr.magic == AUDIO_REDUNDANT_MAGIC) {
             handle_audio_message(bytes);
+        } else if (hdr.magic == SECURE_AUDIO_MAGIC) {
+            handle_secure_audio_message(bytes);
         }
 
         do_receive();  // start next receive immediately
@@ -165,6 +170,14 @@ private:
         std::chrono::steady_clock::time_point last_join_required_sent;
         uint64_t                              drops = 0;
         bool                                  first_log_emitted = false;
+    };
+
+    struct UsedTokenNonce {
+        udp::endpoint endpoint;
+        int64_t       expires_at_ms = 0;
+        std::string   room_id;
+        std::string   profile_id;
+        std::string   role;
     };
 
     struct AudioForwardStats {
@@ -229,6 +242,9 @@ private:
         SyncHdr shdr{};
         std::memcpy(&shdr, recv_buf_.data(), sizeof(SyncHdr));
         const auto now = std::chrono::steady_clock::now();
+        if (!rate_limiter_.allow_control(remote_endpoint_, now)) {
+            return;
+        }
         const uint32_t client_id = client_manager_.get_client_id(remote_endpoint_);
         client_manager_.update_alive(remote_endpoint_, now);
         record_ping_received(client_id, remote_endpoint_, shdr.seq);
@@ -251,6 +267,10 @@ private:
         std::memcpy(&chdr, recv_buf_.data(), sizeof(CtrlHdr));
 
         auto now = std::chrono::steady_clock::now();
+        if (chdr.type != CtrlHdr::Cmd::JOIN && client_manager_.exists(remote_endpoint_) &&
+            !rate_limiter_.allow_control(remote_endpoint_, now)) {
+            return;
+        }
 
         switch (chdr.type) {
             case CtrlHdr::Cmd::JOIN:
@@ -288,6 +308,36 @@ private:
         }
     }
 
+    void cleanup_used_token_nonces() {
+        const int64_t now_ms = performer_join_token::now_ms();
+        for (auto it = used_token_nonces_.begin(); it != used_token_nonces_.end();) {
+            if (it->second.expires_at_ms < now_ms) {
+                it = used_token_nonces_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    bool reserve_token_nonce(const performer_join_token::ValidatedToken& token,
+                             const udp::endpoint& endpoint) {
+        cleanup_used_token_nonces();
+        const std::string nonce_key = session_crypto::nonce_replay_key(token.claims);
+        auto it = used_token_nonces_.find(nonce_key);
+        if (it != used_token_nonces_.end() && it->second.endpoint != endpoint) {
+            return false;
+        }
+
+        used_token_nonces_[nonce_key] = UsedTokenNonce{
+            endpoint,
+            token.claims.expires_at_ms,
+            token.claims.room_id,
+            token.claims.profile_id,
+            token.claims.role,
+        };
+        return true;
+    }
+
     void handle_join(std::size_t bytes, std::chrono::steady_clock::time_point now) {
         if (bytes < JOIN_HDR_LEGACY_SIZE) {
             Log::warn("Rejecting JOIN from {}:{}: packet too small",
@@ -317,8 +367,9 @@ private:
                       remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id);
             return;
         }
+        std::optional<ClientManager::ClientSecurityConfig> security;
         if (!token.empty() && !options_.allow_insecure_dev_joins) {
-            const auto result = performer_join_token::validate(
+            const auto result = performer_join_token::validate_with_claims(
                 token, options_.join_secret, options_.server_id, room_id, profile_id, role_name);
             if (!result.ok) {
                 Log::warn("Rejecting JOIN from {}:{} room '{}': {}",
@@ -326,11 +377,27 @@ private:
                           result.reason);
                 return;
             }
+            if (!reserve_token_nonce(result, remote_endpoint_)) {
+                Log::warn("Rejecting JOIN from {}:{} room '{}': token nonce replay",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id);
+                return;
+            }
+            ClientManager::ClientSecurityConfig config;
+            config.session_key = session_crypto::derive_key_from_join_token(result);
+            config.token_nonce_key = session_crypto::nonce_replay_key(result.claims);
+            security = config;
+        }
+
+        uint32_t registered_capabilities = client_capabilities;
+        if (security.has_value()) {
+            registered_capabilities |= AUDIO_CAP_SECURE_AUDIO;
+        } else {
+            registered_capabilities &= ~AUDIO_CAP_SECURE_AUDIO;
         }
 
         auto registration = client_manager_.register_client(
             remote_endpoint_, now, room_id, profile_id, display_name, role,
-            client_capabilities);
+            registered_capabilities, security);
         for (uint32_t removed_client_id: registration.removed_client_ids) {
             Log::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
                       removed_client_id, room_id, profile_id);
@@ -343,36 +410,192 @@ private:
                   "(ID: {}, {}, capabilities=0x{:08x})",
                   remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
                   profile_id, display_name, role_name, client_id,
-                  token.empty() ? "insecure-dev" : "token-present", client_capabilities);
-        send_join_ack(remote_endpoint_, client_id);
+                  token.empty() ? "insecure-dev" : "token-present", registered_capabilities);
+        uint32_t ack_capabilities = AUDIO_SUPPORTED_CAPABILITIES;
+        if (!security.has_value()) {
+            ack_capabilities &= ~AUDIO_CAP_SECURE_AUDIO;
+        }
+        send_join_ack(remote_endpoint_, client_id, ack_capabilities);
         if (role == ClientRole::Performer) {
             broadcast_participant_info(remote_endpoint_, client_id, profile_id, display_name);
         }
         send_existing_participant_info_to(remote_endpoint_);
     }
 
-    void handle_audio_message(std::size_t bytes) {
-        MsgHdr hdr{};
-        std::memcpy(&hdr, recv_buf_.data(), sizeof(MsgHdr));
-        if (hdr.magic == AUDIO_REDUNDANT_MAGIC) {
-            handle_redundant_audio_message(bytes);
-            return;
+    bool extract_audio_rate_shape(const unsigned char* packet_data, std::size_t bytes,
+                                  uint32_t& sample_rate, uint16_t& frame_count) {
+        if (packet_data == nullptr || bytes < sizeof(MsgHdr)) {
+            return false;
         }
 
-        const size_t min_audio_packet_size =
-            hdr.magic == AUDIO_V2_MAGIC ? sizeof(AudioHdrV2) - AUDIO_BUF_SIZE
-                                        : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
-        if (!message_validator::is_valid_audio_packet(bytes, min_audio_packet_size)) {
-            Log::debug("Audio packet too small: {} bytes", bytes);
+        MsgHdr hdr{};
+        std::memcpy(&hdr, packet_data, sizeof(MsgHdr));
+        if (hdr.magic == AUDIO_REDUNDANT_MAGIC) {
+            bool found = false;
+            std::string reason;
+            audio_packet::for_each_redundant_audio_child(
+                packet_data, bytes,
+                [&](const unsigned char* child, size_t child_len, uint8_t index) {
+                    if (index != 0 || found) {
+                        return;
+                    }
+                    const auto parsed = audio_packet::parse_audio_header(child, child_len);
+                    if (parsed.valid) {
+                        sample_rate = parsed.sample_rate;
+                        frame_count = parsed.frame_count;
+                        found = true;
+                    }
+                },
+                &reason);
+            return found;
+        }
+
+        if (hdr.magic == AUDIO_V2_MAGIC || hdr.magic == AUDIO_V3_MAGIC) {
+            const auto parsed = audio_packet::parse_audio_header(packet_data, bytes);
+            if (!parsed.valid) {
+                return false;
+            }
+            sample_rate = parsed.sample_rate;
+            frame_count = parsed.frame_count;
+            return true;
+        }
+
+        if (hdr.magic == AUDIO_MAGIC) {
+            sample_rate = 48000;
+            frame_count = 480;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool allow_audio_rate(const unsigned char* packet_data, std::size_t bytes) {
+        uint32_t sample_rate = 0;
+        uint16_t frame_count = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (!extract_audio_rate_shape(packet_data, bytes, sample_rate, frame_count)) {
+            rate_limiter_.allow_strict(remote_endpoint_, now);
+            return false;
+        }
+
+        if (rate_limiter_.allow_authenticated_audio(remote_endpoint_, sample_rate,
+                                                    frame_count, now)) {
+            return true;
+        }
+
+        const uint64_t drop_count = ++rate_limited_audio_drops_total_;
+        if (drop_count == 1 || drop_count % 100 == 0) {
+            Log::warn("Rate-limited audio from {}:{} sample_rate={} frame_count={} drops={}",
+                      remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                      sample_rate, frame_count, drop_count);
+        }
+        return false;
+    }
+
+    void handle_audio_message(std::size_t bytes) {
+        handle_plain_audio_message(reinterpret_cast<unsigned char*>(recv_buf_.data()), bytes,
+                                   false);
+    }
+
+    void handle_secure_audio_message(std::size_t bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (bytes < SECURE_PACKET_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
+            rate_limiter_.allow_strict(remote_endpoint_, now);
             return;
         }
 
         if (!client_manager_.exists(remote_endpoint_)) {
-            record_unknown_audio_drop(remote_endpoint_);
+            if (rate_limiter_.allow_unknown(remote_endpoint_, now)) {
+                record_unknown_audio_drop(remote_endpoint_);
+            }
             return;
         }
 
-        if (!validate_complete_audio_packet(bytes)) {
+        const auto security = client_manager_.get_security(remote_endpoint_);
+        if (!security.has_value()) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                Log::warn("Dropping secure audio from endpoint without session key {}:{}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            }
+            return;
+        }
+
+        uint64_t nonce = 0;
+        size_t plaintext_bytes = 0;
+        const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
+        if (!session_crypto::open_audio_packet(
+                security->session_key, packet_data, bytes, nonce,
+                secure_plaintext_buf_.data(), secure_plaintext_buf_.size(),
+                plaintext_bytes)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                Log::warn("Dropping audio with invalid auth tag from {}:{} bytes={}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                          bytes);
+            }
+            return;
+        }
+
+        if (!client_manager_.accept_audio_nonce(remote_endpoint_, nonce)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                Log::warn("Dropping replayed secure audio from {}:{} nonce={}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                          nonce);
+            }
+            return;
+        }
+
+        handle_plain_audio_message(secure_plaintext_buf_.data(), plaintext_bytes, true);
+    }
+
+    void handle_plain_audio_message(unsigned char* packet_data, std::size_t bytes,
+                                    bool authenticated) {
+        if (packet_data == nullptr || bytes < sizeof(MsgHdr)) {
+            rate_limiter_.allow_strict(remote_endpoint_, std::chrono::steady_clock::now());
+            return;
+        }
+
+        MsgHdr hdr{};
+        std::memcpy(&hdr, packet_data, sizeof(MsgHdr));
+        if (hdr.magic == AUDIO_REDUNDANT_MAGIC) {
+            handle_redundant_audio_message(packet_data, bytes, authenticated);
+            return;
+        }
+
+        const size_t min_audio_packet_size =
+            hdr.magic == AUDIO_V2_MAGIC
+                ? audio_packet::v2_header_size()
+                : (hdr.magic == AUDIO_V3_MAGIC
+                       ? audio_packet::v3_header_size()
+                       : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
+        if (!message_validator::is_valid_audio_packet(bytes, min_audio_packet_size)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_,
+                                           std::chrono::steady_clock::now())) {
+                Log::debug("Audio packet too small: {} bytes", bytes);
+            }
+            return;
+        }
+
+        if (!client_manager_.exists(remote_endpoint_)) {
+            if (rate_limiter_.allow_unknown(remote_endpoint_,
+                                            std::chrono::steady_clock::now())) {
+                record_unknown_audio_drop(remote_endpoint_);
+            }
+            return;
+        }
+
+        if (!authenticated && client_manager_.has_session_key(remote_endpoint_)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_,
+                                           std::chrono::steady_clock::now())) {
+                Log::warn("Dropping plaintext audio from signed session {}:{}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            }
+            return;
+        }
+
+        if (!validate_complete_audio_packet(packet_data, bytes)) {
+            return;
+        }
+        if (!allow_audio_rate(packet_data, bytes)) {
             return;
         }
 
@@ -382,42 +605,62 @@ private:
         uint32_t sender_id = client_manager_.get_client_id(remote_endpoint_);
 
         // Embed sender_id in the packet
-        packet_builder::embed_sender_id(reinterpret_cast<unsigned char*>(recv_buf_.data()),
-                                        sender_id);
+        packet_builder::embed_sender_id(packet_data, sender_id);
 
         // SFU: Forward audio packet to all other clients (not back to sender)
         // Copy packet data before forwarding since recv_buf_ will be reused by do_receive()
-        auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
-                                                                        recv_buf_.data() + bytes);
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(packet_data,
+                                                                        packet_data + bytes);
         record_audio_ingress(sender_id, remote_endpoint_, packet_copy->data(), bytes);
         forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
     }
 
-    void handle_redundant_audio_message(std::size_t bytes) {
+    void handle_redundant_audio_message(unsigned char* packet_data, std::size_t bytes,
+                                        bool authenticated) {
         if (bytes < audio_packet::redundant_header_size()) {
-            Log::debug("Redundant audio packet too small: {} bytes", bytes);
+            if (rate_limiter_.allow_strict(remote_endpoint_,
+                                           std::chrono::steady_clock::now())) {
+                Log::debug("Redundant audio packet too small: {} bytes", bytes);
+            }
             return;
         }
 
         if (!client_manager_.exists(remote_endpoint_)) {
-            record_unknown_audio_drop(remote_endpoint_);
+            if (rate_limiter_.allow_unknown(remote_endpoint_,
+                                            std::chrono::steady_clock::now())) {
+                record_unknown_audio_drop(remote_endpoint_);
+            }
             return;
         }
 
-        const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
+        if (!authenticated && client_manager_.has_session_key(remote_endpoint_)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_,
+                                           std::chrono::steady_clock::now())) {
+                Log::warn("Dropping plaintext redundant audio from signed session {}:{}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            }
+            return;
+        }
+
         std::string reason;
         if (!audio_packet::validate_redundant_audio_packet_bytes(packet_data, bytes, &reason)) {
             ++invalid_audio_drops_since_log_;
-            Log::warn("Dropping invalid redundant audio from {}:{}: reason={} bytes={}",
-                      remote_endpoint_.address().to_string(), remote_endpoint_.port(), reason,
-                      bytes);
+            if (rate_limiter_.allow_strict(remote_endpoint_,
+                                           std::chrono::steady_clock::now())) {
+                Log::warn("Dropping invalid redundant audio from {}:{}: reason={} bytes={}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                          reason, bytes);
+            }
+            return;
+        }
+        if (!allow_audio_rate(packet_data, bytes)) {
             return;
         }
 
         client_manager_.update_alive(remote_endpoint_, std::chrono::steady_clock::now());
         const uint32_t sender_id = client_manager_.get_client_id(remote_endpoint_);
-        auto packet_copy = std::make_shared<std::vector<unsigned char>>(recv_buf_.data(),
-                                                                        recv_buf_.data() + bytes);
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(packet_data,
+                                                                        packet_data + bytes);
         if (!audio_packet::embed_sender_id_in_redundant_audio_packet(
                 packet_copy->data(), packet_copy->size(), sender_id, &reason)) {
             ++invalid_audio_drops_since_log_;
@@ -435,23 +678,25 @@ private:
                                 packet_copy);
     }
 
-    bool validate_complete_audio_packet(std::size_t bytes) {
+    bool validate_complete_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
         MsgHdr hdr{};
-        std::memcpy(&hdr, recv_buf_.data(), sizeof(MsgHdr));
+        std::memcpy(&hdr, packet_data, sizeof(MsgHdr));
         if (hdr.magic != AUDIO_V2_MAGIC && hdr.magic != AUDIO_V3_MAGIC) {
             return true;
         }
 
-        const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
         std::string reason;
         if (!audio_packet::validate_audio_packet_bytes(packet_data, bytes, &reason)) {
             const auto parsed = audio_packet::parse_audio_header(packet_data, bytes);
             ++invalid_audio_drops_since_log_;
-            Log::warn(
-                "Dropping invalid audio from {}:{}: reason={} magic=0x{:08x} got {} "
-                "payload_bytes={} seq={}",
-                remote_endpoint_.address().to_string(), remote_endpoint_.port(), reason,
-                hdr.magic, bytes, parsed.payload_bytes, parsed.sequence);
+            if (rate_limiter_.allow_strict(remote_endpoint_,
+                                           std::chrono::steady_clock::now())) {
+                Log::warn(
+                    "Dropping invalid audio from {}:{}: reason={} magic=0x{:08x} got {} "
+                    "payload_bytes={} seq={}",
+                    remote_endpoint_.address().to_string(), remote_endpoint_.port(), reason,
+                    hdr.magic, bytes, parsed.payload_bytes, parsed.sequence);
+            }
             return false;
         }
 
@@ -574,13 +819,14 @@ private:
         }
     }
 
-    void send_join_ack(const udp::endpoint& endpoint, uint32_t participant_id) {
+    void send_join_ack(const udp::endpoint& endpoint, uint32_t participant_id,
+                       uint32_t capabilities) {
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinAckHdr));
         JoinAckHdr ack{};
         ack.magic = CTRL_MAGIC;
         ack.type = CtrlHdr::Cmd::JOIN_ACK;
         ack.participant_id = participant_id;
-        ack.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
+        ack.capabilities = capabilities & AUDIO_SUPPORTED_CAPABILITIES;
         std::memcpy(buf->data(), &ack, sizeof(JoinAckHdr));
         send(buf->data(), buf->size(), endpoint, buf);
     }
@@ -674,11 +920,49 @@ private:
             record_audio_forward_datagram(sender_id, endpoint, packet_data, packet_size);
             auto fallback = packet_for_receiver_capabilities(endpoint, packet_data, packet_size);
             if (fallback != nullptr) {
-                send(fallback->data(), fallback->size(), endpoint, fallback);
-            } else {
+                auto secure_packet =
+                    secure_packet_for_receiver(endpoint, fallback->data(), fallback->size());
+                if (secure_packet != nullptr) {
+                    send(secure_packet->data(), secure_packet->size(), endpoint, secure_packet);
+                } else if (!client_manager_.has_session_key(endpoint)) {
+                    send(fallback->data(), fallback->size(), endpoint, fallback);
+                }
+                continue;
+            }
+
+            auto secure_packet = secure_packet_for_receiver(
+                endpoint, static_cast<const unsigned char*>(packet_data), packet_size);
+            if (secure_packet != nullptr) {
+                send(secure_packet->data(), secure_packet->size(), endpoint, secure_packet);
+            } else if (!client_manager_.has_session_key(endpoint)) {
                 send(packet_data, packet_size, endpoint, keep_alive);
             }
         }
+    }
+
+    std::shared_ptr<std::vector<unsigned char>> secure_packet_for_receiver(
+        const udp::endpoint& endpoint, const unsigned char* packet_data,
+        std::size_t packet_size) {
+        const auto security = client_manager_.get_security(endpoint);
+        if (!security.has_value()) {
+            return nullptr;
+        }
+
+        const uint64_t nonce = client_manager_.next_secure_send_nonce(endpoint);
+        if (nonce == 0) {
+            return nullptr;
+        }
+
+        auto secure_packet = std::make_shared<std::vector<unsigned char>>(
+            SECURE_PACKET_HEADER_BYTES + packet_size + SECURE_PACKET_TAG_BYTES);
+        size_t bytes_written = 0;
+        if (!session_crypto::seal_audio_packet(
+                security->session_key, nonce, packet_data, packet_size,
+                secure_packet->data(), secure_packet->size(), bytes_written)) {
+            return nullptr;
+        }
+        secure_packet->resize(bytes_written);
+        return secure_packet;
     }
 
     std::shared_ptr<std::vector<unsigned char>> packet_for_receiver_capabilities(
@@ -1031,16 +1315,20 @@ private:
 
     ClientManager client_manager_;
     std::unordered_map<udp::endpoint, UnknownEndpointInfo, endpoint_hash> unknown_endpoints_;
+    std::unordered_map<std::string, UsedTokenNonce> used_token_nonces_;
     std::unordered_map<uint32_t, AudioIngressStats> audio_ingress_stats_;
     std::unordered_map<uint64_t, AudioForwardStats> audio_forward_stats_;
     std::unordered_map<uint32_t, PingStats> ping_stats_;
+    server_rate_limiter::ProtocolRateLimiter rate_limiter_;
     uint64_t unknown_audio_drops_since_log_ = 0;
     uint64_t invalid_audio_drops_since_log_ = 0;
+    uint64_t rate_limited_audio_drops_total_ = 0;
     uint32_t metronome_sequence_ = 0;
     std::chrono::steady_clock::time_point last_unknown_audio_summary_ =
         std::chrono::steady_clock::now();
 
     std::array<char, server_config::RECV_BUF_SIZE> recv_buf_;
+    std::array<unsigned char, server_config::RECV_BUF_SIZE> secure_plaintext_buf_;
     udp::endpoint                                  remote_endpoint_;
 
     PeriodicTimer alive_check_timer_;
@@ -1067,16 +1355,20 @@ uint32_t packet_u32_at(const std::vector<unsigned char>& packet, size_t offset) 
 }
 
 std::vector<unsigned char> make_smoke_join_packet(const std::string& name,
-                                                  uint32_t capabilities) {
+                                                  uint32_t capabilities,
+                                                  const std::string& room =
+                                                      "redundancy-smoke",
+                                                  const std::string& token = "") {
     JoinHdr join{};
     join.magic = CTRL_MAGIC;
     join.type = CtrlHdr::Cmd::JOIN;
     join.role = ClientRole::Performer;
     join.capabilities = capabilities;
-    packet_builder::write_fixed(join.room_id, "redundancy-smoke");
-    packet_builder::write_fixed(join.room_handle, "redundancy-smoke");
+    packet_builder::write_fixed(join.room_id, room);
+    packet_builder::write_fixed(join.room_handle, room);
     packet_builder::write_fixed(join.profile_id, name);
     packet_builder::write_fixed(join.display_name, name);
+    packet_builder::write_fixed(join.join_token, token);
 
     std::vector<unsigned char> packet(sizeof(join));
     std::memcpy(packet.data(), &join, sizeof(join));
@@ -1120,11 +1412,28 @@ std::vector<unsigned char> receive_smoke_until(udp::socket& socket, Predicate&& 
     throw std::runtime_error("timed out waiting for expected UDP packet");
 }
 
-void join_smoke_client(udp::socket& socket, const udp::endpoint& server_endpoint,
-                       const std::string& name, uint32_t capabilities) {
-    const auto join = make_smoke_join_packet(name, capabilities);
+template <typename Predicate>
+bool receive_smoke_maybe(udp::socket& socket, Predicate&& predicate,
+                         std::chrono::milliseconds timeout,
+                         std::vector<unsigned char>* out = nullptr) {
+    try {
+        auto packet = receive_smoke_until(socket, std::forward<Predicate>(predicate), timeout);
+        if (out != nullptr) {
+            *out = std::move(packet);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+JoinAckHdr join_smoke_client(udp::socket& socket, const udp::endpoint& server_endpoint,
+                             const std::string& name, uint32_t capabilities,
+                             const std::string& room = "redundancy-smoke",
+                             const std::string& token = "") {
+    const auto join = make_smoke_join_packet(name, capabilities, room, token);
     send_smoke_packet(socket, server_endpoint, join);
-    receive_smoke_until(
+    const auto ack_packet = receive_smoke_until(
         socket,
         [](const std::vector<unsigned char>& packet) {
             if (packet.size() < sizeof(CtrlHdr) || packet_magic(packet) != CTRL_MAGIC) {
@@ -1135,6 +1444,23 @@ void join_smoke_client(udp::socket& socket, const udp::endpoint& server_endpoint
             return ctrl.type == CtrlHdr::Cmd::JOIN_ACK;
         },
         1500ms);
+    JoinAckHdr ack{};
+    std::memcpy(&ack, ack_packet.data(), std::min(ack_packet.size(), sizeof(ack)));
+    return ack;
+}
+
+std::string make_security_smoke_token(const std::string& secret,
+                                      const std::string& server_id,
+                                      const std::string& room,
+                                      const std::string& profile) {
+    performer_join_token::Claims claims;
+    claims.expires_at_ms = performer_join_token::now_ms() + 120000;
+    claims.server_id = server_id;
+    claims.room_id = room;
+    claims.profile_id = profile;
+    claims.role = "performer";
+    claims.nonce = performer_join_token::random_nonce();
+    return performer_join_token::create(claims, secret);
 }
 
 int run_redundancy_relay_smoke() {
@@ -1304,6 +1630,122 @@ int run_timestamp_relay_smoke() {
     }
 }
 
+int run_security_smoke() {
+    asio::io_context server_io;
+    ServerOptions options;
+    options.port = 0;
+    options.server_id = "security-smoke";
+    options.join_secret = "security-smoke-secret";
+
+    Server server(server_io, options);
+    const udp::endpoint server_endpoint(asio::ip::make_address("127.0.0.1"),
+                                        server.local_port());
+
+    std::thread server_thread([&server_io]() { server_io.run(); });
+    try {
+        asio::io_context client_io;
+        udp::socket rx(client_io, udp::endpoint(udp::v4(), 0));
+        udp::socket tx(client_io, udp::endpoint(udp::v4(), 0));
+        udp::socket replay(client_io, udp::endpoint(udp::v4(), 0));
+
+        const std::string room = "security-smoke-room";
+        const std::string rx_token = make_security_smoke_token(
+            options.join_secret, options.server_id, room, "rx-secure");
+        const std::string tx_token = make_security_smoke_token(
+            options.join_secret, options.server_id, room, "tx-secure");
+        const auto rx_key = session_crypto::derive_key_from_join_token_string(rx_token);
+        const auto tx_key = session_crypto::derive_key_from_join_token_string(tx_token);
+        require_smoke(rx_key.has_value(), "receiver key should derive from token");
+        require_smoke(tx_key.has_value(), "sender key should derive from token");
+
+        const auto rx_ack = join_smoke_client(
+            rx, server_endpoint, "rx-secure", AUDIO_SUPPORTED_CAPABILITIES, room, rx_token);
+        const auto tx_ack = join_smoke_client(
+            tx, server_endpoint, "tx-secure", AUDIO_SUPPORTED_CAPABILITIES, room, tx_token);
+        require_smoke((rx_ack.capabilities & AUDIO_CAP_SECURE_AUDIO) != 0,
+                      "receiver should get secure audio capability");
+        require_smoke((tx_ack.capabilities & AUDIO_CAP_SECURE_AUDIO) != 0,
+                      "sender should get secure audio capability");
+
+        const std::array<unsigned char, 4> payload{0x41, 0x42, 0x43, 0x44};
+        auto plaintext_audio = audio_packet::create_audio_packet_v2(
+            AudioCodec::Opus, 1, opus_network_clock::SAMPLE_RATE,
+            opus_network_clock::DEFAULT_FRAME_COUNT, 1, payload.data(),
+            static_cast<uint16_t>(payload.size()));
+        require_smoke(plaintext_audio != nullptr, "plaintext smoke audio should build");
+
+        send_smoke_packet(tx, server_endpoint, *plaintext_audio);
+        const auto is_audio_or_secure = [](const std::vector<unsigned char>& packet) {
+            return packet.size() >= sizeof(MsgHdr) &&
+                   (packet_magic(packet) == AUDIO_V2_MAGIC ||
+                    packet_magic(packet) == AUDIO_V3_MAGIC ||
+                    packet_magic(packet) == AUDIO_REDUNDANT_MAGIC ||
+                    packet_magic(packet) == SECURE_AUDIO_MAGIC);
+        };
+        require_smoke(!receive_smoke_maybe(rx, is_audio_or_secure, 250ms),
+                      "signed session plaintext audio must not be relayed");
+
+        std::vector<unsigned char> secure_audio(
+            SECURE_PACKET_HEADER_BYTES + plaintext_audio->size() + SECURE_PACKET_TAG_BYTES);
+        size_t secure_bytes = 0;
+        require_smoke(session_crypto::seal_audio_packet(
+                          *tx_key, 1, plaintext_audio->data(), plaintext_audio->size(),
+                          secure_audio.data(), secure_audio.size(), secure_bytes),
+                      "sender secure audio should seal");
+        secure_audio.resize(secure_bytes);
+        send_smoke_packet(tx, server_endpoint, secure_audio);
+
+        std::vector<unsigned char> secure_forward;
+        require_smoke(receive_smoke_maybe(rx, is_audio_or_secure, 1500ms, &secure_forward),
+                      "receiver should get secure forwarded audio");
+        require_smoke(packet_magic(secure_forward) == SECURE_AUDIO_MAGIC,
+                      "forwarded audio should be secure");
+
+        std::array<unsigned char, 2048> opened{};
+        uint64_t forward_nonce = 0;
+        size_t opened_bytes = 0;
+        require_smoke(session_crypto::open_audio_packet(
+                          *rx_key, secure_forward.data(), secure_forward.size(),
+                          forward_nonce, opened.data(), opened.size(), opened_bytes),
+                      "receiver should open secure forwarded audio");
+        const auto parsed = audio_packet::parse_audio_header(opened.data(), opened_bytes);
+        require_smoke(parsed.valid && parsed.magic == AUDIO_V2_MAGIC,
+                      "opened forwarded audio should be valid v2");
+        require_smoke(parsed.sender_id == tx_ack.participant_id,
+                      "server should stamp sender id before encryption");
+
+        send_smoke_packet(tx, server_endpoint, secure_audio);
+        require_smoke(!receive_smoke_maybe(rx, is_audio_or_secure, 250ms),
+                      "replayed secure audio nonce must not be relayed");
+
+        const auto replay_join =
+            make_smoke_join_packet("tx-secure", AUDIO_SUPPORTED_CAPABILITIES, room, tx_token);
+        send_smoke_packet(replay, server_endpoint, replay_join);
+        const bool replay_join_acked = receive_smoke_maybe(
+            replay,
+            [](const std::vector<unsigned char>& packet) {
+                if (packet.size() < sizeof(CtrlHdr) || packet_magic(packet) != CTRL_MAGIC) {
+                    return false;
+                }
+                CtrlHdr ctrl{};
+                std::memcpy(&ctrl, packet.data(), sizeof(ctrl));
+                return ctrl.type == CtrlHdr::Cmd::JOIN_ACK;
+            },
+            300ms);
+        require_smoke(!replay_join_acked,
+                      "token nonce replay from another endpoint must not join");
+
+        server_io.stop();
+        server_thread.join();
+        std::cout << "server security smoke passed\n";
+        return 0;
+    } catch (...) {
+        server_io.stop();
+        server_thread.join();
+        throw;
+    }
+}
+
 ServerOptions parse_server_options(int argc, char** argv) {
     ServerOptions options;
     for (int i = 1; i < argc; ++i) {
@@ -1346,6 +1788,9 @@ int main(int argc, char** argv) {
         }
         if (has_arg(argc, argv, "--timestamp-relay-smoke")) {
             return run_timestamp_relay_smoke();
+        }
+        if (has_arg(argc, argv, "--security-smoke")) {
+            return run_security_smoke();
         }
 
         Log::info("Starting SFU server on 0.0.0.0:{}", options.port);

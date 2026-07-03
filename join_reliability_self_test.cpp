@@ -50,6 +50,8 @@ int main() {
     state.mark_join_ack(43, AUDIO_SUPPORTED_CAPABILITIES);
     require(state.server_supports(AUDIO_CAP_CAPTURE_TIMESTAMP),
             "join state should report capture timestamp capability");
+    require(state.server_supports(AUDIO_CAP_SECURE_AUDIO),
+            "join state should report secure audio capability");
 
     state.mark_join_required();
     require(!state.is_join_confirmed(), "join required should clear confirmation");
