@@ -101,6 +101,32 @@ void test_fixed_buffer_input_interleaving()
     expect_array({interleaved[1], interleaved[3], interleaved[5]}, {1.0F, 0.5F, -1.0F});
 }
 
+void test_selected_input_channel_copy()
+{
+    const std::array<float, 3> first{0.1F, 0.2F, 0.3F};
+    const std::array<float, 3> second{0.4F, 0.5F, 0.6F};
+    const std::array<float, 3> third{0.7F, 0.8F, 0.9F};
+    const float* inputs[] = {first.data(), second.data(), third.data()};
+    std::array<float, 3> interleaved{};
+
+    juce_audio_adapter::copy_selected_input_channel_to_interleaved(
+        inputs, 3, 2, 3, 1, interleaved.data(), interleaved.size());
+
+    expect_array(interleaved, {0.7F, 0.8F, 0.9F});
+}
+
+void test_selected_input_channel_falls_back_to_enabled_channel()
+{
+    const std::array<float, 3> enabled{0.25F, 0.5F, 0.75F};
+    const float* inputs[] = {enabled.data()};
+    std::array<float, 3> interleaved{};
+
+    juce_audio_adapter::copy_selected_input_channel_to_interleaved(
+        inputs, 1, 4, 3, 1, interleaved.data(), interleaved.size());
+
+    expect_array(interleaved, {0.25F, 0.5F, 0.75F});
+}
+
 void test_output_clamps_to_last_interleaved_channel()
 {
     const std::vector<float> interleaved{0.1F, 0.3F, 0.5F};
@@ -134,6 +160,8 @@ int main()
     test_null_input_leaves_zeros();
     test_multichannel_input_downmixes_to_mono();
     test_fixed_buffer_input_interleaving();
+    test_selected_input_channel_copy();
+    test_selected_input_channel_falls_back_to_enabled_channel();
     test_output_clamps_to_last_interleaved_channel();
     test_zero_interleaved_channels_outputs_silence();
 

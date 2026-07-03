@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 using AudioDeviceId = std::uint32_t;
 
@@ -24,6 +25,7 @@ struct AudioConfig {
     int bitrate = DEFAULT_BITRATE;
     int complexity = DEFAULT_COMPLEXITY;
     int frames_per_buffer = DEFAULT_FRAMES_PER_BUFFER;
+    int input_channel_index = 0;
     float input_gain = DEFAULT_INPUT_GAIN;
     float output_gain = DEFAULT_OUTPUT_GAIN;
 };
@@ -36,6 +38,7 @@ struct AudioDeviceInfo {
     int max_input_channels = 0;
     int max_output_channels = 0;
     double default_sample_rate = 0.0;
+    std::vector<double> sample_rates;
     bool is_default_input = false;
     bool is_default_output = false;
 };
