@@ -11,6 +11,7 @@ constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
 constexpr uint32_t AUDIO_V2_MAGIC = 0x41553249;  // 'AU2I'
 constexpr uint32_t AUDIO_V3_MAGIC = 0x41553349;  // 'AU3I'
 constexpr uint32_t AUDIO_REDUNDANT_MAGIC = 0x41555244;  // 'AURD'
+constexpr uint32_t SECURE_AUDIO_MAGIC = 0x53454341;  // 'SECA'
 
 // Buffer sizes
 constexpr size_t AUDIO_BUF_SIZE = 512;
@@ -43,8 +44,16 @@ constexpr int    MAX_OPUS_REDUNDANCY_DEPTH_PACKETS =
 // Endpoint capabilities negotiated in extended JOIN/JOIN_ACK packets.
 constexpr uint32_t AUDIO_CAP_REDUNDANCY = 1U << 0;
 constexpr uint32_t AUDIO_CAP_CAPTURE_TIMESTAMP = 1U << 1;
+constexpr uint32_t AUDIO_CAP_SECURE_AUDIO = 1U << 2;
 constexpr uint32_t AUDIO_SUPPORTED_CAPABILITIES =
-    AUDIO_CAP_REDUNDANCY | AUDIO_CAP_CAPTURE_TIMESTAMP;
+    AUDIO_CAP_REDUNDANCY | AUDIO_CAP_CAPTURE_TIMESTAMP | AUDIO_CAP_SECURE_AUDIO;
+
+// Secure audio packet envelope: MsgHdr, uint64 nonce, uint16 ciphertext bytes,
+// uint16 reserved, ciphertext, 16-byte authentication tag.
+constexpr size_t SECURE_PACKET_NONCE_BYTES = sizeof(uint64_t);
+constexpr size_t SECURE_PACKET_TAG_BYTES = 16;
+constexpr size_t SECURE_PACKET_HEADER_BYTES =
+    sizeof(uint32_t) + SECURE_PACKET_NONCE_BYTES + sizeof(uint16_t) + sizeof(uint16_t);
 
 // Type aliases
 template <size_t N>

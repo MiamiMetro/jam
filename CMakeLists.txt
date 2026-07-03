@@ -55,6 +55,9 @@ if(JAM_BUILD_TESTS)
 
     add_executable(audio_packet_self_test audio_packet_self_test.cpp)
 
+    add_executable(session_crypto_self_test session_crypto_self_test.cpp)
+    target_link_libraries(session_crypto_self_test PRIVATE token_crypto)
+
     add_executable(participant_packet_queue_self_test participant_packet_queue_self_test.cpp)
     target_link_libraries(participant_packet_queue_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 
@@ -112,6 +115,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(join_reliability_self_test)
     jam_add_executable_test(opus_network_clock_self_test)
     jam_add_executable_test(audio_packet_self_test)
+    jam_add_executable_test(session_crypto_self_test)
     jam_add_executable_test(participant_packet_queue_self_test)
     jam_add_executable_test(participant_manager_self_test)
     jam_add_executable_test(sequence_tracker_self_test)
