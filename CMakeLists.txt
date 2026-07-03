@@ -86,6 +86,9 @@ target_link_libraries(udp_impair_proxy PRIVATE asio)
 add_executable(multi_participant_jitter_probe multi_participant_jitter_probe.cpp)
 target_link_libraries(multi_participant_jitter_probe PRIVATE asio)
 
+add_executable(relay_load_probe relay_load_probe.cpp)
+target_link_libraries(relay_load_probe PRIVATE asio)
+
 if(JAM_BUILD_TESTS)
     add_executable(recording_writer_self_test recording_writer_self_test.cpp)
     target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)
@@ -160,6 +163,29 @@ if(JAM_BUILD_TESTS)
                          ${CMAKE_SOURCE_DIR}/tools/e2e-latency-smoke.mjs
                          --server-exe $<TARGET_FILE:server>
                          --probe-exe $<TARGET_FILE:latency_probe>)
+        add_test(NAME phase5_track_d_impairment_matrix_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/phase5-track-d-impairment-matrix.mjs
+                         --server-exe $<TARGET_FILE:server>
+                         --proxy-exe $<TARGET_FILE:udp_impair_proxy>
+                         --probe-exe $<TARGET_FILE:latency_probe>
+                         --quick
+                         --out-dir ${CMAKE_BINARY_DIR}/phase5-track-d/impairment-smoke)
+        add_test(NAME phase5_track_d_load_benchmark_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/phase5-track-d-load-benchmark.mjs
+                         --server-exe $<TARGET_FILE:server>
+                         --probe-exe $<TARGET_FILE:relay_load_probe>
+                         --clients 8
+                         --senders 4
+                         --seconds 3
+                         --frames 480
+                         --min-delivery-ratio 0.95
+                         --out-dir ${CMAKE_BINARY_DIR}/phase5-track-d/load-smoke)
+        add_test(NAME phase5_track_d_soak_parser_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/phase5-track-d-soak.mjs
+                         --parser-smoke)
     endif()
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
