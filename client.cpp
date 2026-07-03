@@ -329,6 +329,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(server_endpoint_mutex_);
             server_endpoint_ = resolved_endpoint;
+            outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
         }
         join_state_.reset();
         reset_server_clock_and_ping_state();
@@ -1653,6 +1654,21 @@ public:
                                    });
     }
 
+private:
+    struct OutboundEndpointSnapshot {
+        udp::endpoint endpoint;
+        uint64_t generation = 0;
+    };
+
+    OutboundEndpointSnapshot current_outbound_endpoint_snapshot() const {
+        std::lock_guard<std::mutex> lock(server_endpoint_mutex_);
+        return OutboundEndpointSnapshot{
+            server_endpoint_,
+            outbound_generation_.load(std::memory_order_acquire),
+        };
+    }
+
+public:
     // Send with optional shared_ptr to keep data alive during async operation
     void send(void* data, std::size_t len,
               const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
@@ -1670,24 +1686,22 @@ public:
             send_buffer = std::make_shared<std::vector<unsigned char>>(bytes, bytes + len);
         }
 
-        const auto target = current_server_endpoint();
-        const auto outbound_generation =
-            outbound_generation_.load(std::memory_order_acquire);
-        asio::post(io_context_, [this, send_buffer, target, len, outbound_generation]() {
+        const auto outbound = current_outbound_endpoint_snapshot();
+        asio::post(io_context_, [this, send_buffer, len, outbound]() {
             if (!outbound_enabled_.load(std::memory_order_acquire) ||
-                outbound_generation !=
+                outbound.generation !=
                     outbound_generation_.load(std::memory_order_acquire)) {
                 return;
             }
             std::lock_guard<std::mutex> lock(socket_mutex_);
             if (!outbound_enabled_.load(std::memory_order_acquire) ||
-                outbound_generation !=
+                outbound.generation !=
                     outbound_generation_.load(std::memory_order_acquire)) {
                 return;
             }
             total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
             socket_.async_send_to(asio::buffer(send_buffer->data(), send_buffer->size()),
-                                  target,
+                                  outbound.endpoint,
                                   [send_buffer](std::error_code error_code, std::size_t) {
                                       if (error_code) {
                                           Log::error("send error: {}", error_code.message());
@@ -1706,19 +1720,17 @@ private:
             return;
         }
 
-        const auto target = current_server_endpoint();
-        const auto outbound_generation =
-            outbound_generation_.load(std::memory_order_acquire);
+        const auto outbound = current_outbound_endpoint_snapshot();
 
         std::error_code error_code;
         {
             std::lock_guard<std::mutex> lock(socket_mutex_);
             if (!outbound_enabled_.load(std::memory_order_acquire) ||
-                outbound_generation !=
+                outbound.generation !=
                     outbound_generation_.load(std::memory_order_acquire)) {
                 return;
             }
-            socket_.send_to(asio::buffer(data, len), target, 0, error_code);
+            socket_.send_to(asio::buffer(data, len), outbound.endpoint, 0, error_code);
         }
 
         if (!error_code) {
@@ -3558,60 +3570,152 @@ public:
         asio::io_context io_context;
         asio::io_context aux_context;
 
-        udp::socket dummy_server(aux_context);
-        uint16_t dummy_port = 0;
-        if (!bind_udp_socket_in_range(dummy_server, 19300, 19350, dummy_port)) {
+        udp::socket first_server(aux_context);
+        udp::socket second_server(aux_context);
+        uint16_t first_port = 0;
+        uint16_t second_port = 0;
+        if (!bind_udp_socket_in_range(first_server, 19300, 19350, first_port) ||
+            !bind_udp_socket_in_range(second_server, 19350, 19400, second_port)) {
             failure = "could not bind dummy server port";
             return false;
         }
+        first_server.non_blocking(true);
+        second_server.non_blocking(true);
 
         PerformerJoinOptions join_options{};
-        Client client(io_context, "127.0.0.1", dummy_port, join_options);
+        Client client(io_context, "127.0.0.1", first_port, join_options);
         client.join_state_.mark_join_ack(1, AUDIO_SUPPORTED_CAPABILITIES);
         client.server_clock_ready_.store(true, std::memory_order_release);
 
+        auto build_packet = [&](uint32_t sequence, uint8_t first_payload_byte,
+                                std::array<unsigned char, 128>& packet,
+                                size_t& packet_bytes) {
+            const std::array<unsigned char, 3> payload{
+                first_payload_byte,
+                static_cast<uint8_t>(first_payload_byte + 1),
+                static_cast<uint8_t>(first_payload_byte + 2),
+            };
+            if (!audio_packet::write_audio_packet_v3(
+                    AudioCodec::Opus, sequence, opus_network_clock::SAMPLE_RATE,
+                    opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1, payload.data(),
+                    static_cast<uint16_t>(payload.size()), 12345 + sequence,
+                    packet.data(), packet.size(), packet_bytes)) {
+                failure = "failed to build V3 packet";
+                return false;
+            }
+            return true;
+        };
+
+        auto receive_matching_packet = [&](udp::socket& socket,
+                                           const unsigned char* expected,
+                                           size_t expected_bytes,
+                                           std::chrono::milliseconds timeout,
+                                           std::string& receive_failure) {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            std::array<unsigned char, 256> received{};
+            udp::endpoint sender;
+            while (std::chrono::steady_clock::now() < deadline) {
+                std::error_code ec;
+                const size_t bytes =
+                    socket.receive_from(asio::buffer(received), sender, 0, ec);
+                if (!ec) {
+                    if (bytes == expected_bytes &&
+                        std::memcmp(received.data(), expected, expected_bytes) == 0) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (ec != asio::error::would_block && ec != asio::error::try_again) {
+                    receive_failure = "dummy receive failed: " + ec.message();
+                    return false;
+                }
+                std::this_thread::sleep_for(1ms);
+            }
+            return false;
+        };
+
+        auto expect_matching_packet = [&](udp::socket& socket,
+                                          const std::array<unsigned char, 128>& packet,
+                                          size_t packet_bytes, const char* label) {
+            std::string receive_failure;
+            if (receive_matching_packet(socket, packet.data(), packet_bytes, 500ms,
+                                        receive_failure)) {
+                return true;
+            }
+            failure = !receive_failure.empty()
+                          ? receive_failure
+                          : std::string(label) + ": sync audio packet was not received";
+            return false;
+        };
+
+        auto expect_no_matching_packet = [&](udp::socket& socket,
+                                             const std::array<unsigned char, 128>& packet,
+                                             size_t packet_bytes, const char* label) {
+            std::string receive_failure;
+            if (receive_matching_packet(socket, packet.data(), packet_bytes, 150ms,
+                                        receive_failure)) {
+                failure = std::string(label) + ": sync audio packet should not be received";
+                return false;
+            }
+            if (!receive_failure.empty()) {
+                failure = receive_failure;
+                return false;
+            }
+            return true;
+        };
+
         std::array<unsigned char, 128> packet{};
-        const std::array<unsigned char, 3> payload{0x31, 0x32, 0x33};
         size_t packet_bytes = 0;
-        if (!audio_packet::write_audio_packet_v3(
-                AudioCodec::Opus, 99, opus_network_clock::SAMPLE_RATE,
-                opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1, payload.data(),
-                static_cast<uint16_t>(payload.size()), 12345,
-                packet.data(), packet.size(), packet_bytes)) {
-            failure = "failed to build V3 packet";
+        if (!build_packet(99, 0x31, packet, packet_bytes)) {
             client.stop_connection();
             return false;
         }
 
         client.send_audio_packet_sync(packet.data(), packet_bytes);
-
-        dummy_server.non_blocking(true);
-        const auto deadline = std::chrono::steady_clock::now() + 500ms;
-        std::array<unsigned char, 256> received{};
-        udp::endpoint sender;
-        bool got_packet = false;
-        while (std::chrono::steady_clock::now() < deadline) {
-            std::error_code ec;
-            const size_t bytes =
-                dummy_server.receive_from(asio::buffer(received), sender, 0, ec);
-            if (!ec && bytes == packet_bytes &&
-                std::memcmp(received.data(), packet.data(), packet_bytes) == 0) {
-                got_packet = true;
-                break;
-            }
-            if (ec != asio::error::would_block && ec != asio::error::try_again) {
-                failure = "dummy receive failed: " + ec.message();
-                client.stop_connection();
-                return false;
-            }
-            std::this_thread::sleep_for(1ms);
+        bool got_packet =
+            expect_matching_packet(first_server, packet, packet_bytes, "initial send");
+        if (!got_packet) {
+            client.stop_connection();
+            return false;
         }
 
         client.stop_connection();
-        if (!got_packet) {
-            failure = "sync audio packet was not received without running io_context";
+
+        std::array<unsigned char, 128> stopped_packet{};
+        size_t stopped_packet_bytes = 0;
+        if (!build_packet(100, 0x41, stopped_packet, stopped_packet_bytes)) {
             return false;
         }
+        client.send_audio_packet_sync(stopped_packet.data(), stopped_packet_bytes);
+        if (!expect_no_matching_packet(first_server, stopped_packet, stopped_packet_bytes,
+                                       "post-stop guard")) {
+            return false;
+        }
+
+        client.start_connection("127.0.0.1", second_port);
+        client.join_state_.mark_join_ack(2, AUDIO_SUPPORTED_CAPABILITIES);
+        client.server_clock_ready_.store(true, std::memory_order_release);
+
+        std::array<unsigned char, 128> switched_packet{};
+        size_t switched_packet_bytes = 0;
+        if (!build_packet(101, 0x51, switched_packet, switched_packet_bytes)) {
+            client.stop_connection();
+            return false;
+        }
+        client.send_audio_packet_sync(switched_packet.data(), switched_packet_bytes);
+
+        if (!expect_matching_packet(second_server, switched_packet, switched_packet_bytes,
+                                    "new endpoint send")) {
+            client.stop_connection();
+            return false;
+        }
+        if (!expect_no_matching_packet(first_server, switched_packet, switched_packet_bytes,
+                                       "old endpoint guard")) {
+            client.stop_connection();
+            return false;
+        }
+
+        client.stop_connection();
         return true;
     }
 
