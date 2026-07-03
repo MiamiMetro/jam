@@ -142,6 +142,7 @@ struct AudioDevicePreferences {
     std::string audio_api = "All";
     std::string input_device;
     std::string input_api;
+    std::optional<int> input_channel_index;
     std::string output_device;
     std::string output_api;
 };
@@ -208,6 +209,12 @@ static AudioDevicePreferences load_audio_device_preferences(
             preferences.input_device = value;
         } else if (key == "input_api") {
             preferences.input_api = value;
+        } else if (key == "input_channel") {
+            try {
+                preferences.input_channel_index = std::max(0, std::stoi(value));
+            } catch (const std::exception&) {
+                preferences.input_channel_index.reset();
+            }
         } else if (key == "output_device") {
             preferences.output_device = value;
         } else if (key == "output_api") {
@@ -294,6 +301,7 @@ public:
         default_config.bitrate           = AudioStream::AudioConfig::DEFAULT_BITRATE;
         default_config.complexity        = AudioStream::AudioConfig::DEFAULT_COMPLEXITY;
         default_config.frames_per_buffer = 120;  // 2.5ms validated low-latency default
+        default_config.input_channel_index = 0;
         default_config.input_gain        = 1.0F;
         default_config.output_gain       = 1.0F;
         publish_audio_config(default_config);
@@ -467,7 +475,10 @@ public:
             return false;
         }
         auto input_info = *input_info_ptr;
-        int input_channels = std::min(input_info.max_input_channels, 1);  // Mono input
+        const int input_device_channels = std::max(input_info.max_input_channels, 1);
+        runtime_config.input_channel_index =
+            std::clamp(runtime_config.input_channel_index, 0, input_device_channels - 1);
+        int input_channels = 1;  // The network pipeline remains mono.
 
         // Get output device info
         const auto* output_info_ptr = AudioStream::get_device_info(output_device);
@@ -480,7 +491,8 @@ public:
         // Store device info
         device_info_.input_device_name  = input_info.name;
         device_info_.input_api          = input_info.api_name;
-        device_info_.input_channels     = input_channels;
+        device_info_.input_channels     = input_info.max_input_channels;
+        device_info_.input_channel_index = runtime_config.input_channel_index;
         device_info_.input_sample_rate  = input_info.default_sample_rate;
         device_info_.output_device_name = output_info.name;
         device_info_.output_api         = output_info.api_name;
@@ -618,6 +630,7 @@ public:
         std::string input_device_name;
         std::string input_api;
         int         input_channels;
+        int         input_channel_index;
         double      input_sample_rate;
         std::string output_device_name;
         std::string output_api;
@@ -865,6 +878,25 @@ public:
         auto config = get_audio_config();
         config.frames_per_buffer =
             normalize_buffer_frames_for_codec(get_audio_codec(), frames_per_buffer);
+        publish_audio_config(config);
+    }
+
+    int get_input_channel_index() const {
+        return get_audio_config().input_channel_index;
+    }
+
+    int max_input_channel_count_for_device(AudioStream::DeviceIndex device_index) const {
+        const auto* input_info = AudioStream::get_device_info(device_index);
+        if (input_info == nullptr) {
+            return 1;
+        }
+        return std::max(input_info->max_input_channels, 1);
+    }
+
+    void set_input_channel_index(int channel_index) {
+        auto config = get_audio_config();
+        const int channel_count = max_input_channel_count_for_device(selected_input_device_);
+        config.input_channel_index = std::clamp(channel_index, 0, channel_count - 1);
         publish_audio_config(config);
     }
 
@@ -1457,6 +1489,7 @@ public:
         output << "audio_api=" << selected_audio_api_filter_ << '\n'
                << "input_device=" << input_name << '\n'
                << "input_api=" << input_api << '\n'
+               << "input_channel=" << get_audio_config().input_channel_index << '\n'
                << "output_device=" << output_name << '\n'
                << "output_api=" << output_api << '\n';
         Log::info("Saved audio device preferences: {}",
@@ -1476,7 +1509,13 @@ public:
         if (input_info != nullptr) {
             device_info_.input_device_name = input_info->name;
             device_info_.input_api         = input_info->api_name;
-            device_info_.input_channels    = std::min(input_info->max_input_channels, 1);
+            device_info_.input_channels    = input_info->max_input_channels;
+            auto config = get_audio_config();
+            const int input_channel_count = std::max(input_info->max_input_channels, 1);
+            config.input_channel_index =
+                std::clamp(config.input_channel_index, 0, input_channel_count - 1);
+            publish_audio_config(config);
+            device_info_.input_channel_index = config.input_channel_index;
             device_info_.input_sample_rate = input_info->default_sample_rate;
         }
         return true;
@@ -2034,6 +2073,10 @@ private:
         } else if (!preferences.output_device.empty()) {
             Log::warn("Saved output device is unavailable; using default: {}",
                       preferences.output_device);
+        }
+
+        if (preferences.input_channel_index.has_value()) {
+            set_input_channel_index(*preferences.input_channel_index);
         }
     }
 
@@ -4534,7 +4577,8 @@ public:
 
         Log::info(
             "Baseline snapshot [{}]: platform={} arch={} codec={} audio_active={} "
-            "input='{}' input_api={} input_channels={} input_sample_rate={:.1f} "
+            "input='{}' input_api={} input_channels={} input_channel={} "
+            "input_sample_rate={:.1f} "
             "output='{}' output_api={} output_channels={} output_sample_rate={:.1f} "
             "requested_frames={} actual_frames={} buffer_ms={:.3f} "
             "backend_latency_available={} input_latency_ms={:.3f} output_latency_ms={:.3f} "
@@ -4559,6 +4603,7 @@ public:
             devices.input_device_name,
             devices.input_api,
             devices.input_channels,
+            devices.input_channel_index,
             devices.input_sample_rate,
             devices.output_device_name,
             devices.output_api,
@@ -7177,6 +7222,7 @@ static void draw_bottom_bar(Client& client) {
     static int                                  selected_api        = -1;
     static int                                  refresh_counter     = 0;
     static AudioStream::DeviceIndex             pending_input       = AudioStream::NO_DEVICE;
+    static int                                  pending_input_channel = 0;
     static AudioStream::DeviceIndex             pending_output      = AudioStream::NO_DEVICE;
     static int                                  pending_buffer_frames = 0;
     static int                                  pending_opus_frames_per_packet = 0;
@@ -7212,8 +7258,18 @@ static void draw_bottom_bar(Client& client) {
         return -1;
     };
 
+    auto max_input_channels_for = [&](AudioStream::DeviceIndex device_index) {
+        for (const auto& dev: input_devices) {
+            if (dev.index == device_index) {
+                return std::max(dev.max_input_channels, 1);
+            }
+        }
+        return 1;
+    };
+
     if (!devices_initialized) {
         pending_input         = client.get_selected_input_device();
+        pending_input_channel = client.get_input_channel_index();
         pending_output        = client.get_selected_output_device();
         pending_buffer_frames = client.get_audio_config().frames_per_buffer;
         pending_opus_frames_per_packet = client.get_opus_network_frame_count();
@@ -7222,6 +7278,8 @@ static void draw_bottom_bar(Client& client) {
     }
     pending_buffer_frames =
         normalize_buffer_frames_for_codec(client.get_audio_codec(), pending_buffer_frames);
+    pending_input_channel =
+        std::clamp(pending_input_channel, 0, max_input_channels_for(pending_input) - 1);
 
     // API selector
     ImGui::AlignTextToFramePadding();
@@ -7275,10 +7333,12 @@ static void draw_bottom_bar(Client& client) {
                     if (new_input != AudioStream::NO_DEVICE &&
                         new_output != AudioStream::NO_DEVICE) {
                         pending_input  = new_input;
+                        pending_input_channel = 0;
                         pending_output = new_output;
                     } else if (new_input != AudioStream::NO_DEVICE) {
                         // Found input but not output - switch input only
                         pending_input = new_input;
+                        pending_input_channel = 0;
                     } else if (new_output != AudioStream::NO_DEVICE) {
                         // Found output but not input - switch output only
                         pending_output = new_output;
@@ -7314,6 +7374,31 @@ static void draw_bottom_bar(Client& client) {
                           dev.api_name.c_str(), dev.index);
             if (ImGui::Selectable(dev_label, dev.index == pending_input)) {
                 pending_input = dev.index;
+                pending_input_channel =
+                    std::clamp(pending_input_channel, 0,
+                               std::max(dev.max_input_channels, 1) - 1);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Ch:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(55);
+    const int pending_input_channels = max_input_channels_for(pending_input);
+    char input_channel_preview[16];
+    std::snprintf(input_channel_preview, sizeof(input_channel_preview), "%d",
+                  pending_input_channel + 1);
+    if (ImGui::BeginCombo("##InputChannel", input_channel_preview)) {
+        for (int channel = 0; channel < pending_input_channels; ++channel) {
+            char channel_label[24];
+            std::snprintf(channel_label, sizeof(channel_label), "%d##input_channel_%d",
+                          channel + 1, channel);
+            if (ImGui::Selectable(channel_label, channel == pending_input_channel)) {
+                pending_input_channel = channel;
             }
         }
         ImGui::EndCombo();
@@ -7426,8 +7511,10 @@ static void draw_bottom_bar(Client& client) {
     // Check if devices changed
     AudioStream::DeviceIndex active_input  = client.get_selected_input_device();
     AudioStream::DeviceIndex active_output = client.get_selected_output_device();
+    const int active_input_channel = client.get_input_channel_index();
     bool stream_restart_needed =
         (pending_input != active_input) || (pending_output != active_output) ||
+        (pending_input_channel != active_input_channel) ||
         (pending_buffer_frames != client.get_audio_config().frames_per_buffer);
     bool opus_packet_changed =
         (pending_opus_frames_per_packet != client.get_opus_network_frame_count());
@@ -7452,6 +7539,7 @@ static void draw_bottom_bar(Client& client) {
             last_apply_time = now;
             client.set_audio_api_filter(selected_api_name());
             client.set_input_device(pending_input);
+            client.set_input_channel_index(pending_input_channel);
             client.set_output_device(pending_output);
             client.set_requested_frames_per_buffer(pending_buffer_frames);
             client.set_opus_network_frame_count(pending_opus_frames_per_packet);
@@ -7478,6 +7566,7 @@ static void draw_bottom_bar(Client& client) {
                     pending_output != AudioStream::NO_DEVICE) {
                     client.set_audio_api_filter(selected_api_name());
                     client.set_input_device(pending_input);
+                    client.set_input_channel_index(pending_input_channel);
                     client.set_output_device(pending_output);
                     client.set_requested_frames_per_buffer(pending_buffer_frames);
                     client.set_opus_network_frame_count(pending_opus_frames_per_packet);
@@ -7659,6 +7748,7 @@ struct ClientStartupOptions {
     std::string app_version;
     std::string config_dir;
     int requested_frames = 0;
+    std::optional<int> startup_input_channel_index;
     std::string startup_latency_profile = "adaptive";
     std::optional<int> startup_opus_packet_frames;
     std::optional<int> startup_jitter_packets;
@@ -7737,6 +7827,10 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.performer_join.join_token = argv[++i];
         } else if ((arg == "--frames" || arg == "--buffer-frames") && i + 1 < argc) {
             options.requested_frames = std::stoi(argv[++i]);
+        } else if (arg == "--input-channel" && i + 1 < argc) {
+            options.startup_input_channel_index = std::max(0, std::stoi(argv[++i]) - 1);
+        } else if (arg == "--input-channel-index" && i + 1 < argc) {
+            options.startup_input_channel_index = std::max(0, std::stoi(argv[++i]));
         } else if ((arg == "--latency-profile" || arg == "--opus-latency-profile") &&
                    i + 1 < argc) {
             options.startup_latency_profile = argv[++i];
@@ -7954,6 +8048,9 @@ int run_audio_open_smoke(const ClientStartupOptions& startup_options) {
     AudioStream::AudioConfig config;
     config.frames_per_buffer =
         startup_options.requested_frames > 0 ? startup_options.requested_frames : 120;
+    if (startup_options.startup_input_channel_index.has_value()) {
+        config.input_channel_index = *startup_options.startup_input_channel_index;
+    }
 
     if (!stream.start_audio_stream(input_dev, output_dev, config, smoke_audio_callback, &stream)) {
         Log::error("Audio open smoke failed: {}", AudioStream::get_last_error());
@@ -8407,6 +8504,12 @@ int main(int argc, char** argv) {
             Log::info("Startup requested buffer override: {} frames",
                       startup_options.requested_frames);
         }
+        if (startup_options.startup_input_channel_index.has_value()) {
+            client_instance.set_input_channel_index(*startup_options.startup_input_channel_index);
+            Log::info("Startup input channel override: channel {} (index {})",
+                      *startup_options.startup_input_channel_index + 1,
+                      *startup_options.startup_input_channel_index);
+        }
         if (!apply_startup_latency_profile(client_instance, startup_options)) {
             client_instance.stop_connection();
             log.flush();
@@ -8464,14 +8567,15 @@ int main(int argc, char** argv) {
         if (startup_options.startup_config_smoke) {
             Log::info(
                 "Startup config smoke: codec={} frames={} opus_packet={} jitter_floor={} "
-                "jitter_ms={} auto_start_jitter={} queue_limit={} age_limit_ms={} auto_jitter={} "
-                "redundancy_depth={} effective_redundancy_depth={} "
+                "jitter_ms={} input_channel={} auto_start_jitter={} queue_limit={} "
+                "age_limit_ms={} auto_jitter={} redundancy_depth={} effective_redundancy_depth={} "
                 "broadcast_ipc_port={} app_version={}",
                 client_instance.get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
                 client_instance.get_audio_config().frames_per_buffer,
                 client_instance.get_opus_network_frame_count(),
                 client_instance.get_opus_jitter_buffer_packets(),
                 client_instance.get_opus_jitter_buffer_ms(),
+                client_instance.get_input_channel_index(),
                 client_instance.get_opus_auto_jitter_default()
                     ? std::to_string(client_instance.get_opus_auto_start_jitter_packets())
                     : "disabled",

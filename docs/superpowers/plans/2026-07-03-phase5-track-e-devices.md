@@ -166,17 +166,17 @@ git commit -m "feat: enumerate JUCE device capabilities"
   - Bottom-bar input channel combo that restarts the stream when the selected channel changes.
   - Startup-config smoke output includes `input_channel=`.
 
-- [ ] **Step 1: Write the failing startup-config smoke expectation**
+- [x] **Step 1: Write the failing startup-config smoke expectation**
 
 Add `startup_input_channel_index` to `ClientStartupOptions` and include `input_channel={}` in the existing startup-config smoke log. The expected command after implementation is:
 
 ```powershell
-build\Release\client.exe --startup-config-smoke --input-channel 3 --log-file validation_logs/phase5-track-e/startup-config-smoke.log
+build\Release\client.exe --startup-config-smoke --input-channel 2 --log-file validation_logs/phase5-track-e/startup-config-smoke.log
 ```
 
-Expected log line includes `input_channel=2`.
+Expected log line on the two-channel default input used for this session includes `input_channel=1`.
 
-- [ ] **Step 2: Implement client config, preferences, CLI, and UI**
+- [x] **Step 2: Implement client config, preferences, CLI, and UI**
 
 Implement these exact behaviors:
 
@@ -222,11 +222,11 @@ Preferences:
 output << "input_channel=" << get_audio_config().input_channel_index << '\n';
 ```
 
-- [ ] **Step 3: Update tracker after validation**
+- [x] **Step 3: Update tracker after validation**
 
 After validation passes, update Track E in `LOW_LATENCY_ACTION_PLAN.md` from `not started` to Done and record the build/ctest results plus the accepted behavior: real JUCE caps, sample-rate reporting, clear 48 kHz rejection for unsupported devices, persisted/UI/CLI input-channel selection.
 
-- [ ] **Step 4: Run Task 2 validation**
+- [x] **Step 4: Run Task 2 validation**
 
 Run: `cmake --build build --config Release --parallel 8`
 
@@ -240,7 +240,7 @@ Run: `rg -n "max_input_channels = input \\? 2|max_output_channels = input \\? 0 
 
 Expected: no matches.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add client.cpp LOW_LATENCY_ACTION_PLAN.md

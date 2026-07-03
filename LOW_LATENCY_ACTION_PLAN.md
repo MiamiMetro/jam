@@ -13,7 +13,7 @@ Detailed plans:
 - Phase 5 Track B: `docs/superpowers/plans/2026-07-03-phase5-track-b-network.md` (written)
 - Phase 5 Track C: `docs/superpowers/plans/2026-07-03-phase5-track-c-operations.md` (written)
 - Phase 5 Track D: `docs/superpowers/plans/2026-07-03-phase5-track-d-testing.md` (written)
-- Other Phase 5 tracks: written when selected; do not batch independent tracks together.
+- Phase 5 Track E: `docs/superpowers/plans/2026-07-03-phase5-track-e-devices.md` (written)
 - Ready-to-paste prompts for the sessions that finish each phase:
   `docs/superpowers/plans/2026-07-02-session-prompts.md`
 
@@ -178,9 +178,11 @@ rather than claiming a universal p99 improvement.
 Status: Track A Done (2026-07-03, Release build + full `ctest` 45/45 passed
 locally, signed security smokes passed), Track B Done (2026-07-03, Release
 build + full `ctest` 47/47 passed locally), Track C Done (2026-07-03, Release
-build + full `ctest` 52/52 passed locally), and Track D Done (2026-07-03, 2h
-real-client churn soak passed and CI green on PR #14). Track E not started.
-Phase 5 remains split into independent tracks; each gets its own plan doc.
+build + full `ctest` 52/52 passed locally), Track D Done (2026-07-03, 2h
+real-client churn soak passed and CI green on PR #14), and Track E Done
+(2026-07-03, Release build + full `ctest` 52/52 passed locally). Phase 5
+remained split into independent tracks; Track E was executed alone in its own
+session.
 
 - Track A (security): Done on branch `phase5-track-a-security`. Signed JOINs
   now derive a per-session audio key from the validated HMAC join token;
@@ -211,8 +213,15 @@ Phase 5 remains split into independent tracks; each gets its own plan doc.
   relay load benchmark, and real-client soak runner with log-budget assertions.
   CI-safe smokes are registered in CTest; the required multi-hour real-client
   soak passed locally.
-- Track E (devices): real capability enumeration and input-channel selection in the JUCE
-  backend (`juce_audio_backend.cpp:376-387`).
+- Track E (devices): Done on branch `phase5-track-e-devices`. JUCE device
+  scans now query real channel counts and supported sample rates from created
+  JUCE devices instead of fabricating 2-channel/48 kHz capabilities. Device
+  inventory prints sample-rate lists, stream start rejects selected devices
+  whose non-empty rate lists do not include the app's required 48 kHz clock,
+  and input capture opens the selected physical input channel while preserving
+  the existing mono network pipeline. The selected input channel is available
+  through the bottom-bar `Ch:` picker, `--input-channel` /
+  `--input-channel-index`, and persisted `jam_client.ini` preferences.
 
 Track A local validation snapshot (2026-07-03):
 
@@ -280,6 +289,23 @@ Track D accepted command:
 ```powershell
 node tools/phase5-track-d-soak.mjs --server-exe build/Release/server.exe --client-exe build/Release/client.exe --seconds 7200 --churn-interval-seconds 120 --stable-clients 1 --churn-clients 1 --max-queue-drift-packets 4 --out-dir validation_logs/phase5-track-d/soak-2h-20260703-140217
 ```
+
+Track E local validation snapshot (2026-07-03):
+
+- Release build command: `cmake --build build --config Release --parallel 8`;
+  passed.
+- Full test command: `ctest --test-dir build -C Release --output-on-failure`;
+  passed `52/52` in `307.70 sec`.
+- Startup channel smoke command:
+  `build\Release\client.exe --startup-config-smoke --input-channel 2 --log-file validation_logs\phase5-track-e\startup-config-smoke.log`;
+  passed and logged `input_channel=1`, verifying the one-based CLI maps to the
+  zero-based stored config on this two-channel input.
+- Structural check:
+  `rg -n "max_input_channels = input \? 2|max_output_channels = input \? 0 : 2|default_sample_rate = FALLBACK_SAMPLE_RATE" juce_audio_backend.cpp`;
+  returned no matches.
+- Local inventory output from the startup smoke showed non-fabricated device
+  capabilities, including a 1-channel/44.1 kHz Steam Streaming microphone and
+  an 8-channel Realtek digital output, plus explicit sample-rate lists.
 
 Track B local validation snapshot (2026-07-03):
 

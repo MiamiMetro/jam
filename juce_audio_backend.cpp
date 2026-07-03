@@ -496,7 +496,7 @@ std::vector<AudioDeviceInfo> JuceAudioBackend::scan_device_stubs(bool input) {
             info.api_index = api_index;
             info.max_input_channels = input ? 1 : 0;
             info.max_output_channels = input ? 0 : 1;
-            info.default_sample_rate = FALLBACK_SAMPLE_RATE;
+            info.default_sample_rate = static_cast<double>(AudioConfig::DEFAULT_SAMPLE_RATE);
             info.is_default_input = input && device_index == default_index;
             info.is_default_output = !input && device_index == default_index;
             devices.push_back(info);
