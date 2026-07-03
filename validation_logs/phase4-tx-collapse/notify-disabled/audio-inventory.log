@@ -1,0 +1,37 @@
+# audio inventory
+# cwd: C:\Users\Berkay\Downloads\udpstuff
+# command: C:\Users\Berkay\Downloads\udpstuff\build\Release\client.exe --list-audio-devices
+
+[12:04:29] [info] Runtime: role=client platform=windows arch=x64
+[12:04:29] [info] Available audio APIs:
+[12:04:29] [info] API 0: Windows Audio | default input 65539 | default output 65538
+[12:04:29] [info] API 1: Windows Audio (Exclusive Mode) | default input 131075 | default output 131074
+[12:04:29] [info] API 2: Windows Audio (Low Latency Mode) | default input 196611 | default output 196610
+[12:04:29] [info] API 3: ASIO | default input 0 | default output 0
+[12:04:29] [info] Available audio devices:
+[12:04:29] [info] Device 65539: Headset Microphone (DualSense Wireless Controller) | API: Windows Audio | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 65541: Microphone (Steam Streaming Microphone) | API: Windows Audio | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 65543: Headset Microphone (HyperX Virtual Surround Sound) | API: Windows Audio | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131075: Headset Microphone (DualSense Wireless Controller) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131077: Microphone (Steam Streaming Microphone) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131079: Headset Microphone (HyperX Virtual Surround Sound) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196611: Headset Microphone (DualSense Wireless Controller) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196613: Microphone (Steam Streaming Microphone) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196615: Headset Microphone (HyperX Virtual Surround Sound) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 2 | Max Output Channels: 0 | Default Sample Rate: 48000
+[12:04:29] [info] Device 65538: Headset Earphone (HyperX Virtual Surround Sound) | API: Windows Audio | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 65540: Speakers (Steam Streaming Speakers) | API: Windows Audio | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 65542: Realtek Digital Output (Realtek(R) Audio) | API: Windows Audio | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 65544: Speakers (Steam Streaming Microphone) | API: Windows Audio | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 65546: 24G1WG4 (NVIDIA High Definition Audio) | API: Windows Audio | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131074: Headset Earphone (HyperX Virtual Surround Sound) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131076: Speakers (Steam Streaming Speakers) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131078: Realtek Digital Output (Realtek(R) Audio) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131080: Speakers (Steam Streaming Microphone) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 131082: 24G1WG4 (NVIDIA High Definition Audio) | API: Windows Audio (Exclusive Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196610: Headset Earphone (HyperX Virtual Surround Sound) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196612: Speakers (Steam Streaming Speakers) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196614: Realtek Digital Output (Realtek(R) Audio) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196616: Speakers (Steam Streaming Microphone) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+[12:04:29] [info] Device 196618: 24G1WG4 (NVIDIA High Definition Audio) | API: Windows Audio (Low Latency Mode) | Max Input Channels: 0 | Max Output Channels: 2 | Default Sample Rate: 48000
+
+# exit: code=0 signal=

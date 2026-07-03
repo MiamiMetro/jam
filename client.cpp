@@ -124,6 +124,7 @@ constexpr double UDP_PATH_REBIND_SEVERE_GAP_RATE = 0.25;
 constexpr auto UDP_PATH_REBIND_COOLDOWN = 15s;
 constexpr int OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS = 200;
 constexpr int OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE = 3;
+constexpr bool AUDIO_CALLBACK_NOTIFY_ENABLED = true;
 
 struct PerformerJoinOptions {
     std::string room_id;
@@ -2517,7 +2518,9 @@ private:
 
     void wake_pcm_sender_thread() {
         pcm_sender_wake_.store(true, std::memory_order_release);
-        pcm_sender_cv_.notify_one();
+        if constexpr (AUDIO_CALLBACK_NOTIFY_ENABLED) {
+            pcm_sender_cv_.notify_one();
+        }
     }
 
     static size_t consume_opus_pcm_buffer(ParticipantData& participant, size_t frame_count) {

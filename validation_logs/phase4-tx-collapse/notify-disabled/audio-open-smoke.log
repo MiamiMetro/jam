@@ -1,0 +1,13 @@
+# audio open smoke
+# cwd: C:\Users\Berkay\Downloads\udpstuff
+# command: C:\Users\Berkay\Downloads\udpstuff\build\Release\client.exe --audio-open-smoke --frames 120
+
+[12:04:29] [info] Runtime: role=client platform=windows arch=x64
+[12:04:29] [info] Input latency:  10.000 ms
+[12:04:29] [info] Output latency: 10.000 ms
+[12:04:29] [info] Sample rate:    48000.0 Hz
+[12:04:29] [info] Requested buffer: 120 frames
+[12:04:29] [info] Actual buffer:    480 frames (10.000 ms)
+[12:04:29] [info] Audio open smoke succeeded
+
+# exit: code=0 signal=
