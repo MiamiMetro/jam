@@ -52,6 +52,8 @@ if(JAM_BUILD_TESTS)
     add_executable(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)
     target_link_libraries(server_rate_limiter_self_test PRIVATE asio)
 
+    add_executable(server_metrics_self_test server_metrics_self_test.cpp)
+
     add_executable(join_reliability_self_test join_reliability_self_test.cpp)
 
     add_executable(opus_network_clock_self_test opus_network_clock_self_test.cpp)
@@ -122,6 +124,7 @@ if(JAM_BUILD_TESTS)
 
     jam_add_executable_test(client_manager_self_test)
     jam_add_executable_test(server_rate_limiter_self_test)
+    jam_add_executable_test(server_metrics_self_test)
     jam_add_executable_test(join_reliability_self_test)
     jam_add_executable_test(opus_network_clock_self_test)
     jam_add_executable_test(audio_packet_self_test)
@@ -148,6 +151,8 @@ if(JAM_BUILD_TESTS)
              COMMAND $<TARGET_FILE:server> --dual-stack-relay-smoke)
     add_test(NAME server_security_smoke
              COMMAND $<TARGET_FILE:server> --security-smoke)
+    add_test(NAME server_metrics_export_smoke
+             COMMAND $<TARGET_FILE:server> --metrics-export-smoke)
     add_test(NAME latency_probe_v3_receive_smoke
              COMMAND $<TARGET_FILE:latency_probe> --v3-receive-smoke)
     if(NODE_EXECUTABLE)
