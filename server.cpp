@@ -78,6 +78,8 @@ struct ServerOptions {
     std::string server_id = "local-dev";
     std::string join_secret;
     std::string log_file_path;
+    size_t      log_max_bytes = Logger::DEFAULT_ROTATING_LOG_MAX_BYTES;
+    size_t      log_max_files = Logger::DEFAULT_ROTATING_LOG_MAX_FILES;
     std::string metrics_jsonl_path;
 };
 
@@ -2064,6 +2066,20 @@ int run_metrics_export_smoke() {
     return 0;
 }
 
+size_t parse_positive_size_arg(const std::string& value, const char* option_name) {
+    try {
+        size_t consumed = 0;
+        const auto parsed = std::stoull(value, &consumed, 10);
+        if (consumed != value.size() || parsed == 0 ||
+            parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+            throw std::invalid_argument("out of range");
+        }
+        return static_cast<size_t>(parsed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string("Invalid ") + option_name + ": " + value);
+    }
+}
+
 ServerOptions parse_server_options(int argc, char** argv) {
     ServerOptions options;
     for (int i = 1; i < argc; ++i) {
@@ -2076,6 +2092,10 @@ ServerOptions parse_server_options(int argc, char** argv) {
             options.join_secret = argv[++i];
         } else if (arg == "--log-file" && i + 1 < argc) {
             options.log_file_path = argv[++i];
+        } else if (arg == "--log-max-bytes" && i + 1 < argc) {
+            options.log_max_bytes = parse_positive_size_arg(argv[++i], "--log-max-bytes");
+        } else if (arg == "--log-max-files" && i + 1 < argc) {
+            options.log_max_files = parse_positive_size_arg(argv[++i], "--log-max-files");
         } else if (arg == "--metrics-jsonl" && i + 1 < argc) {
             options.metrics_jsonl_path = argv[++i];
         } else if (arg == "--allow-insecure-dev-joins") {
@@ -2101,7 +2121,7 @@ int main(int argc, char** argv) {
 
         auto& log = Logger::instance();
         log.init(true, false, !options.log_file_path.empty(), options.log_file_path,
-                 spdlog::level::info);
+                 spdlog::level::info, options.log_max_bytes, options.log_max_files);
 
         if (has_arg(argc, argv, "--redundancy-relay-smoke")) {
             return run_redundancy_relay_smoke();
@@ -2124,6 +2144,8 @@ int main(int argc, char** argv) {
                   runtime_arch_name());
         if (!options.log_file_path.empty()) {
             Log::info("Logging to {}", options.log_file_path);
+            Log::info("Log rotation: max_bytes={} max_files={}", options.log_max_bytes,
+                      options.log_max_files);
         }
         if (!options.metrics_jsonl_path.empty()) {
             Log::info("Server metrics JSONL export: {}", options.metrics_jsonl_path);
