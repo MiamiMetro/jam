@@ -126,5 +126,5 @@ target_link_libraries(client PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(client PRIVATE Avrt)
+    target_link_libraries(client PRIVATE Avrt Qwave)
 endif()

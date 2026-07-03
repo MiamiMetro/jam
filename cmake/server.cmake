@@ -14,3 +14,6 @@ find_package(Threads REQUIRED)
 
 add_executable(server server.cpp)
 target_link_libraries(server PRIVATE asio concurrentqueue spdlog::spdlog opus token_crypto Threads::Threads)
+if(WIN32)
+    target_link_libraries(server PRIVATE Qwave)
+endif()

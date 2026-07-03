@@ -144,6 +144,8 @@ if(JAM_BUILD_TESTS)
              COMMAND $<TARGET_FILE:server> --redundancy-relay-smoke)
     add_test(NAME server_timestamp_relay_smoke
              COMMAND $<TARGET_FILE:server> --timestamp-relay-smoke)
+    add_test(NAME server_dual_stack_relay_smoke
+             COMMAND $<TARGET_FILE:server> --dual-stack-relay-smoke)
     add_test(NAME server_security_smoke
              COMMAND $<TARGET_FILE:server> --security-smoke)
     add_test(NAME latency_probe_v3_receive_smoke

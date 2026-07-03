@@ -165,6 +165,8 @@ private:
 #ifdef _WIN32
     HANDLE qos_handle_ = nullptr;
     std::unordered_map<udp::endpoint, QOS_FLOWID, endpoint_hash> flows_;
+    std::unordered_map<udp::endpoint, QosResult, endpoint_hash> failed_flows_;
+    std::optional<QosResult> handle_failure_;
 
     bool ensure_qos_handle(QosResult& result);
 #endif
@@ -172,13 +174,19 @@ private:
 
 #ifdef _WIN32
 inline bool endpoint_to_sockaddr(const udp::endpoint& endpoint, sockaddr_storage& storage,
-                                 int& length) {
+                                 int& length, bool unmap_v4_mapped) {
     std::memset(&storage, 0, sizeof(storage));
-    if (endpoint.address().is_v4()) {
+    if (endpoint.address().is_v4() ||
+        (unmap_v4_mapped && endpoint.address().is_v6() &&
+         endpoint.address().to_v6().is_v4_mapped())) {
         auto* addr = reinterpret_cast<sockaddr_in*>(&storage);
         addr->sin_family = AF_INET;
         addr->sin_port   = htons(endpoint.port());
-        const auto bytes = endpoint.address().to_v4().to_bytes();
+        const auto v4_address =
+            endpoint.address().is_v4()
+                ? endpoint.address().to_v4()
+                : asio::ip::make_address_v4(asio::ip::v4_mapped, endpoint.address().to_v6());
+        const auto bytes = v4_address.to_bytes();
         std::memcpy(&addr->sin_addr, bytes.data(), bytes.size());
         length = sizeof(sockaddr_in);
         return true;
@@ -198,6 +206,11 @@ inline bool UdpSocketQos::ensure_qos_handle(QosResult& result) {
     if (qos_handle_ != nullptr) {
         return true;
     }
+    if (handle_failure_.has_value()) {
+        result = *handle_failure_;
+        result.newly_configured = false;
+        return false;
+    }
 
     QOS_VERSION version{};
     version.MajorVersion = 1;
@@ -208,6 +221,8 @@ inline bool UdpSocketQos::ensure_qos_handle(QosResult& result) {
 
     result.error_code = GetLastError();
     result.detail = "QOSCreateHandle failed with error " + std::to_string(result.error_code);
+    handle_failure_ = result;
+    handle_failure_->newly_configured = false;
     return false;
 }
 
@@ -222,26 +237,52 @@ inline QosResult UdpSocketQos::ensure_flow(udp::socket& socket,
         result.detail = "qWAVE flow already configured";
         return result;
     }
+    if (const auto failed = failed_flows_.find(normalized); failed != failed_flows_.end()) {
+        result = failed->second;
+        result.requested = true;
+        result.newly_configured = false;
+        return result;
+    }
 
     result.newly_configured = true;
     if (!ensure_qos_handle(result)) {
         return result;
     }
 
-    sockaddr_storage storage{};
-    int              storage_length = 0;
-    if (!endpoint_to_sockaddr(normalized, storage, storage_length)) {
-        result.detail = "endpoint address family is not supported by qWAVE";
-        return result;
-    }
+    auto cache_failure = [&]() {
+        auto cached = result;
+        cached.newly_configured = false;
+        failed_flows_[normalized] = cached;
+    };
+
+    auto add_socket_to_flow = [&](bool unmap_v4_mapped, QOS_FLOWID& flow_id) {
+        sockaddr_storage storage{};
+        int              storage_length = 0;
+        if (!endpoint_to_sockaddr(normalized, storage, storage_length, unmap_v4_mapped)) {
+            result.detail = "endpoint address family is not supported by qWAVE";
+            result.error_code = ERROR_INVALID_PARAMETER;
+            return false;
+        }
+        if (QOSAddSocketToFlow(qos_handle_, socket.native_handle(),
+                               reinterpret_cast<PSOCKADDR>(&storage), QOSTrafficTypeVoice,
+                               QOS_NON_ADAPTIVE_FLOW, &flow_id) != 0) {
+            return true;
+        }
+        result.error_code = GetLastError();
+        return false;
+    };
 
     QOS_FLOWID flow_id = 0;
-    if (QOSAddSocketToFlow(qos_handle_, socket.native_handle(),
-                           reinterpret_cast<PSOCKADDR>(&storage), QOSTrafficTypeVoice,
-                           QOS_NON_ADAPTIVE_FLOW, &flow_id) == 0) {
-        result.error_code = GetLastError();
+    bool       flow_added = add_socket_to_flow(true, flow_id);
+    if (!flow_added && result.error_code == ERROR_INVALID_PARAMETER &&
+        normalized.address().is_v6() && normalized.address().to_v6().is_v4_mapped()) {
+        flow_id = 0;
+        flow_added = add_socket_to_flow(false, flow_id);
+    }
+    if (!flow_added) {
         result.detail = "QOSAddSocketToFlow failed with error " +
                         std::to_string(result.error_code);
+        cache_failure();
         return result;
     }
 
@@ -264,6 +305,8 @@ inline QosResult UdpSocketQos::ensure_flow(udp::socket& socket,
 
 inline void UdpSocketQos::reset() {
     flows_.clear();
+    failed_flows_.clear();
+    handle_failure_.reset();
     if (qos_handle_ != nullptr) {
         QOSCloseHandle(qos_handle_);
         qos_handle_ = nullptr;
