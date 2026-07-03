@@ -1,0 +1,66 @@
+# e2e latency smoke
+# cwd: C:\Users\Berkay\Downloads\udpstuff
+# command: node tools/e2e-latency-smoke.mjs --server-exe build/Release/server.exe --probe-exe build/Release/latency_probe.exe --frames 120 --jitter 4 --packets 650 --margin-ms 8
+
+[server] [12:17:58] [info] Starting SFU server on 0.0.0.0:55509
+[12:17:58] [info] Runtime: role=server platform=windows arch=x64
+[12:17:58] [info] Forwarding audio packets between clients
+[12:17:58] [warning] Insecure performer dev joins enabled
+[12:17:58] [info] UDP socket buffers optimized for packet forwarding (4194304 bytes)
+[12:17:58] [info] SFU server ready: forwarding audio between clients
+[server] [12:17:58] [info] JOIN: 127.0.0.1:55510 room='latency-probe' user='latency-probe-receiver' display='latency-probe-receiver' role='performer' (ID: 1, insecure-dev, capabilities=0x00000003)
+[server] [12:17:58] [info] JOIN: 127.0.0.1:55511 room='latency-probe' user='latency-probe-sender' display='latency-probe-sender' role='performer' (ID: 2, insecure-dev, capabilities=0x00000003)
+[server] [12:18:00] [info] Client LEAVE: 127.0.0.1:55511
+[server] [12:18:00] [info] Client LEAVE: 127.0.0.1:55510
+[latency_probe] latency_probe v2
+server: 127.0.0.1:55509
+codec: pcm_int16
+sample_rate: 48000
+frames_per_packet: 120
+jitter_min_packets: 4
+playout_ppm: 0
+invalid_flood_packets: 0
+total_packets: 650
+impulse_packet: 20
+sent_packets: 650
+encode_failures: 0
+raw_audio_packets: 650
+redundant_audio_packets: 650
+v2_audio_packets: 0
+receiver_queue_drops: 0
+invalid_audio_packets: 0
+received_packets: 650
+decoded_packets: 650
+missing_packets: 0
+undecoded_packets: 0
+detected_output_sample: 2880
+latency_samples: 480
+latency_ms: 10
+e2e_latency_samples: 650
+e2e_latency_ms last/avg/max/steady_max: 9.4238/9.98548/11.5315/11.5315
+e2e_latency_budget_ms: 23
+e2e_latency_margin_ms: 8
+avg_queue_depth: 4.02923
+queue_drift_from_jitter: 0.0292308
+min_queue_depth_after_ready: 1
+max_queue_depth: 5
+final_queue_depth: 0
+underruns: 0
+plc_frames: 0
+gap_plc_frames: 0
+empty_plc_frames: 0
+max_gap_plc_run: 0
+decoder_resets: 0
+gap_waits: 0
+sequence_gaps: 0
+sequence_gap_recoveries: 0
+sequence_late_or_duplicate: 1944
+sequence_unresolved_gaps: 0
+decode_failures: 0
+decoded_size_mismatches: 0
+non_finite_samples: 0
+out_of_range_samples: 0
+repeated_blocks: 647
+max_discontinuity: 0.800012
+
+# exit: code=0

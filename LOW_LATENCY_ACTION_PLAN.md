@@ -109,23 +109,58 @@ Device-backed snapshot also passed with Release binaries using `JAM_SERVER_EXE=b
 
 ## Phase 4: TX Path Collapse
 
-Status: Not started — plan doc written after Phase 3 lands (so the improvement is measurable).
+Status: Implemented locally - acceptance pending (2026-07-03, Release build
+green, full `ctest` 39/39 passed locally, E2E loopback smoke recorded locally,
+CI pending, required send-queue p99 improvement not yet proven)
 
 Goal: capture-to-wire without the `asio::post` hop; bounded allocations; prioritized sender.
 
-Design decision to make in the plan doc (this is the landmine the original plan ignored):
-**socket ownership.** The sender thread must transmit while the io thread receives on the
-same socket. A second socket is NOT acceptable — the server identifies clients by source
-`ip:port` (`server.cpp:370-382`). Recommended: synchronous `send_to` from the sender thread
-under `socket_mutex_` (hold times are sub-microsecond; the io thread only takes it to re-arm
-receives and during rebind, `client.cpp:1563, 1727-1740`), which also composes with the
-existing rebind/generation logic. Verify no asio thread-safety violation remains, or drop to
-the native socket handle for sends.
+Implemented: audio packets are encoded and synchronously sent from the sender
+thread on the existing UDP socket under `socket_mutex_`; no second socket was
+introduced, so the server still observes the joined source `ip:port`. Control
+traffic remains on the existing io-thread send path. The sender hot path uses a
+fixed reusable packet pool for primary and redundant Opus packets instead of
+per-packet vector allocation, and the sender thread enters MMCSS "Pro Audio" on
+Windows when available.
 
-Acceptance: audio packets no longer traverse `asio::post`; per-packet allocations replaced
-by a reusable pool; sender thread runs at raised priority (MMCSS "Pro Audio" on Windows);
-p99 send-queue age (`observe_opus_send_queue_age`) measurably lower than the Phase 3
-baseline; build + full ctest.
+Task 7 wake decision: `pcm_sender_cv_.notify_one()` remains enabled. The
+no-notify validation regressed 30s Opus send-queue p99 from `0.211 ms` to
+`2.592 ms` on client A and from `0.203 ms` to `3.124 ms` on client B, so the
+callback wake was kept.
+
+Local validation snapshot (2026-07-03; acceptance blocker: mixed p99 signal and
+CI pending):
+
+- Before baseline: pre-collapse commit `cd9a275`, built in
+  `C:\Users\Berkay\Downloads\udpstuff-phase4-before`; logs in
+  `validation_logs/phase4-tx-collapse/before`.
+- After baseline: current Phase 4 code; logs in
+  `validation_logs/phase4-tx-collapse/after`.
+- 30s Opus send-queue p99 from `Baseline snapshot` logs:
+  client A `0.189 ms -> 0.212 ms`, client B `0.247 ms -> 0.209 ms`.
+  The p99 signal is mixed on this local device-backed run; client A regressed
+  by `0.023 ms` while client B improved by `0.038 ms`. Opus max send-queue age
+  decreased on both clients (`0.453 ms -> 0.412 ms`, `0.518 ms -> 0.426 ms`).
+- Phase 3 accepted E2E baseline: last `9.1425 ms`, avg `9.90777 ms`, max
+  `11.5601 ms`, steady_max `11.5601 ms`.
+- Phase 4 local E2E rerun:
+  `validation_logs/phase4-tx-collapse/e2e-smoke.log` reports last
+  `9.4238 ms`, avg `9.98548 ms`, max `11.5315 ms`, steady_max `11.5315 ms`
+  against the `23 ms` budget. This is recorded as a local snapshot, not final
+  accepted latency validation, because the required p99 before/after signal is
+  mixed and CI is still pending.
+- Release build command logged in
+  `validation_logs/phase4-tx-collapse/release-build.log`.
+- Full test command logged in
+  `validation_logs/phase4-tx-collapse/ctest-release.log`: `100% tests passed,
+  0 tests failed out of 39` in `25.09 sec`.
+- CI: pending on PR/push.
+
+Acceptance: structural TX collapse items are complete (no audio `asio::post`,
+bounded packet reuse, sender-thread synchronous send on the original socket, and
+MMCSS priority). Acceptance is not closed: local latency validation is only a
+snapshot, the send-queue p99 result is mixed because one client regressed
+slightly in the required before/after run, and remote CI remains pending.
 
 ## Phase 5: Production Hardening
 

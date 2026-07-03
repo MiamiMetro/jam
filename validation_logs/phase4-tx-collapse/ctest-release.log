@@ -1,0 +1,83 @@
+Test project C:/Users/Berkay/Downloads/udpstuff/build
+      Start  1: client_manager_self_test
+ 1/39 Test  #1: client_manager_self_test ............................   Passed    0.01 sec
+      Start  2: join_reliability_self_test
+ 2/39 Test  #2: join_reliability_self_test ..........................   Passed    0.01 sec
+      Start  3: opus_network_clock_self_test
+ 3/39 Test  #3: opus_network_clock_self_test ........................   Passed    0.01 sec
+      Start  4: audio_packet_self_test
+ 4/39 Test  #4: audio_packet_self_test ..............................   Passed    0.01 sec
+      Start  5: participant_packet_queue_self_test
+ 5/39 Test  #5: participant_packet_queue_self_test ..................   Passed    0.01 sec
+      Start  6: participant_manager_self_test
+ 6/39 Test  #6: participant_manager_self_test .......................   Passed    0.01 sec
+      Start  7: sequence_tracker_self_test
+ 7/39 Test  #7: sequence_tracker_self_test ..........................   Passed    0.01 sec
+      Start  8: udp_port_self_test
+ 8/39 Test  #8: udp_port_self_test ..................................   Passed    0.01 sec
+      Start  9: jitter_policy_self_test
+ 9/39 Test  #9: jitter_policy_self_test .............................   Passed    0.01 sec
+      Start 10: redundant_receive_policy_self_test
+10/39 Test #10: redundant_receive_policy_self_test ..................   Passed    0.01 sec
+      Start 11: recording_writer_self_test
+11/39 Test #11: recording_writer_self_test ..........................   Passed    0.02 sec
+      Start 12: audio_analysis_self_test
+12/39 Test #12: audio_analysis_self_test ............................   Passed    0.01 sec
+      Start 13: audio_backend_policy_self_test
+13/39 Test #13: audio_backend_policy_self_test ......................   Passed    0.01 sec
+      Start 14: juce_audio_adapter_self_test
+14/39 Test #14: juce_audio_adapter_self_test ........................   Passed    0.01 sec
+      Start 15: opus_receiver_harness_self_test
+15/39 Test #15: opus_receiver_harness_self_test .....................   Passed    0.01 sec
+      Start 16: server_redundancy_relay_smoke
+16/39 Test #16: server_redundancy_relay_smoke .......................   Passed    0.07 sec
+      Start 17: server_timestamp_relay_smoke
+17/39 Test #17: server_timestamp_relay_smoke ........................   Passed    0.06 sec
+      Start 18: latency_probe_v3_receive_smoke
+18/39 Test #18: latency_probe_v3_receive_smoke ......................   Passed    0.01 sec
+      Start 19: server_audio_path_feedback_smoke
+19/39 Test #19: server_audio_path_feedback_smoke ....................   Passed    5.07 sec
+      Start 20: latency_probe_return_burst_smoke
+20/39 Test #20: latency_probe_return_burst_smoke ....................   Passed    6.04 sec
+      Start 21: latency_probe_large_gap_smoke
+21/39 Test #21: latency_probe_large_gap_smoke .......................   Passed    7.73 sec
+      Start 22: e2e_latency_loopback_smoke
+22/39 Test #22: e2e_latency_loopback_smoke ..........................   Passed    2.06 sec
+      Start 23: client_udp_endpoint_guard_smoke
+23/39 Test #23: client_udp_endpoint_guard_smoke .....................   Passed    1.34 sec
+      Start 24: client_auto_jitter_empty_playout_smoke
+24/39 Test #24: client_auto_jitter_empty_playout_smoke ..............   Passed    0.06 sec
+      Start 25: client_audio_path_feedback_smoke
+25/39 Test #25: client_audio_path_feedback_smoke ....................   Passed    0.06 sec
+      Start 26: client_opus_playout_policy_smoke
+26/39 Test #26: client_opus_playout_policy_smoke ....................   Passed    0.06 sec
+      Start 27: client_opus_redundancy_policy_smoke
+27/39 Test #27: client_opus_redundancy_policy_smoke .................   Passed    0.06 sec
+      Start 28: client_opus_encode_buffer_smoke
+28/39 Test #28: client_opus_encode_buffer_smoke .....................   Passed    0.06 sec
+      Start 29: client_udp_audio_sync_send_smoke
+29/39 Test #29: client_udp_audio_sync_send_smoke ....................   Passed    0.49 sec
+      Start 30: client_audio_v3_receive_smoke
+30/39 Test #30: client_audio_v3_receive_smoke .......................   Passed    0.18 sec
+      Start 31: client_e2e_latency_metric_smoke
+31/39 Test #31: client_e2e_latency_metric_smoke .....................   Passed    0.19 sec
+      Start 32: client_startup_config_adaptive_smoke
+32/39 Test #32: client_startup_config_adaptive_smoke ................   Passed    0.19 sec
+      Start 33: client_startup_config_low_smoke
+33/39 Test #33: client_startup_config_low_smoke .....................   Passed    0.19 sec
+      Start 34: client_startup_config_stable_smoke
+34/39 Test #34: client_startup_config_stable_smoke ..................   Passed    0.18 sec
+      Start 35: client_startup_config_jitter_ms_scaling_smoke
+35/39 Test #35: client_startup_config_jitter_ms_scaling_smoke .......   Passed    0.19 sec
+      Start 36: client_startup_config_jitter_requested_ms_smoke
+36/39 Test #36: client_startup_config_jitter_requested_ms_smoke .....   Passed    0.19 sec
+      Start 37: client_startup_config_jitter_age_validation_smoke
+37/39 Test #37: client_startup_config_jitter_age_validation_smoke ...   Passed    0.19 sec
+      Start 38: client_startup_config_jitter_unit_conflict_smoke
+38/39 Test #38: client_startup_config_jitter_unit_conflict_smoke ....   Passed    0.06 sec
+      Start 39: client_startup_config_redundancy_depth_smoke
+39/39 Test #39: client_startup_config_redundancy_depth_smoke ........   Passed    0.19 sec
+
+100% tests passed, 0 tests failed out of 39
+
+Total Test time (real) =  25.09 sec

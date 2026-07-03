@@ -1,0 +1,57 @@
+# local baseline server
+# cwd: C:\Users\Berkay\Downloads\udpstuff
+# command: C:\Users\Berkay\Downloads\udpstuff\build\Release\server.exe --port 9999 --server-id local-dev --join-secret dev-secret
+
+[12:04:30] [info] Starting SFU server on 0.0.0.0:9999
+[12:04:30] [info] Runtime: role=server platform=windows arch=x64
+[12:04:30] [info] Forwarding audio packets between clients
+[12:04:30] [info] UDP socket buffers optimized for packet forwarding (4194304 bytes)
+[12:04:30] [info] SFU server ready: forwarding audio between clients
+[12:04:32] [info] JOIN: 127.0.0.1:58989 room='room-a' user='user-a1' display='User A1' role='performer' (ID: 1, token-present, capabilities=0x00000003)
+[12:04:32] [info] JOIN: 127.0.0.1:58990 room='room-a' user='user-a2' display='User A2' role='performer' (ID: 2, token-present, capabilities=0x00000003)
+[12:04:35] [info] Ingress diag interval sender=1 endpoint=127.0.0.1:58989 received=972 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=972 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:35] [info] Ingress diag interval sender=2 endpoint=127.0.0.1:58990 received=960 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=960 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:35] [info] Forward diag interval sender=2 target=1 forwarded=960 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=960 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:35] [info] Forward diag interval sender=1 target=2 forwarded=960 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=960 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:35] [info] Ping diag interval client=1 endpoint=127.0.0.1:58989 received=6 reply_queued=6 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=6 reply_queued=6 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:35] [info] Ping diag interval client=2 endpoint=127.0.0.1:58990 received=6 reply_queued=6 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=6 reply_queued=6 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:40] [info] Ingress diag interval sender=1 endpoint=127.0.0.1:58989 received=1996 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=2968 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:40] [info] Ingress diag interval sender=2 endpoint=127.0.0.1:58990 received=1996 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=2956 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:40] [info] Forward diag interval sender=2 target=1 forwarded=1996 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=2956 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:40] [info] Forward diag interval sender=1 target=2 forwarded=1996 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=2956 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:40] [info] Ping diag interval client=1 endpoint=127.0.0.1:58989 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=16 reply_queued=16 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:40] [info] Ping diag interval client=2 endpoint=127.0.0.1:58990 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=16 reply_queued=16 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:45] [info] Ingress diag interval sender=1 endpoint=127.0.0.1:58989 received=2004 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=4972 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:45] [info] Ingress diag interval sender=2 endpoint=127.0.0.1:58990 received=2004 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=4960 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:45] [info] Forward diag interval sender=2 target=1 forwarded=2004 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=4960 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:45] [info] Forward diag interval sender=1 target=2 forwarded=2004 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=4960 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:45] [info] Ping diag interval client=1 endpoint=127.0.0.1:58989 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=26 reply_queued=26 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:45] [info] Ping diag interval client=2 endpoint=127.0.0.1:58990 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=26 reply_queued=26 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:50] [info] Ingress diag interval sender=1 endpoint=127.0.0.1:58989 received=1996 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=6968 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:50] [info] Ingress diag interval sender=2 endpoint=127.0.0.1:58990 received=1996 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=6956 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:50] [info] Forward diag interval sender=2 target=1 forwarded=1996 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=6956 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:50] [info] Forward diag interval sender=1 target=2 forwarded=1996 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=6956 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:50] [info] Ping diag interval client=1 endpoint=127.0.0.1:58989 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=36 reply_queued=36 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:50] [info] Ping diag interval client=2 endpoint=127.0.0.1:58990 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=36 reply_queued=36 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:55] [info] Ingress diag interval sender=1 endpoint=127.0.0.1:58989 received=2000 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=8968 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:55] [info] Ingress diag interval sender=2 endpoint=127.0.0.1:58990 received=2000 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=8956 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:55] [info] Forward diag interval sender=2 target=1 forwarded=2000 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=8956 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:55] [info] Forward diag interval sender=1 target=2 forwarded=2000 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=8956 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:55] [info] Ping diag interval client=1 endpoint=127.0.0.1:58989 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=46 reply_queued=46 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:04:55] [info] Ping diag interval client=2 endpoint=127.0.0.1:58990 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=46 reply_queued=46 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:00] [info] Ingress diag interval sender=1 endpoint=127.0.0.1:58989 received=2004 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=10972 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:00] [info] Ingress diag interval sender=2 endpoint=127.0.0.1:58990 received=2004 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=10960 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:00] [info] Forward diag interval sender=2 target=1 forwarded=2004 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=10960 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:00] [info] Forward diag interval sender=1 target=2 forwarded=2004 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=10960 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:00] [info] Ping diag interval client=1 endpoint=127.0.0.1:58989 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=56 reply_queued=56 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:00] [info] Ping diag interval client=2 endpoint=127.0.0.1:58990 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=56 reply_queued=56 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:02] [info] Client LEAVE: 127.0.0.1:58989
+[12:05:05] [info] Ingress diag interval sender=1 endpoint=127.0.0.1:58989 received=1028 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=12000 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:05] [info] Ingress diag interval sender=2 endpoint=127.0.0.1:58990 received=2000 seq_gap=0 net_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=12960 seq_gap=0 net_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:05] [info] Forward diag interval sender=2 target=1 forwarded=1040 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=12000 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:05] [info] Forward diag interval sender=1 target=2 forwarded=1028 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total forwarded=11988 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:05] [info] Ping diag interval client=1 endpoint=127.0.0.1:58989 received=6 reply_queued=6 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=62 reply_queued=62 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:05] [info] Ping diag interval client=2 endpoint=127.0.0.1:58990 received=10 reply_queued=10 seq_gap=0 gap_rate=0.0% seq_recovered=0 seq_unresolved=0 seq_late=0 late=0.0% total received=66 reply_queued=66 seq_gap=0 seq_recovered=0 seq_unresolved=0 seq_late=0
+[12:05:07] [info] Client LEAVE: 127.0.0.1:58990
+
+# exit: code= signal=SIGTERM

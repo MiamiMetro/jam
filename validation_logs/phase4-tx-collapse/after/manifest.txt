@@ -1,0 +1,18 @@
+Jam RtAudio performer baseline
+created_at=2026-07-03T09:17:14.465Z
+repo=C:\Users\Berkay\Downloads\udpstuff
+seconds=30
+interval_seconds=5
+frames=120
+codec=opus
+api=default
+latency_profile=low
+jitter=4
+queue_limit=default
+age_limit_ms=default
+auto_jitter=default
+
+Manual dev-jam equivalent:
+node tools/dev-jam.mjs server
+node tools/dev-jam.mjs client a
+node tools/dev-jam.mjs client b

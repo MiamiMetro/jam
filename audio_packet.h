@@ -389,6 +389,119 @@ inline bool embed_sender_id_in_redundant_audio_packet(unsigned char* data, size_
         reason);
 }
 
+struct AudioPacketView {
+    const unsigned char* data = nullptr;
+    size_t size = 0;
+};
+
+inline bool write_audio_packet_v2(AudioCodec codec, uint32_t sequence, uint32_t sample_rate,
+                                  uint16_t frame_count, uint8_t channels,
+                                  const unsigned char* payload, uint16_t payload_bytes,
+                                  unsigned char* out, size_t out_capacity,
+                                  size_t& bytes_written) {
+    bytes_written = 0;
+    const size_t required = v2_header_size() + payload_bytes;
+    if (out == nullptr || out_capacity < required ||
+        (payload_bytes > 0 && payload == nullptr)) {
+        return false;
+    }
+
+    AudioHdrV2 hdr{};
+    hdr.magic = AUDIO_V2_MAGIC;
+    hdr.sender_id = 0;
+    hdr.sequence = sequence;
+    hdr.sample_rate = sample_rate;
+    hdr.frame_count = frame_count;
+    hdr.payload_bytes = payload_bytes;
+    hdr.channels = channels;
+    hdr.codec = codec;
+
+    std::memcpy(out, &hdr, v2_header_size());
+    if (payload_bytes > 0) {
+        std::memcpy(out + v2_header_size(), payload, payload_bytes);
+    }
+    bytes_written = required;
+    return true;
+}
+
+inline bool write_audio_packet_v3(AudioCodec codec, uint32_t sequence, uint32_t sample_rate,
+                                  uint16_t frame_count, uint8_t channels,
+                                  const unsigned char* payload, uint16_t payload_bytes,
+                                  int64_t capture_server_time_ns,
+                                  unsigned char* out, size_t out_capacity,
+                                  size_t& bytes_written) {
+    bytes_written = 0;
+    const size_t required = v3_header_size() + payload_bytes;
+    if (out == nullptr || out_capacity < required ||
+        (payload_bytes > 0 && payload == nullptr)) {
+        return false;
+    }
+
+    AudioHdrV3 hdr{};
+    hdr.magic = AUDIO_V3_MAGIC;
+    hdr.sender_id = 0;
+    hdr.sequence = sequence;
+    hdr.sample_rate = sample_rate;
+    hdr.frame_count = frame_count;
+    hdr.payload_bytes = payload_bytes;
+    hdr.channels = channels;
+    hdr.codec = codec;
+    hdr.capture_server_time_ns = capture_server_time_ns;
+
+    std::memcpy(out, &hdr, v3_header_size());
+    if (payload_bytes > 0) {
+        std::memcpy(out + v3_header_size(), payload, payload_bytes);
+    }
+    bytes_written = required;
+    return true;
+}
+
+inline bool write_redundant_audio_packet(const AudioPacketView* packets, size_t packet_count,
+                                         unsigned char* out, size_t out_capacity,
+                                         size_t max_packet_bytes,
+                                         size_t& bytes_written) {
+    bytes_written = 0;
+    if (packets == nullptr || packet_count == 0 ||
+        packet_count > MAX_AUDIO_REDUNDANT_PACKETS || out == nullptr ||
+        out_capacity < redundant_header_size()) {
+        return false;
+    }
+
+    size_t total_bytes = redundant_header_size();
+    size_t selected_count = 0;
+    for (size_t i = 0; i < packet_count; ++i) {
+        const auto& packet = packets[i];
+        if (packet.data == nullptr ||
+            !validate_audio_packet_bytes(packet.data, packet.size)) {
+            return false;
+        }
+        if (max_packet_bytes > 0 && total_bytes + packet.size > max_packet_bytes) {
+            if (selected_count == 0) {
+                return false;
+            }
+            break;
+        }
+        if (total_bytes + packet.size > out_capacity) {
+            return false;
+        }
+        total_bytes += packet.size;
+        ++selected_count;
+    }
+
+    AudioRedundantHdr hdr{};
+    hdr.magic = AUDIO_REDUNDANT_MAGIC;
+    hdr.packet_count = static_cast<uint8_t>(selected_count);
+    std::memcpy(out, &hdr, redundant_header_size());
+
+    size_t offset = redundant_header_size();
+    for (size_t i = 0; i < selected_count; ++i) {
+        std::memcpy(out + offset, packets[i].data, packets[i].size);
+        offset += packets[i].size;
+    }
+    bytes_written = total_bytes;
+    return true;
+}
+
 inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet(
     const std::vector<const std::vector<unsigned char>*>& packets,
     size_t max_packet_bytes = 0) {
@@ -397,8 +510,8 @@ inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet
     }
 
     size_t total_bytes = redundant_header_size();
-    std::vector<const std::vector<unsigned char>*> selected_packets;
-    selected_packets.reserve(packets.size());
+    std::array<AudioPacketView, MAX_AUDIO_REDUNDANT_PACKETS> selected_packets{};
+    size_t selected_count = 0;
     for (const auto* packet: packets) {
         if (packet == nullptr ||
             !validate_audio_packet_bytes(packet->data(), packet->size())) {
@@ -406,27 +519,25 @@ inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet
         }
         if (max_packet_bytes > 0 &&
             total_bytes + packet->size() > max_packet_bytes) {
-            if (selected_packets.empty()) {
+            if (selected_count == 0) {
                 return nullptr;
             }
             break;
         }
-        selected_packets.push_back(packet);
+        selected_packets[selected_count] = {packet->data(), packet->size()};
+        ++selected_count;
         total_bytes += packet->size();
     }
 
     auto redundant = std::make_shared<std::vector<unsigned char>>();
     redundant->resize(total_bytes);
-    AudioRedundantHdr hdr{};
-    hdr.magic = AUDIO_REDUNDANT_MAGIC;
-    hdr.packet_count = static_cast<uint8_t>(selected_packets.size());
-    std::memcpy(redundant->data(), &hdr, redundant_header_size());
-
-    size_t offset = redundant_header_size();
-    for (const auto* packet: selected_packets) {
-        std::memcpy(redundant->data() + offset, packet->data(), packet->size());
-        offset += packet->size();
+    size_t bytes_written = 0;
+    if (!write_redundant_audio_packet(selected_packets.data(), selected_count,
+                                      redundant->data(), redundant->size(),
+                                      max_packet_bytes, bytes_written)) {
+        return nullptr;
     }
+    redundant->resize(bytes_written);
     return redundant;
 }
 
@@ -466,22 +577,13 @@ inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v2(
     uint8_t channels, const unsigned char* payload, uint16_t payload_bytes) {
     auto packet = std::make_shared<std::vector<unsigned char>>();
     packet->resize(v2_header_size() + payload_bytes);
-
-    AudioHdrV2 hdr{};
-    hdr.magic         = AUDIO_V2_MAGIC;
-    hdr.sender_id     = 0;
-    hdr.sequence      = sequence;
-    hdr.sample_rate   = sample_rate;
-    hdr.frame_count   = frame_count;
-    hdr.payload_bytes = payload_bytes;
-    hdr.channels      = channels;
-    hdr.codec         = codec;
-
-    std::memcpy(packet->data(), &hdr, v2_header_size());
-    if (payload_bytes > 0) {
-        std::memcpy(packet->data() + v2_header_size(), payload, payload_bytes);
+    size_t bytes_written = 0;
+    if (!write_audio_packet_v2(codec, sequence, sample_rate, frame_count, channels,
+                               payload, payload_bytes, packet->data(), packet->size(),
+                               bytes_written)) {
+        return nullptr;
     }
-
+    packet->resize(bytes_written);
     return packet;
 }
 
@@ -491,23 +593,13 @@ inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v3(
     int64_t capture_server_time_ns) {
     auto packet = std::make_shared<std::vector<unsigned char>>();
     packet->resize(v3_header_size() + payload_bytes);
-
-    AudioHdrV3 hdr{};
-    hdr.magic = AUDIO_V3_MAGIC;
-    hdr.sender_id = 0;
-    hdr.sequence = sequence;
-    hdr.sample_rate = sample_rate;
-    hdr.frame_count = frame_count;
-    hdr.payload_bytes = payload_bytes;
-    hdr.channels = channels;
-    hdr.codec = codec;
-    hdr.capture_server_time_ns = capture_server_time_ns;
-
-    std::memcpy(packet->data(), &hdr, v3_header_size());
-    if (payload_bytes > 0) {
-        std::memcpy(packet->data() + v3_header_size(), payload, payload_bytes);
+    size_t bytes_written = 0;
+    if (!write_audio_packet_v3(codec, sequence, sample_rate, frame_count, channels,
+                               payload, payload_bytes, capture_server_time_ns,
+                               packet->data(), packet->size(), bytes_written)) {
+        return nullptr;
     }
-
+    packet->resize(bytes_written);
     return packet;
 }
 
