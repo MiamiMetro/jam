@@ -160,6 +160,14 @@ if(JAM_BUILD_TESTS)
                          ${CMAKE_SOURCE_DIR}/tools/e2e-latency-smoke.mjs
                          --server-exe $<TARGET_FILE:server>
                          --probe-exe $<TARGET_FILE:latency_probe>)
+        add_test(NAME phase5_track_d_impairment_matrix_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/phase5-track-d-impairment-matrix.mjs
+                         --server-exe $<TARGET_FILE:server>
+                         --proxy-exe $<TARGET_FILE:udp_impair_proxy>
+                         --probe-exe $<TARGET_FILE:latency_probe>
+                         --quick
+                         --out-dir ${CMAKE_BINARY_DIR}/phase5-track-d/impairment-smoke)
     endif()
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
