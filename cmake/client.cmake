@@ -123,3 +123,7 @@ target_link_libraries(client PRIVATE
     juce::juce_core
     juce::juce_events
 )
+
+if(WIN32)
+    target_link_libraries(client PRIVATE Avrt)
+endif()

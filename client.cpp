@@ -31,6 +31,7 @@
 #define NOMINMAX  // Prevent Windows from defining min/max macros
 #endif
 #include <windows.h>
+#include <avrt.h>
 #include <winsock2.h>
 #endif
 
@@ -2203,7 +2204,39 @@ private:
         }
     }
 
+    class ScopedSenderThreadPriority {
+    public:
+        ScopedSenderThreadPriority() {
+#ifdef _WIN32
+            DWORD task_index = 0;
+            handle_ = AvSetMmThreadCharacteristicsA("Pro Audio", &task_index);
+            if (handle_ != nullptr) {
+                AvSetMmThreadPriority(handle_, AVRT_PRIORITY_HIGH);
+            } else {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+            }
+#endif
+        }
+
+        ~ScopedSenderThreadPriority() {
+#ifdef _WIN32
+            if (handle_ != nullptr) {
+                AvRevertMmThreadCharacteristics(handle_);
+            }
+#endif
+        }
+
+        ScopedSenderThreadPriority(const ScopedSenderThreadPriority&) = delete;
+        ScopedSenderThreadPriority& operator=(const ScopedSenderThreadPriority&) = delete;
+
+    private:
+#ifdef _WIN32
+        HANDLE handle_ = nullptr;
+#endif
+    };
+
     void pcm_sender_loop() {
+        ScopedSenderThreadPriority sender_priority;
         TxPacketBufferPool packet_pool;
         std::array<unsigned char, AUDIO_BUF_SIZE> encoded_data{};
 
