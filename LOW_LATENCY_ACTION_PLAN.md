@@ -9,6 +9,7 @@ Detailed plans:
 
 - Phase 0 + 1: `docs/superpowers/plans/2026-07-02-phase0-1-ci-rt-safety.md` (written)
 - Phase 2: `docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md` (written)
+- Phase 5 Track A: `docs/superpowers/plans/2026-07-03-phase5-track-a-security.md` (written)
 - Phase 5 Track D: `docs/superpowers/plans/2026-07-03-phase5-track-d-testing.md` (written)
 - Other Phase 5 tracks: written when selected; do not batch independent tracks together.
 - Ready-to-paste prompts for the sessions that finish each phase:
@@ -16,8 +17,8 @@ Detailed plans:
 
 ## Current State
 
-- Release build passes; full test suite passes 42/42 locally for Phase 5 Track D
-  tooling (verified 2026-07-03).
+- Release build passes; full test suite passes 45/45 locally for Phase 5 Track A
+  security (verified 2026-07-03).
 - Receive-side jitter/playout policy is in good shape and regression-tested.
 - Phase 3 end-to-end latency is measurable in loopback smoke and device-backed baseline logs.
 - CI exists and is green for the Phase 0+1 and Phase 2 PRs.
@@ -172,12 +173,21 @@ rather than claiming a universal p99 improvement.
 
 ## Phase 5: Production Hardening
 
-Status: Track D Done (2026-07-03, 2h real-client churn soak passed and CI green
-on PR #14). Tracks A/B/C/E not started. Phase 5 remains split into independent
-tracks; each gets its own plan doc.
+Status: Track A Done (2026-07-03, Release build + full `ctest` 45/45 passed
+locally, signed security smokes passed) and Track D Done (2026-07-03, 2h
+real-client churn soak passed and CI green on PR #14). Tracks B/C/E not
+started. Phase 5 remains split into independent tracks; each gets its own plan
+doc.
 
-- Track A (security): per-packet authentication via session key derived at join, then
-  payload encryption; server-side token nonce tracking; per-client rate limiting.
+- Track A (security): Done on branch `phase5-track-a-security`. Signed JOINs
+  now derive a per-session audio key from the validated HMAC join token;
+  signed sessions reject plaintext audio, authenticate/decrypt secure audio,
+  drop packet nonce replays, and re-encrypt relayed audio per recipient.
+  The server tracks join-token nonce ownership and rejects reuse from a
+  different endpoint. Protocol-aware rate limiting allows authenticated
+  low-latency audio cadence while limiting unknown, malformed, replay,
+  unknown-session, control, and abusive traffic. Insecure dev joins remain
+  plaintext for local smokes only.
 - Track B (network): DSCP/QoS marking (qWAVE on Windows — plain `IP_TOS` is ignored there);
   dual-stack IPv4/IPv6 sockets.
 - Track C (operations): server metrics export (machine-readable), log rotation
@@ -189,6 +199,31 @@ tracks; each gets its own plan doc.
   soak passed locally.
 - Track E (devices): real capability enumeration and input-channel selection in the JUCE
   backend (`juce_audio_backend.cpp:376-387`).
+
+Track A local validation snapshot (2026-07-03):
+
+- Release build command logged in `validation_logs/phase5-track-a/release-build.log`.
+- Full test command logged in `validation_logs/phase5-track-a/ctest-release.log`:
+  `100% tests passed, 0 tests failed out of 45` in `38.29 sec`.
+- Security smoke logged in
+  `validation_logs/phase5-track-a/server-security-smoke.log`; it verifies
+  signed sessions reject plaintext audio, secure audio relays after
+  per-recipient encryption, packet nonce replay is dropped, and join-token
+  nonce replay from another endpoint is rejected.
+- Session crypto self-test logged in
+  `validation_logs/phase5-track-a/session-crypto-self-test.log`; status `ok`.
+- Server rate limiter self-test logged in
+  `validation_logs/phase5-track-a/server-rate-limiter-self-test.log`;
+  status `ok`.
+- Signed latency probe logged in
+  `validation_logs/phase5-track-a/signed-latency-probe.log`: signed-token
+  secure probe traffic delivered `120/120` packets with `0` invalid audio
+  packets and steady E2E max `11.217 ms`.
+- Signed room routing probe logged in
+  `validation_logs/phase5-track-a/signed-room-routing-probe.log`: same-room
+  secure audio and listener delivery passed, different-room leakage stayed
+  false, stale duplicate forwarding stayed false, and rejoined sender
+  forwarding passed.
 
 Track D local validation snapshot (2026-07-03):
 
@@ -238,8 +273,8 @@ Do not call the app production-ready until all of these are true:
 
 - Phase 0–2 complete (CI green, RT-safe callback, no callback mutex).
 - E2E latency measured in real sessions (Phase 3).
-- Packet authentication implemented; encryption decision made and implemented if hosting
-  requires privacy; token replay protection; joined-client rate limiting (Track A).
+- Packet authentication, payload encryption for signed audio sessions, token nonce replay
+  protection, and joined-client rate limiting implemented (Track A).
 - Device latency warnings or adaptation exist (audit "granted vs requested" finding).
 - Soak/load/impairment tests pass against defined budgets (Track D).
 - Server metrics and log rotation exist (Track C).
