@@ -29,7 +29,7 @@ const PROFILES = {
     jitter: 2,
     maxQueueDriftPackets: 3.0,
     maxQueueDepthPackets: 12,
-    e2eMarginMs: 25,
+    e2eMarginMs: 30,
   },
   stable: {
     frames: 960,

@@ -9,13 +9,15 @@ Detailed plans:
 
 - Phase 0 + 1: `docs/superpowers/plans/2026-07-02-phase0-1-ci-rt-safety.md` (written)
 - Phase 2: `docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md` (written)
-- Phase 3-5: written when the preceding phase lands (their designs depend on earlier outcomes)
+- Phase 5 Track D: `docs/superpowers/plans/2026-07-03-phase5-track-d-testing.md` (written)
+- Other Phase 5 tracks: written when selected; do not batch independent tracks together.
 - Ready-to-paste prompts for the sessions that finish each phase:
   `docs/superpowers/plans/2026-07-02-session-prompts.md`
 
 ## Current State
 
-- Release build passes; full test suite passes 37/37 (verified 2026-07-02).
+- Release build passes; full test suite passes 42/42 locally for Phase 5 Track D
+  tooling (verified 2026-07-03).
 - Receive-side jitter/playout policy is in good shape and regression-tested.
 - Phase 3 end-to-end latency is measurable in loopback smoke and device-backed baseline logs.
 - CI exists and is green for the Phase 0+1 and Phase 2 PRs.
@@ -164,7 +166,8 @@ slightly in the required before/after run, and remote CI remains pending.
 
 ## Phase 5: Production Hardening
 
-Status: Not started — split into independent tracks; each gets its own plan doc.
+Status: Track D implemented locally; long-duration acceptance pending. Tracks A/B/C/E
+not started. Phase 5 remains split into independent tracks; each gets its own plan doc.
 
 - Track A (security): per-packet authentication via session key derived at join, then
   payload encryption; server-side token nonce tracking; per-client rate limiting.
@@ -172,10 +175,48 @@ Status: Not started — split into independent tracks; each gets its own plan do
   dual-stack IPv4/IPv6 sockets.
 - Track C (operations): server metrics export (machine-readable), log rotation
   (`basic_file_sink` never rotates, `logger.h:147`), crash reporting.
-- Track D (testing): soak (multi-hour, churn + drift), load (room-scale relay benchmark),
-  impairment matrix (loss/reorder/burst × latency profiles) with defined budgets.
+- Track D (testing): implemented locally on branch `phase5-track-d-testing` from
+  `f75eff7`. Added a repeatable impairment matrix harness, room-scale relay load
+  benchmark, and real-client soak runner with log-budget assertions. CI-safe smokes
+  are registered in CTest; the required multi-hour real-client soak has not been run.
 - Track E (devices): real capability enumeration and input-channel selection in the JUCE
   backend (`juce_audio_backend.cpp:376-387`).
+
+Track D local validation snapshot (2026-07-03):
+
+- Release build command logged in `validation_logs/phase5-track-d/release-build.log`.
+- Full test command logged in `validation_logs/phase5-track-d/ctest-release.log`:
+  `100% tests passed, 0 tests failed out of 42` in `42.20 sec`.
+- Quick impairment matrix logged in
+  `validation_logs/phase5-track-d/impairment-quick/summary.json`; status `ok`.
+  Rows:
+  - `low/clean`: steady E2E `11.3205 ms <= 29 ms`, queue drift `0.0125`
+    packets, max queue `5`, max gap PLC run `0`.
+  - `low/reorder`: steady E2E `11.5112 ms <= 29 ms`, queue drift `-0.13125`
+    packets, max queue `5`, max gap PLC run `0`.
+  - `balanced/burst`: steady E2E `62.983 ms <= 70 ms`, queue drift `2.62229`
+    packets, max queue `6`, max gap PLC run `0`; burst loss produced `3`
+    empty PLC frames inside budget.
+- Quick relay load benchmark logged in
+  `validation_logs/phase5-track-d/load-quick/summary.json`; status `ok`.
+  Run shape: `8` clients, `4` senders, `3 s`, `480` frames. Sent `1200`
+  packets, expected `8400` forwards, received `8400`, delivery ratio `1.0`,
+  forward rate `2800 packets/s`, max receive gap `16.336 ms`.
+- Soak parser smoke logged in `validation_logs/phase5-track-d/soak-parser-smoke.log`.
+- Short real-client churn soak logged in
+  `validation_logs/phase5-track-d/soak-short/summary.json`; status `ok`.
+  Run shape: `20 s`, one stable client, one churn client, `8 s` churn interval.
+  Parsed `9` baseline snapshots and `4` participant snapshots with
+  `maxOverDeadline=0` and max absolute queue drift `0.92` packets.
+
+Track D acceptance still pending:
+
+```powershell
+node tools/phase5-track-d-soak.mjs --server-exe build/Release/server.exe --client-exe build/Release/client.exe --seconds 7200 --churn-interval-seconds 120 --stable-clients 1 --churn-clients 1 --max-queue-drift-packets 4 --out-dir validation_logs/phase5-track-d/soak-2h
+```
+
+Do not mark Track D fully Done or satisfy the production gate until that multi-hour
+soak passes and the remote CI run for the branch is green.
 
 ## Production Gate
 

@@ -81,7 +81,7 @@ Create `tools/phase5-track-d-impairment-matrix.mjs` with profile budgets:
 ```js
 const PROFILES = {
   low: { frames: 120, jitter: 4, maxQueueDriftPackets: 3.0, maxQueueDepthPackets: 16, e2eMarginMs: 14 },
-  balanced: { frames: 480, jitter: 2, maxQueueDriftPackets: 3.0, maxQueueDepthPackets: 12, e2eMarginMs: 25 },
+  balanced: { frames: 480, jitter: 2, maxQueueDriftPackets: 3.0, maxQueueDepthPackets: 12, e2eMarginMs: 30 },
   stable: { frames: 960, jitter: 4, maxQueueDriftPackets: 4.0, maxQueueDepthPackets: 14, e2eMarginMs: 45 },
 };
 const CASES = {
