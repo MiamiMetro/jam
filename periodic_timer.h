@@ -44,7 +44,11 @@ private:
             return;
         }
         callback_();
-        next_tick_ += interval_;        // Accumulate time to prevent drift
+        const auto now = std::chrono::steady_clock::now();
+        next_tick_ += interval_;
+        if (next_tick_ <= now) {
+            next_tick_ = now + interval_;
+        }
         timer_.expires_at(next_tick_);  // Use absolute time, not relative
         timer_.async_wait([this](std::error_code error_code) { on_timeout(error_code); });
     }

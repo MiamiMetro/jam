@@ -1646,19 +1646,29 @@ public:
     void reset_server_clock_and_ping_state() {
         server_clock_ready_.store(false, std::memory_order_release);
         server_clock_offset_ns_.store(0, std::memory_order_release);
-        have_ping_reply_sequence_.store(false, std::memory_order_release);
         ping_tx_sequence_.store(0, std::memory_order_release);
-        last_ping_reply_sequence_.store(0, std::memory_order_release);
-        ping_path_interval_received_.store(0, std::memory_order_relaxed);
-        ping_path_interval_missing_.store(0, std::memory_order_relaxed);
-        ping_path_total_received_.store(0, std::memory_order_relaxed);
-        ping_path_total_missing_.store(0, std::memory_order_relaxed);
-        ping_path_consecutive_missing_.store(0, std::memory_order_relaxed);
+        reset_ping_path_feedback(0);
         rtt_ms_.store(0.0, std::memory_order_relaxed);
         rtt_last_ns_.store(0, std::memory_order_relaxed);
         rtt_min_ns_.store(0, std::memory_order_relaxed);
         rtt_avg_ns_.store(0, std::memory_order_relaxed);
         rtt_max_ns_.store(0, std::memory_order_relaxed);
+    }
+
+    void reset_ping_path_feedback(uint32_t watch_start_sequence) {
+        have_ping_reply_sequence_.store(false, std::memory_order_release);
+        last_ping_reply_sequence_.store(0, std::memory_order_release);
+        ping_path_watch_start_sequence_.store(watch_start_sequence,
+                                             std::memory_order_release);
+        ping_path_interval_received_.store(0, std::memory_order_relaxed);
+        ping_path_interval_missing_.store(0, std::memory_order_relaxed);
+        ping_path_total_received_.store(0, std::memory_order_relaxed);
+        ping_path_total_missing_.store(0, std::memory_order_relaxed);
+        ping_path_consecutive_missing_.store(0, std::memory_order_relaxed);
+    }
+
+    void reset_ping_path_feedback_to_current_sequence() {
+        reset_ping_path_feedback(ping_tx_sequence_.load(std::memory_order_acquire));
     }
 
     void on_receive(const std::shared_ptr<ReceiveState>& state,
@@ -3565,6 +3575,28 @@ public:
                should_rebind_udp_path_after_severe_loss(received_replies, missing_replies);
     }
 
+    static bool ping_reply_is_within_watch_window(uint32_t reply_sequence,
+                                                  uint32_t watch_start_sequence) {
+        return reply_sequence >= watch_start_sequence;
+    }
+
+    static uint32_t ping_path_missing_replies_for_timeout(
+        uint32_t sent_sequence, uint32_t watch_start_sequence, bool have_reply_sequence,
+        uint32_t last_reply_sequence) {
+        if (sent_sequence < watch_start_sequence) {
+            return 0;
+        }
+
+        uint32_t first_missing_sequence = watch_start_sequence;
+        if (have_reply_sequence && last_reply_sequence >= watch_start_sequence) {
+            first_missing_sequence = last_reply_sequence + 1U;
+        }
+        if (sent_sequence < first_missing_sequence) {
+            return 0;
+        }
+        return sent_sequence - first_missing_sequence + 1U;
+    }
+
     static uint16_t opus_packet_frames_after_audio_path_feedback(
         uint16_t current_frame_count, uint32_t received_packets, uint32_t sequence_gaps) {
         const uint64_t observed_packets =
@@ -3674,6 +3706,19 @@ public:
             }
             return true;
         };
+        auto expect_missing = [&](uint32_t sent, uint32_t watch_start, bool have_reply,
+                                  uint32_t last_reply, uint32_t expected,
+                                  const char* label) {
+            const uint32_t actual = ping_path_missing_replies_for_timeout(
+                sent, watch_start, have_reply, last_reply);
+            if (actual != expected) {
+                failure = std::string(label) + ": expected missing " +
+                          std::to_string(expected) + ", got " +
+                          std::to_string(actual);
+                return false;
+            }
+            return true;
+        };
 
         return expect(opus_network_clock::BALANCED_FRAME_COUNT, 8, 0, 30.0,
                       opus_network_clock::BALANCED_FRAME_COUNT, "clean default") &&
@@ -3690,7 +3735,16 @@ public:
                !should_rebind_udp_path_after_ping_feedback(5, 3, 20.0) &&
                should_rebind_udp_path_after_ping_feedback(5, 3, 400.0) &&
                should_rebind_udp_path_after_feedback(
-                   opus_network_clock::STABLE_FRAME_COUNT, 1, 99);
+                   opus_network_clock::STABLE_FRAME_COUNT, 1, 99) &&
+               !ping_reply_is_within_watch_window(34, 35) &&
+               ping_reply_is_within_watch_window(35, 35) &&
+               expect_missing(34, 35, false, 0, 0, "pre-watch send ignored") &&
+               expect_missing(35, 35, false, 0, 1, "first post-join send") &&
+               expect_missing(43, 35, false, 0, 9, "pre-threshold post-join sends") &&
+               expect_missing(44, 35, false, 0, 10, "threshold post-join sends") &&
+               expect_missing(44, 35, true, 40, 4, "missing after last reply") &&
+               expect_missing(44, 35, true, 50, 0, "reply ahead of send") &&
+               expect_missing(44, 35, true, 20, 10, "stale reply before watch");
     }
 
     static bool run_opus_redundancy_policy_smoke(std::string& failure) {
@@ -4192,6 +4246,7 @@ public:
             client.ping_path_total_received_.store(7, std::memory_order_relaxed);
             client.ping_path_total_missing_.store(3, std::memory_order_relaxed);
             client.ping_path_consecutive_missing_.store(2, std::memory_order_relaxed);
+            client.ping_path_watch_start_sequence_.store(44, std::memory_order_release);
             if (!client.can_send_capture_timestamps()) {
                 failure = "synced timestamp-capable client should allow capture timestamps";
                 client.stop_connection();
@@ -4209,6 +4264,7 @@ public:
                 client.ping_path_total_received_.load(std::memory_order_relaxed) != 0 ||
                 client.ping_path_total_missing_.load(std::memory_order_relaxed) != 0 ||
                 client.ping_path_consecutive_missing_.load(std::memory_order_relaxed) != 0 ||
+                client.ping_path_watch_start_sequence_.load(std::memory_order_acquire) != 0 ||
                 client.rtt_ms_.load(std::memory_order_relaxed) != 0.0 ||
                 client.rtt_last_ns_.load(std::memory_order_relaxed) != 0 ||
                 client.rtt_min_ns_.load(std::memory_order_relaxed) != 0 ||
@@ -4757,6 +4813,8 @@ private:
                 const auto display_name = fixed_string(info.display_name);
                 if (!join_state_.is_join_confirmed()) {
                     join_state_.mark_join_ack(info.participant_id);
+                    reset_ping_path_feedback_to_current_sequence();
+                    server_audio_replay_window_.reset();
                     Log::info("JOIN confirmed by participant metadata (participant ID: {})",
                               info.participant_id);
                 }
@@ -4770,6 +4828,7 @@ private:
                 break;
             }
             case CtrlHdr::Cmd::JOIN_ACK: {
+                const bool was_confirmed = join_state_.is_join_confirmed();
                 uint32_t server_capabilities = 0;
                 if (bytes >= sizeof(JoinAckHdr)) {
                     JoinAckHdr ack{};
@@ -4777,6 +4836,10 @@ private:
                     server_capabilities = ack.capabilities;
                 }
                 join_state_.mark_join_ack(chdr.participant_id, server_capabilities);
+                if (!was_confirmed) {
+                    reset_ping_path_feedback_to_current_sequence();
+                    server_audio_replay_window_.reset();
+                }
                 Log::info("JOIN acknowledged by server (participant ID: {}, capabilities=0x{:08x})",
                           chdr.participant_id, server_capabilities);
                 break;
@@ -4906,16 +4969,11 @@ private:
             return;
         }
 
-        uint32_t missing_replies = 0;
-        if (have_ping_reply_sequence_.load(std::memory_order_acquire)) {
-            const uint32_t last_reply =
-                last_ping_reply_sequence_.load(std::memory_order_acquire);
-            if (sent_sequence > last_reply) {
-                missing_replies = sent_sequence - last_reply;
-            }
-        } else if (sent_sequence >= PING_PATH_TIMEOUT_PROMOTE_REPLIES) {
-            missing_replies = sent_sequence;
-        }
+        const uint32_t missing_replies = ping_path_missing_replies_for_timeout(
+            sent_sequence,
+            ping_path_watch_start_sequence_.load(std::memory_order_acquire),
+            have_ping_reply_sequence_.load(std::memory_order_acquire),
+            last_ping_reply_sequence_.load(std::memory_order_acquire));
 
         ping_path_consecutive_missing_.store(missing_replies,
                                              std::memory_order_relaxed);
@@ -4931,6 +4989,12 @@ private:
     }
 
     void observe_ping_path_feedback(uint32_t reply_sequence, double rtt_ms) {
+        if (!ping_reply_is_within_watch_window(
+                reply_sequence,
+                ping_path_watch_start_sequence_.load(std::memory_order_acquire))) {
+            return;
+        }
+
         uint32_t missing_replies = 0;
         if (have_ping_reply_sequence_.exchange(true, std::memory_order_acq_rel)) {
             const uint32_t previous =
@@ -6345,6 +6409,7 @@ private:
     std::atomic<uint32_t> ping_tx_sequence_{0};
     std::atomic<uint32_t> last_ping_reply_sequence_{0};
     std::atomic<bool>     have_ping_reply_sequence_{false};
+    std::atomic<uint32_t> ping_path_watch_start_sequence_{0};
     std::atomic<uint32_t> ping_path_interval_received_{0};
     std::atomic<uint32_t> ping_path_interval_missing_{0};
     std::atomic<uint32_t> ping_path_total_received_{0};
