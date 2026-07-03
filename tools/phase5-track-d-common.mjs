@@ -136,6 +136,24 @@ export function runLogged(name, command, args, logFile = "") {
   });
 }
 
+export function waitForExit(child) {
+  return new Promise((resolve) => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      resolve({
+        code: child?.exitCode ?? (child?.signalCode ? 1 : 0),
+        signal: child?.signalCode ?? null,
+      });
+      return;
+    }
+    child.once("exit", (code, signal) => {
+      resolve({ code: code ?? (signal ? 1 : 0), signal });
+    });
+    child.once("error", (error) => {
+      resolve({ code: 1, signal: null, error });
+    });
+  });
+}
+
 export async function stopChild(child) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return;

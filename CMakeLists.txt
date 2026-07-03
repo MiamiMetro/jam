@@ -182,6 +182,10 @@ if(JAM_BUILD_TESTS)
                          --frames 480
                          --min-delivery-ratio 0.95
                          --out-dir ${CMAKE_BINARY_DIR}/phase5-track-d/load-smoke)
+        add_test(NAME phase5_track_d_soak_parser_smoke
+                 COMMAND ${NODE_EXECUTABLE}
+                         ${CMAKE_SOURCE_DIR}/tools/phase5-track-d-soak.mjs
+                         --parser-smoke)
     endif()
     if(TARGET client)
         add_test(NAME client_udp_endpoint_guard_smoke
