@@ -12,7 +12,7 @@
 #include <spdlog/async_logger.h>
 #include <spdlog/common.h>
 #include <spdlog/logger.h>
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
@@ -23,6 +23,8 @@ public:
     static constexpr double    BYTES_PER_KB_DBL  = 1024.0;
     static constexpr size_t    THREAD_POOL_SIZE  = 8192;
     static constexpr int       FLUSH_INTERVAL_MS = 3000;
+    static constexpr size_t    DEFAULT_ROTATING_LOG_MAX_BYTES = 10ULL * 1024ULL * 1024ULL;
+    static constexpr size_t    DEFAULT_ROTATING_LOG_MAX_FILES = 5;
 
     // Non-copyable singleton
     Logger(const Logger&)            = delete;
@@ -37,7 +39,9 @@ public:
     // Initialize logger
     void init(bool use_stdout = true, bool use_stderr = true, bool use_file = false,
               const std::string&        file_path = "logs/app.log",
-              spdlog::level::level_enum lvl       = spdlog::level::debug);
+              spdlog::level::level_enum lvl       = spdlog::level::debug,
+              size_t max_file_bytes = DEFAULT_ROTATING_LOG_MAX_BYTES,
+              size_t max_files = DEFAULT_ROTATING_LOG_MAX_FILES);
 
     // Enable / disable sinks dynamically (thread-safe)
     void enable_stdout(bool enable);
@@ -86,22 +90,31 @@ private:
 
     std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> stdout_sink_;
     std::shared_ptr<spdlog::sinks::stderr_color_sink_mt> stderr_sink_;
-    std::shared_ptr<spdlog::sinks::basic_file_sink_mt>   file_sink_;
+    std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> file_sink_;
 
     bool stdout_enabled_ = true;
     bool stderr_enabled_ = true;
     bool file_enabled_   = false;
+    std::string file_path_;
+    size_t file_max_bytes_ = DEFAULT_ROTATING_LOG_MAX_BYTES;
+    size_t file_max_files_ = DEFAULT_ROTATING_LOG_MAX_FILES;
 
     spdlog::level::level_enum level_ = spdlog::level::debug;
 };
 
 void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::string& file_path,
-                  spdlog::level::level_enum lvl) {
+                  spdlog::level::level_enum lvl, size_t max_file_bytes,
+                  size_t max_files) {
     std::scoped_lock lock(mutex_);
     stdout_enabled_ = use_stdout;
     stderr_enabled_ = use_stderr;
     file_enabled_   = use_file;
     level_          = lvl;
+
+    const size_t effective_max_file_bytes =
+        max_file_bytes == 0 ? DEFAULT_ROTATING_LOG_MAX_BYTES : max_file_bytes;
+    const size_t effective_max_files =
+        max_files == 0 ? DEFAULT_ROTATING_LOG_MAX_FILES : max_files;
 
     // Prepare sinks
     if (use_stdout && !stdout_sink_) {
@@ -116,7 +129,13 @@ void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
         stderr_sink_->set_level(spdlog::level::warn);
     }
 
-    if (use_file && !file_sink_) {
+    const bool rebuild_file_sink =
+        use_file &&
+        (!file_sink_ || file_path_ != file_path ||
+         file_max_bytes_ != effective_max_file_bytes ||
+         file_max_files_ != effective_max_files);
+
+    if (rebuild_file_sink) {
         try {
             std::filesystem::path path(file_path);
             if (!path.parent_path().empty()) {
@@ -144,11 +163,17 @@ void Logger::init(bool use_stdout, bool use_stderr, bool use_file, const std::st
                 fprintf(stdout, "Logger: Creating new log file");
             }
 
-            file_sink_ = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, true);
+            file_sink_ = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                file_path, effective_max_file_bytes, effective_max_files, false);
             file_sink_->set_pattern("[%Y-%m-%d %T.%e] [%^%l%$] %v");
+            file_path_      = file_path;
+            file_max_bytes_ = effective_max_file_bytes;
+            file_max_files_ = effective_max_files;
         } catch (const std::exception& e) {
             fprintf(stderr, "Logger: failed to create log file (%s): %s\n", file_path.c_str(),
                     e.what());
+            file_sink_.reset();
+            file_enabled_ = false;
         }
     }
 

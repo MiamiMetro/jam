@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -25,6 +27,7 @@
 
 #include "audio_packet.h"
 #include "client_manager.h"
+#include "crash_reporter.h"
 #include "endpoint_hash.h"
 #include "logger.h"
 #include "message_validator.h"
@@ -35,6 +38,7 @@
 #include "sequence_tracker.h"
 #include "server_rate_limiter.h"
 #include "server_config.h"
+#include "server_metrics.h"
 #include "session_crypto.h"
 #include "udp_port.h"
 #include "udp_socket_config.h"
@@ -75,6 +79,11 @@ struct ServerOptions {
     std::string server_id = "local-dev";
     std::string join_secret;
     std::string log_file_path;
+    size_t      log_max_bytes = Logger::DEFAULT_ROTATING_LOG_MAX_BYTES;
+    size_t      log_max_files = Logger::DEFAULT_ROTATING_LOG_MAX_FILES;
+    std::string metrics_jsonl_path;
+    bool        crash_reports_enabled = true;
+    std::string crash_report_dir = "crash_reports/server";
 };
 
 template <size_t N>
@@ -88,6 +97,8 @@ public:
     Server(asio::io_context& io_context, const ServerOptions& options)
         : options_(options),
           socket_(io_context),
+          metrics_exporter_(options.metrics_jsonl_path),
+          started_at_(std::chrono::steady_clock::now()),
           alive_check_timer_(io_context, server_config::ALIVE_CHECK_INTERVAL,
                              [this]() { alive_check_timer_callback(); }) {
         std::error_code socket_error;
@@ -128,6 +139,21 @@ public:
         std::error_code ec;
         const auto      local = socket_.local_endpoint(ec);
         return !ec && local.protocol() == udp::v6();
+    }
+
+    bool export_metrics_snapshot() {
+        if (!metrics_exporter_.enabled()) {
+            return true;
+        }
+
+        std::string error;
+        if (metrics_exporter_.write(build_metrics_snapshot(), &error)) {
+            return true;
+        }
+
+        Log::warn("Failed to write server metrics JSONL '{}': {}",
+                  metrics_exporter_.path().string(), error);
+        return false;
     }
 
     void do_receive() {
@@ -511,6 +537,7 @@ private:
         }
 
         const uint64_t drop_count = ++rate_limited_audio_drops_total_;
+        ++rate_limited_audio_drops_interval_;
         if (drop_count == 1 || drop_count % 100 == 0) {
             Log::warn("Rate-limited audio from {}:{} sample_rate={} frame_count={} drops={}",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port(),
@@ -671,7 +698,7 @@ private:
 
         std::string reason;
         if (!audio_packet::validate_redundant_audio_packet_bytes(packet_data, bytes, &reason)) {
-            ++invalid_audio_drops_since_log_;
+            record_invalid_audio_drop();
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
                 Log::warn("Dropping invalid redundant audio from {}:{}: reason={} bytes={}",
@@ -690,7 +717,7 @@ private:
                                                                         packet_data + bytes);
         if (!audio_packet::embed_sender_id_in_redundant_audio_packet(
                 packet_copy->data(), packet_copy->size(), sender_id, &reason)) {
-            ++invalid_audio_drops_since_log_;
+            record_invalid_audio_drop();
             Log::warn("Dropping redundant audio that could not be stamped: reason={}", reason);
             return;
         }
@@ -715,7 +742,7 @@ private:
         std::string reason;
         if (!audio_packet::validate_audio_packet_bytes(packet_data, bytes, &reason)) {
             const auto parsed = audio_packet::parse_audio_header(packet_data, bytes);
-            ++invalid_audio_drops_since_log_;
+            record_invalid_audio_drop();
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
                 Log::warn(
@@ -770,6 +797,8 @@ private:
         cleanup_unknown_endpoints(now);
 
         ++unknown_audio_drops_since_log_;
+        ++unknown_audio_drops_interval_;
+        ++unknown_audio_drops_total_;
 
         auto it = unknown_endpoints_.find(endpoint);
         if (it == unknown_endpoints_.end()) {
@@ -821,6 +850,12 @@ private:
         }
     }
 
+    void record_invalid_audio_drop() {
+        ++invalid_audio_drops_since_log_;
+        ++invalid_audio_drops_interval_;
+        ++invalid_audio_drops_total_;
+    }
+
     void alive_check_timer_callback() {
         auto now = std::chrono::steady_clock::now();
         auto timed_out_ids =
@@ -831,7 +866,9 @@ private:
             broadcast_participant_leave(timed_out_id);
         }
 
+        export_metrics_snapshot();
         log_audio_forward_summary();
+        reset_metrics_intervals();
     }
 
     void broadcast_participant_leave(uint32_t participant_id) {
@@ -1217,6 +1254,128 @@ private:
         ++stats.reply_queued_interval;
     }
 
+    static server_metrics::TrafficCounters audio_counters_from_ingress(
+        const AudioIngressStats& stats) {
+        server_metrics::TrafficCounters counters;
+        counters.interval = stats.received_interval;
+        counters.total = stats.received_total;
+        counters.sequence_gaps_interval = stats.sequence_gaps_interval;
+        counters.sequence_gaps_total = stats.sequence_gaps_total;
+        counters.sequence_gap_recoveries_interval =
+            stats.sequence_gap_recoveries_interval;
+        counters.sequence_gap_recoveries_total = stats.sequence_gap_recoveries_total;
+        counters.sequence_unresolved_gaps = stats.sequence_unresolved_gaps;
+        counters.sequence_late_or_reordered_interval =
+            stats.sequence_late_or_reordered_interval;
+        counters.sequence_late_or_reordered_total =
+            stats.sequence_late_or_reordered_total;
+        return counters;
+    }
+
+    static server_metrics::TrafficCounters audio_counters_from_forward(
+        const AudioForwardStats& stats) {
+        server_metrics::TrafficCounters counters;
+        counters.interval = stats.forwarded_interval;
+        counters.total = stats.forwarded_total;
+        counters.sequence_gaps_interval = stats.sequence_gaps_interval;
+        counters.sequence_gaps_total = stats.sequence_gaps_total;
+        counters.sequence_gap_recoveries_interval =
+            stats.sequence_gap_recoveries_interval;
+        counters.sequence_gap_recoveries_total = stats.sequence_gap_recoveries_total;
+        counters.sequence_unresolved_gaps = stats.sequence_unresolved_gaps;
+        counters.sequence_late_or_reordered_interval =
+            stats.sequence_late_or_reordered_interval;
+        counters.sequence_late_or_reordered_total =
+            stats.sequence_late_or_reordered_total;
+        return counters;
+    }
+
+    static server_metrics::TrafficCounters ping_counters_from_stats(
+        const PingStats& stats) {
+        server_metrics::TrafficCounters counters;
+        counters.interval = stats.received_interval;
+        counters.total = stats.received_total;
+        counters.sequence_gaps_interval = stats.sequence_gaps_interval;
+        counters.sequence_gaps_total = stats.sequence_gaps_total;
+        counters.sequence_gap_recoveries_interval =
+            stats.sequence_gap_recoveries_interval;
+        counters.sequence_gap_recoveries_total = stats.sequence_gap_recoveries_total;
+        counters.sequence_unresolved_gaps = stats.sequence_unresolved_gaps;
+        counters.sequence_late_or_reordered_interval =
+            stats.sequence_late_or_reordered_interval;
+        counters.sequence_late_or_reordered_total =
+            stats.sequence_late_or_reordered_total;
+        return counters;
+    }
+
+    static std::string metric_endpoint(const udp::endpoint& endpoint) {
+        const auto address = udp_network::format_address_for_display(endpoint.address());
+        if (endpoint.address().is_v6() && !endpoint.address().to_v6().is_v4_mapped()) {
+            return "[" + address + "]:" + std::to_string(endpoint.port());
+        }
+        return address + ":" + std::to_string(endpoint.port());
+    }
+
+    server_metrics::Snapshot build_metrics_snapshot() const {
+        const auto now = std::chrono::steady_clock::now();
+        server_metrics::Snapshot snapshot;
+        snapshot.server_id = options_.server_id;
+        snapshot.timestamp_unix_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        snapshot.uptime_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - started_at_)
+                .count();
+        snapshot.connected_clients = client_manager_.count();
+        snapshot.unknown_endpoint_count = unknown_endpoints_.size();
+        snapshot.token_nonce_count = used_token_nonces_.size();
+        snapshot.drops.unknown_audio_interval = unknown_audio_drops_interval_;
+        snapshot.drops.unknown_audio_total = unknown_audio_drops_total_;
+        snapshot.drops.invalid_audio_interval = invalid_audio_drops_interval_;
+        snapshot.drops.invalid_audio_total = invalid_audio_drops_total_;
+        snapshot.drops.rate_limited_audio_interval = rate_limited_audio_drops_interval_;
+        snapshot.drops.rate_limited_audio_total = rate_limited_audio_drops_total_;
+
+        snapshot.ingress.reserve(audio_ingress_stats_.size());
+        for (const auto& [sender_id, stats]: audio_ingress_stats_) {
+            snapshot.ingress.push_back(server_metrics::IngressMetric{
+                sender_id,
+                metric_endpoint(stats.endpoint),
+                audio_counters_from_ingress(stats),
+                stats.last_frame_count,
+            });
+        }
+
+        snapshot.forwards.reserve(audio_forward_stats_.size());
+        for (const auto& [key, stats]: audio_forward_stats_) {
+            snapshot.forwards.push_back(server_metrics::ForwardMetric{
+                static_cast<uint32_t>(key >> 32),
+                static_cast<uint32_t>(key & 0xFFFFFFFFU),
+                audio_counters_from_forward(stats),
+            });
+        }
+
+        snapshot.pings.reserve(ping_stats_.size());
+        for (const auto& [client_id, stats]: ping_stats_) {
+            snapshot.pings.push_back(server_metrics::PingMetric{
+                client_id,
+                metric_endpoint(stats.endpoint),
+                stats.reply_queued_interval,
+                stats.reply_queued_total,
+                ping_counters_from_stats(stats),
+            });
+        }
+
+        return snapshot;
+    }
+
+    void reset_metrics_intervals() {
+        unknown_audio_drops_interval_ = 0;
+        invalid_audio_drops_interval_ = 0;
+        rate_limited_audio_drops_interval_ = 0;
+    }
+
     void log_audio_forward_summary() {
         if (invalid_audio_drops_since_log_ > 0) {
             Log::warn("Dropped {} invalid/incomplete audio packets in the last interval",
@@ -1339,6 +1498,8 @@ private:
 
     ServerOptions options_;
     udp::socket   socket_;
+    server_metrics::JsonlExporter metrics_exporter_;
+    std::chrono::steady_clock::time_point started_at_;
 
     ClientManager client_manager_;
     std::unordered_map<udp::endpoint, UnknownEndpointInfo, endpoint_hash> unknown_endpoints_;
@@ -1349,7 +1510,12 @@ private:
     server_rate_limiter::ProtocolRateLimiter rate_limiter_;
     udp_network::UdpSocketQos socket_qos_;
     uint64_t unknown_audio_drops_since_log_ = 0;
+    uint64_t unknown_audio_drops_interval_ = 0;
+    uint64_t unknown_audio_drops_total_ = 0;
     uint64_t invalid_audio_drops_since_log_ = 0;
+    uint64_t invalid_audio_drops_interval_ = 0;
+    uint64_t invalid_audio_drops_total_ = 0;
+    uint64_t rate_limited_audio_drops_interval_ = 0;
     uint64_t rate_limited_audio_drops_total_ = 0;
     uint32_t metronome_sequence_ = 0;
     std::chrono::steady_clock::time_point last_unknown_audio_summary_ =
@@ -1869,6 +2035,87 @@ int run_security_smoke() {
     }
 }
 
+int run_metrics_export_smoke() {
+    asio::io_context server_io;
+    const auto dir =
+        std::filesystem::temp_directory_path() /
+        ("jam-server-metrics-smoke-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    ServerOptions options;
+    options.port = 0;
+    options.server_id = "metrics-smoke";
+    options.allow_insecure_dev_joins = true;
+    options.metrics_jsonl_path = (dir / "metrics.jsonl").string();
+
+    std::filesystem::remove_all(dir);
+    Server server(server_io, options);
+    require_smoke(server.export_metrics_snapshot(), "metrics export should succeed");
+
+    {
+        std::ifstream in(options.metrics_jsonl_path, std::ios::binary);
+        std::string body((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        require_smoke(body.find("\"schema\":\"jam_server_metrics_v1\"") != std::string::npos,
+                      "metrics smoke missing schema");
+        require_smoke(body.find("\"server_id\":\"metrics-smoke\"") != std::string::npos,
+                      "metrics smoke missing server id");
+        require_smoke(body.find("\"connected_clients\":0") != std::string::npos,
+                      "metrics smoke missing client count");
+    }
+
+    std::filesystem::remove_all(dir);
+    std::cout << "server metrics export smoke passed\n";
+    return 0;
+}
+
+int run_crash_report_smoke() {
+    const auto dir =
+        std::filesystem::temp_directory_path() /
+        ("jam-server-crash-smoke-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    crash_reporter::Options options;
+    options.report_dir = dir;
+    options.process_name = "server";
+    options.platform = runtime_platform_name();
+    options.arch = runtime_arch_name();
+
+    std::filesystem::remove_all(dir);
+    const auto report = crash_reporter::write_report(options, "server crash smoke", nullptr);
+    require_smoke(std::filesystem::exists(report), "crash smoke report missing");
+
+    {
+        std::ifstream in(report, std::ios::binary);
+        std::string body((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        require_smoke(body.find("\"schema\":\"jam_crash_report_v1\"") != std::string::npos,
+                      "crash smoke missing schema");
+        require_smoke(body.find("\"process\":\"server\"") != std::string::npos,
+                      "crash smoke missing process");
+        require_smoke(body.find("\"reason\":\"server crash smoke\"") != std::string::npos,
+                      "crash smoke missing reason");
+    }
+
+    std::filesystem::remove_all(dir);
+    std::cout << "server crash report smoke passed\n";
+    return 0;
+}
+
+size_t parse_positive_size_arg(const std::string& value, const char* option_name) {
+    try {
+        size_t consumed = 0;
+        const auto parsed = std::stoull(value, &consumed, 10);
+        if (consumed != value.size() || parsed == 0 ||
+            parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+            throw std::invalid_argument("out of range");
+        }
+        return static_cast<size_t>(parsed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string("Invalid ") + option_name + ": " + value);
+    }
+}
+
 ServerOptions parse_server_options(int argc, char** argv) {
     ServerOptions options;
     for (int i = 1; i < argc; ++i) {
@@ -1881,6 +2128,16 @@ ServerOptions parse_server_options(int argc, char** argv) {
             options.join_secret = argv[++i];
         } else if (arg == "--log-file" && i + 1 < argc) {
             options.log_file_path = argv[++i];
+        } else if (arg == "--log-max-bytes" && i + 1 < argc) {
+            options.log_max_bytes = parse_positive_size_arg(argv[++i], "--log-max-bytes");
+        } else if (arg == "--log-max-files" && i + 1 < argc) {
+            options.log_max_files = parse_positive_size_arg(argv[++i], "--log-max-files");
+        } else if (arg == "--metrics-jsonl" && i + 1 < argc) {
+            options.metrics_jsonl_path = argv[++i];
+        } else if (arg == "--crash-report-dir" && i + 1 < argc) {
+            options.crash_report_dir = argv[++i];
+        } else if (arg == "--disable-crash-reports") {
+            options.crash_reports_enabled = false;
         } else if (arg == "--allow-insecure-dev-joins") {
             options.allow_insecure_dev_joins = true;
         }
@@ -1904,7 +2161,7 @@ int main(int argc, char** argv) {
 
         auto& log = Logger::instance();
         log.init(true, false, !options.log_file_path.empty(), options.log_file_path,
-                 spdlog::level::info);
+                 spdlog::level::info, options.log_max_bytes, options.log_max_files);
 
         if (has_arg(argc, argv, "--redundancy-relay-smoke")) {
             return run_redundancy_relay_smoke();
@@ -1918,12 +2175,33 @@ int main(int argc, char** argv) {
         if (has_arg(argc, argv, "--security-smoke")) {
             return run_security_smoke();
         }
+        if (has_arg(argc, argv, "--metrics-export-smoke")) {
+            return run_metrics_export_smoke();
+        }
+        if (has_arg(argc, argv, "--crash-report-smoke")) {
+            return run_crash_report_smoke();
+        }
+
+        if (options.crash_reports_enabled) {
+            crash_reporter::Options crash_options;
+            crash_options.report_dir = options.crash_report_dir;
+            crash_options.process_name = "server";
+            crash_options.platform = runtime_platform_name();
+            crash_options.arch = runtime_arch_name();
+            crash_reporter::install(crash_options);
+            Log::info("Crash reports enabled: {}", options.crash_report_dir);
+        }
 
         Log::info("Starting SFU server on [::]:{} (dual-stack preferred)", options.port);
         Log::info("Runtime: role=server platform={} arch={}", runtime_platform_name(),
                   runtime_arch_name());
         if (!options.log_file_path.empty()) {
             Log::info("Logging to {}", options.log_file_path);
+            Log::info("Log rotation: max_bytes={} max_files={}", options.log_max_bytes,
+                      options.log_max_files);
+        }
+        if (!options.metrics_jsonl_path.empty()) {
+            Log::info("Server metrics JSONL export: {}", options.metrics_jsonl_path);
         }
         Log::info("Forwarding audio packets between clients");
         if (options.allow_insecure_dev_joins) {

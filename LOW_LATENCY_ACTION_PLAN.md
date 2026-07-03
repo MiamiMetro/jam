@@ -11,6 +11,7 @@ Detailed plans:
 - Phase 2: `docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md` (written)
 - Phase 5 Track A: `docs/superpowers/plans/2026-07-03-phase5-track-a-security.md` (written)
 - Phase 5 Track B: `docs/superpowers/plans/2026-07-03-phase5-track-b-network.md` (written)
+- Phase 5 Track C: `docs/superpowers/plans/2026-07-03-phase5-track-c-operations.md` (written)
 - Phase 5 Track D: `docs/superpowers/plans/2026-07-03-phase5-track-d-testing.md` (written)
 - Other Phase 5 tracks: written when selected; do not batch independent tracks together.
 - Ready-to-paste prompts for the sessions that finish each phase:
@@ -18,8 +19,8 @@ Detailed plans:
 
 ## Current State
 
-- Release build passes; full test suite passes 47/47 locally for Phase 5 Track B
-  network (verified 2026-07-03).
+- Release build passes; full test suite passes 52/52 locally for Phase 5 Track C
+  operations (verified 2026-07-03).
 - Receive-side jitter/playout policy is in good shape and regression-tested.
 - Phase 3 end-to-end latency is measurable in loopback smoke and device-backed baseline logs.
 - CI exists and is green for the Phase 0+1 and Phase 2 PRs.
@@ -176,8 +177,9 @@ rather than claiming a universal p99 improvement.
 
 Status: Track A Done (2026-07-03, Release build + full `ctest` 45/45 passed
 locally, signed security smokes passed), Track B Done (2026-07-03, Release
-build + full `ctest` 47/47 passed locally), and Track D Done (2026-07-03, 2h
-real-client churn soak passed and CI green on PR #14). Tracks C/E not started.
+build + full `ctest` 47/47 passed locally), Track C Done (2026-07-03, Release
+build + full `ctest` 52/52 passed locally), and Track D Done (2026-07-03, 2h
+real-client churn soak passed and CI green on PR #14). Track E not started.
 Phase 5 remains split into independent tracks; each gets its own plan doc.
 
 - Track A (security): Done on branch `phase5-track-a-security`. Signed JOINs
@@ -195,8 +197,15 @@ Phase 5 remains split into independent tracks; each gets its own plan doc.
   when needed, and outbound UDP flows request EF QoS via qWAVE on Windows or
   `IP_TOS`/`IPV6_TCLASS` elsewhere. qWAVE flow failures are cached per
   endpoint so unsupported paths warn once instead of retrying at packet rate.
-- Track C (operations): server metrics export (machine-readable), log rotation
-  (`basic_file_sink` never rotates, `logger.h:147`), crash reporting.
+- Track C (operations): Done on branch `phase5-track-c-operations`. The server
+  can export machine-readable JSONL metrics snapshots with
+  `--metrics-jsonl <path>`, including connected-client counts, drop counters,
+  and the existing ingress/forward/ping sequence diagnostics. File logging now
+  uses spdlog rotating sinks with defaults of `10 MiB` and `5` retained files,
+  configurable via `--log-max-bytes` and `--log-max-files`; `basic_file_sink`
+  is gone from `logger.h`. Normal server startup installs local crash reporting
+  to `crash_reports/server` by default, with Windows minidumps through
+  `DbgHelp` for unhandled exceptions and JSON metadata for explicit reports.
 - Track D (testing): Done on branch `phase5-track-d-testing` from `f75eff7`,
   merged as PR #14. Added a repeatable impairment matrix harness, room-scale
   relay load benchmark, and real-client soak runner with log-budget assertions.
@@ -282,6 +291,22 @@ Track B local validation snapshot (2026-07-03):
   `ctest --test-dir build -C Release --output-on-failure`; passed `47/47` in
   `38.44 sec`.
 
+Track C local validation snapshot (2026-07-03):
+
+- Release build command: `cmake --build build --config Release`; passed.
+- Targeted operations smoke command:
+  `ctest --test-dir build -C Release -R "server_metrics_self_test|server_metrics_export_smoke|logger_self_test|crash_reporter_self_test|server_crash_report_smoke" --output-on-failure`;
+  passed `5/5`.
+- Full test command:
+  `ctest --test-dir build -C Release --output-on-failure`; passed `52/52` in
+  `38.72 sec`.
+- Structural check: `rg -n "basic_file_sink" logger.h` returned no matches.
+- Server metrics export is enabled with `--metrics-jsonl <path>` and writes
+  JSONL snapshots using schema `jam_server_metrics_v1`.
+- Server crash reporting writes JSON metadata using schema
+  `jam_crash_report_v1`; Windows unhandled exceptions also attempt `.dmp`
+  minidumps via `DbgHelp`.
+
 ## Production Gate
 
 Do not call the app production-ready until all of these are true:
@@ -292,7 +317,7 @@ Do not call the app production-ready until all of these are true:
   protection, and joined-client rate limiting implemented (Track A).
 - Device latency warnings or adaptation exist (audit "granted vs requested" finding).
 - Soak/load/impairment tests pass against defined budgets (Track D).
-- Server metrics and log rotation exist (Track C).
+- Server metrics, log rotation, and crash reporting exist (Track C).
 
 ## Execution Rules
 
