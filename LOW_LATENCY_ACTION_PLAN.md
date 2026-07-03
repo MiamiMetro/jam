@@ -333,6 +333,25 @@ Track C local validation snapshot (2026-07-03):
   `jam_crash_report_v1`; Windows unhandled exceptions also attempt `.dmp`
   minidumps via `DbgHelp`.
 
+## Deferred Follow-ups
+
+- **Swap the session crypto primitive to libsodium ChaCha20-Poly1305** (noted 2026-07-03).
+  Track A's `session_crypto.h` uses a hand-rolled HMAC-SHA256 keystream + HMAC tag over
+  picosha2. It is functionally sound (encrypt-then-MAC, constant-time compare, nonce
+  replay window) and its latency cost is unmeasurable at jam scale — signed-probe steady
+  E2E max `11.217 ms` vs `11.53–11.56 ms` unsigned baselines — so this is NOT urgent.
+  Swap it when either trigger fires:
+  - Rooms grow beyond ~8 participants: the server decrypts + re-encrypts per recipient,
+    and the picosha2-based keystream is roughly 10–100× slower than ChaCha20-Poly1305,
+    making the relay the first throughput ceiling.
+  - The project wants audited rather than home-grown crypto before wider hosting.
+  Scope: replace the keystream/tag internals of `seal_audio_packet` / `open_audio_packet`
+  in `session_crypto.h` (and key derivation if desired) with libsodium
+  `crypto_aead_chacha20poly1305_ietf`; the wire format changes, so bump the secure-audio
+  capability/version so old clients fail loudly at JOIN. Keep `session_crypto_self_test`
+  and `server --security-smoke` green; rerun the signed latency probe to confirm the
+  latency claim still holds. Effort: Small (one header + one FetchContent dependency).
+
 ## Production Gate
 
 Do not call the app production-ready until all of these are true:
