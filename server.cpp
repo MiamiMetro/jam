@@ -37,6 +37,7 @@
 #include "server_config.h"
 #include "session_crypto.h"
 #include "udp_port.h"
+#include "udp_socket_config.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -86,17 +87,29 @@ class Server {
 public:
     Server(asio::io_context& io_context, const ServerOptions& options)
         : options_(options),
-          socket_(io_context, udp::endpoint(udp::v4(), options.port)),
+          socket_(io_context),
           alive_check_timer_(io_context, server_config::ALIVE_CHECK_INTERVAL,
                              [this]() { alive_check_timer_callback(); }) {
+        std::error_code socket_error;
+        const auto protocol =
+            udp_network::open_dual_stack_socket(socket_, options.port, socket_error);
+        if (socket_error) {
+            throw std::runtime_error("Failed to bind UDP socket: " +
+                                     socket_error.message());
+        }
+        const auto local = socket_.local_endpoint();
+        Log::info("UDP socket bound on {}:{} ({})",
+                  udp_network::format_address_for_display(local.address()), local.port(),
+                  protocol == udp::v6() ? "IPv6 dual-stack" : "IPv4 fallback");
+
         // Optimize UDP socket buffers for high-throughput packet forwarding
-        try {
-            socket_.set_option(asio::socket_base::receive_buffer_size(UDP_SOCKET_BUFFER_BYTES));
-            socket_.set_option(asio::socket_base::send_buffer_size(UDP_SOCKET_BUFFER_BYTES));
+        std::error_code buffer_error;
+        udp_network::configure_low_latency_buffers(socket_, buffer_error);
+        if (!buffer_error) {
             Log::info("UDP socket buffers optimized for packet forwarding ({} bytes)",
                       UDP_SOCKET_BUFFER_BYTES);
-        } catch (const std::exception& e) {
-            Log::warn("Failed to set socket buffer sizes: {}", e.what());
+        } else {
+            Log::warn("Failed to set socket buffer sizes: {}", buffer_error.message());
         }
 
         Log::info("SFU server ready: forwarding audio between clients");
@@ -109,6 +122,12 @@ public:
 
     uint16_t local_port() const {
         return socket_.local_endpoint().port();
+    }
+
+    bool is_dual_stack_socket() const {
+        std::error_code ec;
+        const auto      local = socket_.local_endpoint(ec);
+        return !ec && local.protocol() == udp::v6();
     }
 
     void do_receive() {
@@ -149,6 +168,14 @@ public:
     // Send with optional shared_ptr to keep data alive during async operation
     void send(void* data, std::size_t len, const udp::endpoint& target,
               const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
+        const auto qos = socket_qos_.ensure_flow(socket_, target);
+        if (qos.newly_configured &&
+            (!qos.ok() || qos.detail.find("failed") != std::string::npos)) {
+            Log::warn("UDP QoS not fully active for {}:{}: {}",
+                      udp_network::format_address_for_display(target.address()), target.port(),
+                      qos.detail);
+        }
+
         auto send_buffer = keep_alive;
         if (send_buffer == nullptr) {
             const auto* bytes = static_cast<const unsigned char*>(data);
@@ -1320,6 +1347,7 @@ private:
     std::unordered_map<uint64_t, AudioForwardStats> audio_forward_stats_;
     std::unordered_map<uint32_t, PingStats> ping_stats_;
     server_rate_limiter::ProtocolRateLimiter rate_limiter_;
+    udp_network::UdpSocketQos socket_qos_;
     uint64_t unknown_audio_drops_since_log_ = 0;
     uint64_t invalid_audio_drops_since_log_ = 0;
     uint64_t rate_limited_audio_drops_total_ = 0;
@@ -1630,6 +1658,101 @@ int run_timestamp_relay_smoke() {
     }
 }
 
+int run_dual_stack_relay_smoke() {
+    asio::io_context server_io;
+    ServerOptions    options;
+    options.port = 0;
+    options.allow_insecure_dev_joins = true;
+    options.server_id = "dual-stack-relay-smoke";
+
+    Server server(server_io, options);
+    if (!server.is_dual_stack_socket()) {
+        std::cout << "server dual-stack relay smoke skipped: IPv6 dual-stack unavailable\n";
+        return 0;
+    }
+
+    const uint16_t server_port = server.local_port();
+    const udp::endpoint server_v4(asio::ip::make_address("127.0.0.1"), server_port);
+    const udp::endpoint server_v6(asio::ip::make_address("::1"), server_port);
+
+    std::thread server_thread([&server_io]() { server_io.run(); });
+    try {
+        asio::io_context client_io;
+        udp::socket      v4_client(client_io, udp::endpoint(udp::v4(), 0));
+        udp::socket      v6_client(client_io);
+        std::error_code  ec;
+        v6_client.open(udp::v6(), ec);
+        if (!ec) {
+            v6_client.bind(udp::endpoint(udp::v6(), 0), ec);
+        }
+        if (ec) {
+            server_io.stop();
+            server_thread.join();
+            std::cout << "server dual-stack relay smoke skipped: IPv6 loopback unavailable\n";
+            return 0;
+        }
+
+        const std::string room = "dual-stack-smoke";
+        const auto        v4_ack =
+            join_smoke_client(v4_client, server_v4, "v4-client", AUDIO_CAP_REDUNDANCY, room);
+        const auto v6_ack =
+            join_smoke_client(v6_client, server_v6, "v6-client", AUDIO_CAP_REDUNDANCY, room);
+        require_smoke(v4_ack.participant_id != 0, "v4 client should join");
+        require_smoke(v6_ack.participant_id != 0, "v6 client should join");
+
+        const std::array<unsigned char, 3> v4_payload{4, 5, 6};
+        auto v4_packet = audio_packet::create_audio_packet_v2(
+            AudioCodec::Opus, 10, opus_network_clock::SAMPLE_RATE,
+            opus_network_clock::DEFAULT_FRAME_COUNT, 1, v4_payload.data(),
+            static_cast<uint16_t>(v4_payload.size()));
+        require_smoke(v4_packet != nullptr, "v4 packet should build");
+        send_smoke_packet(v4_client, server_v4, *v4_packet);
+
+        const auto v6_forward = receive_smoke_until(
+            v6_client,
+            [](const std::vector<unsigned char>& packet) {
+                return packet.size() >= audio_packet::v2_header_size() &&
+                       packet_magic(packet) == AUDIO_V2_MAGIC;
+            },
+            1500ms);
+        const auto v6_parsed =
+            audio_packet::parse_audio_header(v6_forward.data(), v6_forward.size());
+        require_smoke(v6_parsed.valid, "v6 receiver should get valid v4 audio");
+        require_smoke(v6_parsed.sender_id == v4_ack.participant_id,
+                      "v4 sender id should be stamped on v6 forward");
+
+        const std::array<unsigned char, 3> v6_payload{7, 8, 9};
+        auto v6_packet = audio_packet::create_audio_packet_v2(
+            AudioCodec::Opus, 11, opus_network_clock::SAMPLE_RATE,
+            opus_network_clock::DEFAULT_FRAME_COUNT, 1, v6_payload.data(),
+            static_cast<uint16_t>(v6_payload.size()));
+        require_smoke(v6_packet != nullptr, "v6 packet should build");
+        send_smoke_packet(v6_client, server_v6, *v6_packet);
+
+        const auto v4_forward = receive_smoke_until(
+            v4_client,
+            [](const std::vector<unsigned char>& packet) {
+                return packet.size() >= audio_packet::v2_header_size() &&
+                       packet_magic(packet) == AUDIO_V2_MAGIC;
+            },
+            1500ms);
+        const auto v4_parsed =
+            audio_packet::parse_audio_header(v4_forward.data(), v4_forward.size());
+        require_smoke(v4_parsed.valid, "v4 receiver should get valid v6 audio");
+        require_smoke(v4_parsed.sender_id == v6_ack.participant_id,
+                      "v6 sender id should be stamped on v4 forward");
+
+        server_io.stop();
+        server_thread.join();
+        std::cout << "server dual-stack relay smoke passed\n";
+        return 0;
+    } catch (...) {
+        server_io.stop();
+        server_thread.join();
+        throw;
+    }
+}
+
 int run_security_smoke() {
     asio::io_context server_io;
     ServerOptions options;
@@ -1789,11 +1912,14 @@ int main(int argc, char** argv) {
         if (has_arg(argc, argv, "--timestamp-relay-smoke")) {
             return run_timestamp_relay_smoke();
         }
+        if (has_arg(argc, argv, "--dual-stack-relay-smoke")) {
+            return run_dual_stack_relay_smoke();
+        }
         if (has_arg(argc, argv, "--security-smoke")) {
             return run_security_smoke();
         }
 
-        Log::info("Starting SFU server on 0.0.0.0:{}", options.port);
+        Log::info("Starting SFU server on [::]:{} (dual-stack preferred)", options.port);
         Log::info("Runtime: role=server platform={} arch={}", runtime_platform_name(),
                   runtime_arch_name());
         if (!options.log_file_path.empty()) {

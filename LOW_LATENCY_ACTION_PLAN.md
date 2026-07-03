@@ -10,6 +10,7 @@ Detailed plans:
 - Phase 0 + 1: `docs/superpowers/plans/2026-07-02-phase0-1-ci-rt-safety.md` (written)
 - Phase 2: `docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md` (written)
 - Phase 5 Track A: `docs/superpowers/plans/2026-07-03-phase5-track-a-security.md` (written)
+- Phase 5 Track B: `docs/superpowers/plans/2026-07-03-phase5-track-b-network.md` (written)
 - Phase 5 Track D: `docs/superpowers/plans/2026-07-03-phase5-track-d-testing.md` (written)
 - Other Phase 5 tracks: written when selected; do not batch independent tracks together.
 - Ready-to-paste prompts for the sessions that finish each phase:
@@ -17,8 +18,8 @@ Detailed plans:
 
 ## Current State
 
-- Release build passes; full test suite passes 45/45 locally for Phase 5 Track A
-  security (verified 2026-07-03).
+- Release build passes; full test suite passes 47/47 locally for Phase 5 Track B
+  network (verified 2026-07-03).
 - Receive-side jitter/playout policy is in good shape and regression-tested.
 - Phase 3 end-to-end latency is measurable in loopback smoke and device-backed baseline logs.
 - CI exists and is green for the Phase 0+1 and Phase 2 PRs.
@@ -174,10 +175,10 @@ rather than claiming a universal p99 improvement.
 ## Phase 5: Production Hardening
 
 Status: Track A Done (2026-07-03, Release build + full `ctest` 45/45 passed
-locally, signed security smokes passed) and Track D Done (2026-07-03, 2h
-real-client churn soak passed and CI green on PR #14). Tracks B/C/E not
-started. Phase 5 remains split into independent tracks; each gets its own plan
-doc.
+locally, signed security smokes passed), Track B Done (2026-07-03, Release
+build + full `ctest` 47/47 passed locally), and Track D Done (2026-07-03, 2h
+real-client churn soak passed and CI green on PR #14). Tracks C/E not started.
+Phase 5 remains split into independent tracks; each gets its own plan doc.
 
 - Track A (security): Done on branch `phase5-track-a-security`. Signed JOINs
   now derive a per-session audio key from the validated HMAC join token;
@@ -188,8 +189,12 @@ doc.
   low-latency audio cadence while limiting unknown, malformed, replay,
   unknown-session, control, and abusive traffic. Insecure dev joins remain
   plaintext for local smokes only.
-- Track B (network): DSCP/QoS marking (qWAVE on Windows — plain `IP_TOS` is ignored there);
-  dual-stack IPv4/IPv6 sockets.
+- Track B (network): Done on branch `phase5-track-b-network`. UDP sockets now
+  prefer IPv6 dual-stack binds with IPv4 fallback, clients resolve both IPv4
+  and IPv6 endpoints, IPv4 destinations are normalized to IPv4-mapped IPv6
+  when needed, and outbound UDP flows request EF QoS via qWAVE on Windows or
+  `IP_TOS`/`IPV6_TCLASS` elsewhere. qWAVE flow failures are cached per
+  endpoint so unsupported paths warn once instead of retrying at packet rate.
 - Track C (operations): server metrics export (machine-readable), log rotation
   (`basic_file_sink` never rotates, `logger.h:147`), crash reporting.
 - Track D (testing): Done on branch `phase5-track-d-testing` from `f75eff7`,
@@ -266,6 +271,16 @@ Track D accepted command:
 ```powershell
 node tools/phase5-track-d-soak.mjs --server-exe build/Release/server.exe --client-exe build/Release/client.exe --seconds 7200 --churn-interval-seconds 120 --stable-clients 1 --churn-clients 1 --max-queue-drift-packets 4 --out-dir validation_logs/phase5-track-d/soak-2h-20260703-140217
 ```
+
+Track B local validation snapshot (2026-07-03):
+
+- Release build command: `cmake --build build --config Release`; passed.
+- Targeted network smoke command:
+  `ctest --test-dir build -C Release -R "udp_socket_config_self_test|server_dual_stack_relay_smoke|server_security_smoke|server_redundancy_relay_smoke|client_udp_endpoint_guard_smoke" --output-on-failure`;
+  passed `5/5` in `2.48 sec`.
+- Full test command:
+  `ctest --test-dir build -C Release --output-on-failure`; passed `47/47` in
+  `38.44 sec`.
 
 ## Production Gate
 

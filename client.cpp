@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -67,6 +68,7 @@
 #include "session_crypto.h"
 #include "wav_file_playback.h"
 #include "udp_port.h"
+#include "udp_socket_config.h"
 
 using asio::ip::udp;
 using namespace std::chrono_literals;
@@ -258,7 +260,7 @@ public:
            std::filesystem::path audio_preferences_path = {},
            AudioDevicePreferences audio_preferences = {})
         : io_context_(io_context),
-          socket_(io_context, udp::endpoint(udp::v4(), 0)),
+          socket_(io_context),
           performer_join_options_(std::move(performer_join_options)),
           audio_preferences_path_(std::move(audio_preferences_path)),
           selected_audio_api_filter_(audio_preferences.audio_api.empty()
@@ -270,7 +272,15 @@ public:
           join_retry_timer_(io_context, 1s, [this]() { join_retry_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
           cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
-        Log::info("Client local port: {}", socket_.local_endpoint().port());
+        std::error_code socket_error;
+        const auto protocol =
+            udp_network::open_dual_stack_socket(socket_, 0, socket_error);
+        if (socket_error) {
+            throw std::runtime_error("Failed to bind UDP socket: " +
+                                     socket_error.message());
+        }
+        Log::info("Client local port: {} ({})", socket_.local_endpoint().port(),
+                  protocol == udp::v6() ? "IPv6 dual-stack" : "IPv4 fallback");
 
         // Optimize UDP socket buffers for low-latency audio streaming
         {
@@ -324,16 +334,29 @@ public:
         // Resolve hostname or IP address
         udp::resolver               resolver(io_context_);
         udp::resolver::results_type endpoints =
-            resolver.resolve(udp::v4(), server_address, std::to_string(server_port));
-        const udp::endpoint resolved_endpoint = *endpoints.begin();
+            resolver.resolve(server_address, std::to_string(server_port));
+        const auto selected_endpoint =
+            udp_network::choose_endpoint_for_socket(socket_, endpoints);
+        if (!selected_endpoint.has_value()) {
+            throw std::runtime_error("No compatible UDP endpoint resolved for " +
+                                     server_address);
+        }
+        const udp::endpoint resolved_endpoint = *selected_endpoint;
 
-        Log::info("Resolved to: {}:{}", resolved_endpoint.address().to_string(),
+        Log::info("Resolved to: {}:{}", 
+                  udp_network::format_address_for_display(resolved_endpoint.address()),
                   resolved_endpoint.port());
         {
             std::lock_guard<std::mutex> lock(server_endpoint_mutex_);
             server_endpoint_ = resolved_endpoint;
             outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
         }
+        udp_network::QosResult qos;
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            qos = socket_qos_.ensure_flow(socket_, resolved_endpoint);
+        }
+        log_udp_qos_result(resolved_endpoint, qos);
         join_state_.reset();
         reset_session_security();
         reset_server_clock_and_ping_state();
@@ -531,7 +554,7 @@ public:
 
     // Getters for UI access
     std::string get_server_address() const {
-        return current_server_endpoint().address().to_string();
+        return udp_network::format_address_for_display(current_server_endpoint().address());
     }
 
     unsigned short get_server_port() const {
@@ -1724,25 +1747,30 @@ public:
 
         const auto outbound = current_outbound_endpoint_snapshot();
         asio::post(io_context_, [this, send_buffer, len, outbound]() {
+            udp_network::QosResult qos;
             if (!outbound_enabled_.load(std::memory_order_acquire) ||
                 outbound.generation !=
                     outbound_generation_.load(std::memory_order_acquire)) {
                 return;
             }
-            std::lock_guard<std::mutex> lock(socket_mutex_);
-            if (!outbound_enabled_.load(std::memory_order_acquire) ||
-                outbound.generation !=
-                    outbound_generation_.load(std::memory_order_acquire)) {
-                return;
+            {
+                std::lock_guard<std::mutex> lock(socket_mutex_);
+                if (!outbound_enabled_.load(std::memory_order_acquire) ||
+                    outbound.generation !=
+                        outbound_generation_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                qos = socket_qos_.ensure_flow(socket_, outbound.endpoint);
+                total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
+                socket_.async_send_to(asio::buffer(send_buffer->data(), send_buffer->size()),
+                                      outbound.endpoint,
+                                      [send_buffer](std::error_code error_code, std::size_t) {
+                                          if (error_code) {
+                                              Log::error("send error: {}", error_code.message());
+                                          }
+                                      });
             }
-            total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
-            socket_.async_send_to(asio::buffer(send_buffer->data(), send_buffer->size()),
-                                  outbound.endpoint,
-                                  [send_buffer](std::error_code error_code, std::size_t) {
-                                      if (error_code) {
-                                          Log::error("send error: {}", error_code.message());
-                                      }
-                                  });
+            log_udp_qos_result(outbound.endpoint, qos);
         });
     }
 
@@ -1788,6 +1816,7 @@ private:
         }
 
         std::error_code error_code;
+        udp_network::QosResult qos;
         {
             std::lock_guard<std::mutex> lock(socket_mutex_);
             if (!outbound_enabled_.load(std::memory_order_acquire) ||
@@ -1795,9 +1824,11 @@ private:
                     outbound_generation_.load(std::memory_order_acquire)) {
                 return;
             }
+            qos = socket_qos_.ensure_flow(socket_, outbound.endpoint);
             socket_.send_to(asio::buffer(send_data, send_len), outbound.endpoint, 0,
                             error_code);
         }
+        log_udp_qos_result(outbound.endpoint, qos);
 
         if (!error_code) {
             total_bytes_tx_.fetch_add(send_len, std::memory_order_relaxed);
@@ -1812,13 +1843,28 @@ private:
     }
 
     static void configure_udp_socket(udp::socket& socket) {
-        try {
-            socket.set_option(asio::socket_base::receive_buffer_size(UDP_SOCKET_BUFFER_BYTES));
-            socket.set_option(asio::socket_base::send_buffer_size(UDP_SOCKET_BUFFER_BYTES));
+        std::error_code buffer_error;
+        udp_network::configure_low_latency_buffers(socket, buffer_error);
+        if (!buffer_error) {
             Log::info("UDP socket buffers optimized for low latency ({} bytes)",
                       UDP_SOCKET_BUFFER_BYTES);
-        } catch (const std::exception& e) {
-            Log::warn("Failed to set socket buffer sizes: {}", e.what());
+        } else {
+            Log::warn("Failed to set socket buffer sizes: {}", buffer_error.message());
+        }
+    }
+
+    static void log_udp_qos_result(const udp::endpoint& endpoint,
+                                   const udp_network::QosResult& result) {
+        if (!result.newly_configured) {
+            return;
+        }
+        const auto address = udp_network::format_address_for_display(endpoint.address());
+        if (!result.ok() || result.detail.find("failed") != std::string::npos) {
+            Log::warn("UDP QoS not fully active for {}:{}: {}", address, endpoint.port(),
+                      result.detail);
+        } else {
+            Log::info("UDP QoS active for {}:{}: {}", address, endpoint.port(),
+                      result.detail);
         }
     }
 
@@ -1910,10 +1956,7 @@ private:
         std::error_code ec;
         std::error_code ignored;
         udp::socket     replacement(io_context_);
-        replacement.open(udp::v4(), ec);
-        if (!ec) {
-            replacement.bind(udp::endpoint(udp::v4(), 0), ec);
-        }
+        udp_network::open_compatible_socket(replacement, target, 0, ec);
         if (ec) {
             Log::error("UDP path rebind failed after '{}': {}", reason, ec.message());
             return;
@@ -1927,6 +1970,7 @@ private:
         outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
 
         uint16_t old_port = 0;
+        udp_network::QosResult qos;
         {
             std::lock_guard<std::mutex> lock(socket_mutex_);
 
@@ -1940,7 +1984,10 @@ private:
             socket_.cancel(ignored);
             socket_.close(ignored);
             socket_ = std::move(replacement);
+            socket_qos_.reset();
+            qos = socket_qos_.ensure_flow(socket_, target);
         }
+        log_udp_qos_result(target, qos);
 
         join_state_.reset();
         reset_server_clock_and_ping_state();
@@ -6109,6 +6156,7 @@ private:
 
     asio::io_context& io_context_;
     udp::socket       socket_;
+    udp_network::UdpSocketQos socket_qos_;
     mutable std::mutex socket_mutex_;
     mutable std::mutex server_endpoint_mutex_;
     udp::endpoint      server_endpoint_;
