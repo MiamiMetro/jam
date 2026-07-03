@@ -77,6 +77,67 @@ inline void copy_inputs_to_interleaved(const float* const* input_channels,
                                interleaved_channel_count, interleaved.data(), interleaved.size());
 }
 
+inline void copy_selected_input_channel_to_interleaved(const float* const* input_channels,
+                                                       int input_channel_count,
+                                                       int requested_input_channel,
+                                                       int frame_count,
+                                                       int interleaved_channel_count,
+                                                       float* interleaved,
+                                                       std::size_t interleaved_size)
+{
+    const auto safe_frame_count = std::max(frame_count, 0);
+    const auto safe_interleaved_channel_count = std::max(interleaved_channel_count, 1);
+    const auto required_size = static_cast<std::size_t>(safe_frame_count) *
+                               static_cast<std::size_t>(safe_interleaved_channel_count);
+    const auto writable_size = std::min(required_size, interleaved_size);
+
+    if (interleaved == nullptr || writable_size == 0) {
+        return;
+    }
+
+    std::fill_n(interleaved, writable_size, 0.0F);
+
+    if (input_channels == nullptr || input_channel_count <= 0) {
+        return;
+    }
+
+    int source_channel = -1;
+    if (requested_input_channel >= 0 && requested_input_channel < input_channel_count &&
+        input_channels[requested_input_channel] != nullptr) {
+        source_channel = requested_input_channel;
+    } else {
+        for (int input_channel = 0; input_channel < input_channel_count; ++input_channel) {
+            if (input_channels[input_channel] != nullptr) {
+                source_channel = input_channel;
+                break;
+            }
+        }
+    }
+
+    if (source_channel < 0) {
+        return;
+    }
+
+    for (int frame = 0; frame < safe_frame_count; ++frame) {
+        const auto frame_index =
+            static_cast<std::size_t>(frame) *
+            static_cast<std::size_t>(safe_interleaved_channel_count);
+        if (frame_index >= writable_size) {
+            break;
+        }
+
+        const auto sample = input_channels[source_channel][frame];
+        for (int output_channel = 0; output_channel < safe_interleaved_channel_count;
+             ++output_channel) {
+            const auto index = frame_index + static_cast<std::size_t>(output_channel);
+            if (index >= writable_size) {
+                break;
+            }
+            interleaved[index] = sample;
+        }
+    }
+}
+
 inline void copy_interleaved_to_outputs(const std::vector<float>& interleaved,
                                         int frame_count,
                                         int interleaved_channel_count,

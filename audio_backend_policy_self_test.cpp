@@ -59,10 +59,16 @@ int main() {
             "AudioLatencyInfo::actual_buffer_frames must be int");
     require(std::is_same_v<decltype(AudioConfig{}.frames_per_buffer), int>,
             "AudioConfig::frames_per_buffer must be int");
+    require(std::is_same_v<decltype(AudioConfig{}.input_channel_index), int>,
+            "AudioConfig::input_channel_index must be int");
+    require(AudioConfig{}.input_channel_index == 0,
+            "AudioConfig::input_channel_index must default to channel 0");
     require(std::is_same_v<decltype(AudioDeviceInfo{}.max_input_channels), int>,
             "AudioDeviceInfo::max_input_channels must be int");
     require(std::is_same_v<decltype(AudioDeviceInfo{}.max_output_channels), int>,
             "AudioDeviceInfo::max_output_channels must be int");
+    require(std::is_same_v<decltype(AudioDeviceInfo{}.sample_rates), std::vector<double>>,
+            "AudioDeviceInfo::sample_rates must be vector<double>");
 
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "ASIO")
                 <= audio_backend::rank_api_for_platform(audio_backend::Platform::windows,

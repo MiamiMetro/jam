@@ -3,8 +3,27 @@
 #include "juce_audio_backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
+#include <sstream>
 #include <spdlog/spdlog.h>
+
+namespace {
+std::string format_sample_rates(const std::vector<double>& sample_rates) {
+    if (sample_rates.empty()) {
+        return "unknown";
+    }
+
+    std::ostringstream out;
+    for (std::size_t index = 0; index < sample_rates.size(); ++index) {
+        if (index > 0) {
+            out << ',';
+        }
+        out << static_cast<int>(std::lround(sample_rates[index]));
+    }
+    return out.str();
+}
+}  // namespace
 
 AudioStream::AudioStream() : backend_(std::make_unique<JuceAudioBackend>()) {}
 
@@ -25,10 +44,10 @@ void AudioStream::print_all_devices() {
     for (const auto& device_info: to_stream_device_infos(shared_backend().get_all_devices())) {
         spdlog::info(
             "Device {}: {} | API: {} | Max Input Channels: {} | Max Output Channels: {} | "
-            "Default Sample Rate: {}",
+            "Default Sample Rate: {} | Sample Rates: {}",
             device_info.index, device_info.name, device_info.api_name,
             device_info.max_input_channels, device_info.max_output_channels,
-            device_info.default_sample_rate);
+            device_info.default_sample_rate, format_sample_rates(device_info.sample_rates));
     }
 }
 
@@ -79,12 +98,16 @@ void AudioStream::print_device_info(const DeviceInfo* input_info, const DeviceIn
         return;
     }
 
-    spdlog::info("Input Device: {} | API: {} | Max Input Channels: {} | Default Sample Rate: {}",
+    spdlog::info(
+        "Input Device: {} | API: {} | Max Input Channels: {} | Default Sample Rate: {} | "
+        "Sample Rates: {}",
                  input_info->name, input_info->api_name, input_info->max_input_channels,
-                 input_info->default_sample_rate);
-    spdlog::info("Output Device: {} | API: {} | Max Output Channels: {} | Default Sample Rate: {}",
+        input_info->default_sample_rate, format_sample_rates(input_info->sample_rates));
+    spdlog::info(
+        "Output Device: {} | API: {} | Max Output Channels: {} | Default Sample Rate: {} | "
+        "Sample Rates: {}",
                  output_info->name, output_info->api_name, output_info->max_output_channels,
-                 output_info->default_sample_rate);
+        output_info->default_sample_rate, format_sample_rates(output_info->sample_rates));
 }
 
 bool AudioStream::start_audio_stream(DeviceIndex input_device, DeviceIndex output_device,
