@@ -71,6 +71,12 @@ if(JAM_BUILD_TESTS)
 
     add_executable(udp_port_self_test udp_port_self_test.cpp)
 
+    add_executable(udp_socket_config_self_test udp_socket_config_self_test.cpp)
+    target_link_libraries(udp_socket_config_self_test PRIVATE asio)
+    if(WIN32)
+        target_link_libraries(udp_socket_config_self_test PRIVATE Qwave)
+    endif()
+
     add_executable(jitter_policy_self_test jitter_policy_self_test.cpp)
 
     add_executable(redundant_receive_policy_self_test redundant_receive_policy_self_test.cpp)
@@ -124,6 +130,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(participant_manager_self_test)
     jam_add_executable_test(sequence_tracker_self_test)
     jam_add_executable_test(udp_port_self_test)
+    jam_add_executable_test(udp_socket_config_self_test)
     jam_add_executable_test(jitter_policy_self_test)
     jam_add_executable_test(redundant_receive_policy_self_test)
     jam_add_executable_test(recording_writer_self_test)
