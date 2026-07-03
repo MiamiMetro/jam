@@ -174,6 +174,8 @@ if(JAM_BUILD_TESTS)
                  COMMAND $<TARGET_FILE:client> --opus-redundancy-policy-smoke)
         add_test(NAME client_opus_encode_buffer_smoke
                  COMMAND $<TARGET_FILE:client> --opus-encode-buffer-smoke)
+        add_test(NAME client_udp_audio_sync_send_smoke
+                 COMMAND $<TARGET_FILE:client> --udp-audio-sync-send-smoke)
         add_test(NAME client_audio_v3_receive_smoke
                  COMMAND $<TARGET_FILE:client> --audio-v3-receive-smoke)
         add_test(NAME client_e2e_latency_metric_smoke
