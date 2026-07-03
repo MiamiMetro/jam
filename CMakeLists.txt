@@ -47,7 +47,7 @@ target_link_libraries(jam_broadcaster PRIVATE asio spdlog::spdlog)
 
 if(JAM_BUILD_TESTS)
     add_executable(client_manager_self_test client_manager_self_test.cpp)
-    target_link_libraries(client_manager_self_test PRIVATE asio concurrentqueue)
+    target_link_libraries(client_manager_self_test PRIVATE asio concurrentqueue token_crypto)
 
     add_executable(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)
     target_link_libraries(server_rate_limiter_self_test PRIVATE asio)
