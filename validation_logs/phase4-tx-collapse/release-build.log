@@ -1,0 +1,20 @@
+MSBuild version 17.14.23+b0019275e for .NET Framework
+
+  Checking File Globs
+  spdlog.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\_deps\spdlog-build\Release\spdlog.lib
+  glfw.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\_deps\glfw-build\src\Release\glfw3.lib
+  imgui_lib.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\Release\imgui_lib.lib
+  opus.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\_deps\opus-build\Release\opus.lib
+  client.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\Release\client.exe
+MSBuild version 17.14.23+b0019275e for .NET Framework
+
+  Checking File Globs
+  spdlog.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\_deps\spdlog-build\Release\spdlog.lib
+  opus.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\_deps\opus-build\Release\opus.lib
+  server.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\Release\server.exe
+MSBuild version 17.14.23+b0019275e for .NET Framework
+
+  Checking File Globs
+  spdlog.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\_deps\spdlog-build\Release\spdlog.lib
+  opus.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\_deps\opus-build\Release\opus.lib
+  latency_probe.vcxproj -> C:\Users\Berkay\Downloads\udpstuff\build\Release\latency_probe.exe
