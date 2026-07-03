@@ -582,6 +582,48 @@ public:
         uint64_t over_deadline_count;
     };
 
+    struct LatencyPercentileWindow {
+        static constexpr size_t CAPACITY = 256;
+
+        std::array<int64_t, CAPACITY> samples{};
+        size_t next = 0;
+        size_t count = 0;
+        mutable std::mutex mutex;
+
+        void observe(int64_t sample_ns) {
+            std::lock_guard<std::mutex> lock(mutex);
+            samples[next] = sample_ns;
+            next = (next + 1) % CAPACITY;
+            count = std::min(count + 1, CAPACITY);
+        }
+
+        int64_t percentile_99_ns() const {
+            std::array<int64_t, CAPACITY> copy{};
+            size_t local_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                local_count = count;
+                std::copy_n(samples.begin(), local_count, copy.begin());
+            }
+            if (local_count == 0) {
+                return 0;
+            }
+            std::sort(copy.begin(), copy.begin() + static_cast<std::ptrdiff_t>(local_count));
+            const size_t index = std::min(
+                local_count - 1,
+                static_cast<size_t>(
+                    std::ceil(static_cast<double>(local_count) * 0.99) - 1.0));
+            return copy[index];
+        }
+
+        void clear() {
+            std::lock_guard<std::mutex> lock(mutex);
+            next = 0;
+            count = 0;
+            samples.fill(0);
+        }
+    };
+
     struct PathDiagnostics {
         double rtt_last_ms = 0.0;
         double rtt_min_ms = 0.0;
@@ -596,6 +638,7 @@ public:
         double audio_ingress_gap_percent = 0.0;
         double opus_send_queue_avg_ms = 0.0;
         double opus_send_queue_max_ms = 0.0;
+        double opus_send_queue_p99_ms = 0.0;
         double total_estimate_ms = 0.0;
         double total_input_ms = 0.0;
         double total_opus_ms = 0.0;
@@ -672,6 +715,8 @@ public:
             ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed));
         diagnostics.opus_send_queue_max_ms =
             ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed));
+        diagnostics.opus_send_queue_p99_ms =
+            ns_to_ms(opus_send_queue_age_p99_ns_.load(std::memory_order_relaxed));
         const auto latency = get_latency_info();
         const double fallback_buffer_ms =
             latency.buffer_duration_ms > 0.0 ? latency.buffer_duration_ms
@@ -1675,6 +1720,8 @@ private:
         OpusSendFrame discarded_opus;
         while (opus_send_queue_.try_dequeue(discarded_opus)) {
         }
+        opus_send_queue_age_window_.clear();
+        opus_send_queue_age_p99_ns_.store(0, std::memory_order_relaxed);
         opus_tx_accumulator_.fill(0.0F);
         opus_tx_accumulated_frames_ = 0;
         opus_tx_accumulator_capture_time_ = {};
@@ -2738,6 +2785,9 @@ private:
                                 .count();
         observe_latency_sample(opus_send_queue_age_last_ns_, opus_send_queue_age_avg_ns_,
                                opus_send_queue_age_max_ns_, age_ns);
+        opus_send_queue_age_window_.observe(age_ns);
+        opus_send_queue_age_p99_ns_.store(opus_send_queue_age_window_.percentile_99_ns(),
+                                          std::memory_order_relaxed);
     }
 
     void observe_tx_encode_time(std::chrono::steady_clock::duration elapsed) {
@@ -2957,7 +3007,7 @@ private:
         Log::info(
             "Audio diag: frames={} tx_packets={} tx_drops pcm/opus={}/{} "
             "tx_malformed={} ({:.1f}/s) "
-            "sendq_age_ms last/avg/max={:.2f}/{:.2f}/{:.2f} rx_bytes={} tx_bytes={}",
+            "sendq_age_ms last/avg/max/opus_p99={:.2f}/{:.2f}/{:.2f}/{:.2f} rx_bytes={} tx_bytes={}",
                   current_audio_frames_per_buffer(),
                   audio_tx_sequence_.load(std::memory_order_relaxed),
                   pcm_send_drops,
@@ -2967,12 +3017,13 @@ private:
                   ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
                   ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
                   ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
+                  ns_to_ms(opus_send_queue_age_p99_ns_.load(std::memory_order_relaxed)),
                   total_bytes_rx_.load(std::memory_order_relaxed),
                   total_bytes_tx_.load(std::memory_order_relaxed));
 
         Log::info(
             "Latency diag: callback_ms last/avg/max/deadline={:.3f}/{:.3f}/{:.3f}/{:.3f} "
-            "over={} txq_ms pcm={:.3f}/{:.3f}/{:.3f} opus={:.3f}/{:.3f}/{:.3f} "
+            "over={} txq_ms pcm={:.3f}/{:.3f}/{:.3f} opus={:.3f}/{:.3f}/{:.3f} opus_p99={:.3f} "
             "encode_ms={:.3f}/{:.3f}/{:.3f} send_pace_ms={:.3f}/{:.3f}/{:.3f} "
             "rx_decode_ms={:.3f}/{:.3f}/{:.3f} rx_playout_ms={:.3f}/{:.3f}/{:.3f}",
             ns_to_ms(callback_last_ns_.load(std::memory_order_relaxed)),
@@ -2986,6 +3037,7 @@ private:
             ns_to_ms(opus_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(opus_send_queue_age_p99_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(tx_encode_last_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(tx_encode_avg_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(tx_encode_max_ns_.load(std::memory_order_relaxed)),
@@ -3911,7 +3963,7 @@ public:
             "tx_packets={} tx_drops pcm/opus={}/{} "
             "tx_malformed={} "
             "sendq_ms pcm_last/avg/max={:.3f}/{:.3f}/{:.3f} "
-            "opus_last/avg/max={:.3f}/{:.3f}/{:.3f} "
+            "opus_last/avg/max={:.3f}/{:.3f}/{:.3f} opus_p99={:.3f} "
             "encode_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
             "send_pace_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
             "rx_decode_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
@@ -3960,6 +4012,7 @@ public:
             ns_to_ms(opus_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
+            ns_to_ms(opus_send_queue_age_p99_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(tx_encode_last_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(tx_encode_avg_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(tx_encode_max_ns_.load(std::memory_order_relaxed)),
@@ -5554,6 +5607,8 @@ private:
     std::atomic<int64_t>                      opus_send_queue_age_last_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_avg_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_max_ns_{0};
+    std::atomic<int64_t>                      opus_send_queue_age_p99_ns_{0};
+    LatencyPercentileWindow                   opus_send_queue_age_window_;
     std::atomic<int64_t>                      tx_encode_last_ns_{0};
     std::atomic<int64_t>                      tx_encode_avg_ns_{0};
     std::atomic<int64_t>                      tx_encode_max_ns_{0};
