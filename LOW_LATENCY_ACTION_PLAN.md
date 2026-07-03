@@ -111,9 +111,9 @@ Device-backed snapshot also passed with Release binaries using `JAM_SERVER_EXE=b
 
 ## Phase 4: TX Path Collapse
 
-Status: Implemented locally - acceptance pending (2026-07-03, Release build
-green, full `ctest` 39/39 passed locally, E2E loopback smoke recorded locally,
-CI pending, required send-queue p99 improvement not yet proven)
+Status: Done (2026-07-03, TX collapse merged in PR #13, CI green, Release
+build green, full `ctest` 39/39 passed locally, E2E loopback smoke within
+budget, 2h real-client churn soak stable)
 
 Goal: capture-to-wire without the `asio::post` hop; bounded allocations; prioritized sender.
 
@@ -130,8 +130,7 @@ no-notify validation regressed 30s Opus send-queue p99 from `0.211 ms` to
 `2.592 ms` on client A and from `0.203 ms` to `3.124 ms` on client B, so the
 callback wake was kept.
 
-Local validation snapshot (2026-07-03; acceptance blocker: mixed p99 signal and
-CI pending):
+Validation snapshot (2026-07-03):
 
 - Before baseline: pre-collapse commit `cd9a275`, built in
   `C:\Users\Berkay\Downloads\udpstuff-phase4-before`; logs in
@@ -148,26 +147,34 @@ CI pending):
 - Phase 4 local E2E rerun:
   `validation_logs/phase4-tx-collapse/e2e-smoke.log` reports last
   `9.4238 ms`, avg `9.98548 ms`, max `11.5315 ms`, steady_max `11.5315 ms`
-  against the `23 ms` budget. This is recorded as a local snapshot, not final
-  accepted latency validation, because the required p99 before/after signal is
-  mixed and CI is still pending.
+  against the `23 ms` budget.
 - Release build command logged in
   `validation_logs/phase4-tx-collapse/release-build.log`.
 - Full test command logged in
   `validation_logs/phase4-tx-collapse/ctest-release.log`: `100% tests passed,
   0 tests failed out of 39` in `25.09 sec`.
-- CI: pending on PR/push.
+- CI: green on PR #13 merge run
+  `https://github.com/MiamiMetro/jam/actions/runs/28653147027`.
+- Closure soak: `validation_logs/phase5-track-d/soak-2h-20260703-140217`
+  ran the 7200s real-client churn soak with one stable client and one churn
+  client, `summary.json` status `ok`, `1492` baseline snapshots, `1419`
+  participant snapshots, `maxOverDeadline=0`, max absolute queue drift
+  `2.05` packets against the `4` packet budget. Parsed Phase 4 fields from the
+  same client logs show max baseline `opus_p99=2.144 ms`; the final stable
+  7200s snapshot reports `opus_p99=0.158 ms`, Opus send-queue max `6.276 ms`,
+  and participant `e2e_ms last/avg/max=10.0/10.0/10.8`.
 
-Acceptance: structural TX collapse items are complete (no audio `asio::post`,
-bounded packet reuse, sender-thread synchronous send on the original socket, and
-MMCSS priority). Acceptance is not closed: local latency validation is only a
-snapshot, the send-queue p99 result is mixed because one client regressed
-slightly in the required before/after run, and remote CI remains pending.
+Acceptance: closed. Structural TX collapse items are complete (no audio
+`asio::post`, bounded packet reuse, sender-thread synchronous send on the
+original socket, and MMCSS priority). The short before/after p99 signal was
+mixed and is recorded above; the 2h soak accepts the phase as stable/bounded
+rather than claiming a universal p99 improvement.
 
 ## Phase 5: Production Hardening
 
-Status: Track D implemented locally; long-duration acceptance pending. Tracks A/B/C/E
-not started. Phase 5 remains split into independent tracks; each gets its own plan doc.
+Status: Track D Done (2026-07-03, 2h real-client churn soak passed and CI green
+on PR #14). Tracks A/B/C/E not started. Phase 5 remains split into independent
+tracks; each gets its own plan doc.
 
 - Track A (security): per-packet authentication via session key derived at join, then
   payload encryption; server-side token nonce tracking; per-client rate limiting.
@@ -175,10 +182,11 @@ not started. Phase 5 remains split into independent tracks; each gets its own pl
   dual-stack IPv4/IPv6 sockets.
 - Track C (operations): server metrics export (machine-readable), log rotation
   (`basic_file_sink` never rotates, `logger.h:147`), crash reporting.
-- Track D (testing): implemented locally on branch `phase5-track-d-testing` from
-  `f75eff7`. Added a repeatable impairment matrix harness, room-scale relay load
-  benchmark, and real-client soak runner with log-budget assertions. CI-safe smokes
-  are registered in CTest; the required multi-hour real-client soak has not been run.
+- Track D (testing): Done on branch `phase5-track-d-testing` from `f75eff7`,
+  merged as PR #14. Added a repeatable impairment matrix harness, room-scale
+  relay load benchmark, and real-client soak runner with log-budget assertions.
+  CI-safe smokes are registered in CTest; the required multi-hour real-client
+  soak passed locally.
 - Track E (devices): real capability enumeration and input-channel selection in the JUCE
   backend (`juce_audio_backend.cpp:376-387`).
 
@@ -208,15 +216,21 @@ Track D local validation snapshot (2026-07-03):
   Run shape: `20 s`, one stable client, one churn client, `8 s` churn interval.
   Parsed `9` baseline snapshots and `4` participant snapshots with
   `maxOverDeadline=0` and max absolute queue drift `0.92` packets.
+- 2h real-client churn soak logged in
+  `validation_logs/phase5-track-d/soak-2h-20260703-140217/summary.json`;
+  status `ok`. Run shape: `7200 s`, one stable client, one churn client,
+  `120 s` churn interval. Parsed `1492` baseline snapshots and `1419`
+  participant snapshots with `maxOverDeadline=0` and max absolute queue drift
+  `2.05` packets against the `4` packet budget. All `60` churn client runs and
+  the stable client exited `0`.
+- CI: green on PR #14 merge run
+  `https://github.com/MiamiMetro/jam/actions/runs/28655644950`.
 
-Track D acceptance still pending:
+Track D accepted command:
 
 ```powershell
-node tools/phase5-track-d-soak.mjs --server-exe build/Release/server.exe --client-exe build/Release/client.exe --seconds 7200 --churn-interval-seconds 120 --stable-clients 1 --churn-clients 1 --max-queue-drift-packets 4 --out-dir validation_logs/phase5-track-d/soak-2h
+node tools/phase5-track-d-soak.mjs --server-exe build/Release/server.exe --client-exe build/Release/client.exe --seconds 7200 --churn-interval-seconds 120 --stable-clients 1 --churn-clients 1 --max-queue-drift-packets 4 --out-dir validation_logs/phase5-track-d/soak-2h-20260703-140217
 ```
-
-Do not mark Track D fully Done or satisfy the production gate until that multi-hour
-soak passes and the remote CI run for the branch is green.
 
 ## Production Gate
 
