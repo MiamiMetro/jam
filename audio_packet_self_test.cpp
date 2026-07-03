@@ -1,6 +1,8 @@
 #include "audio_packet.h"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
@@ -311,6 +313,78 @@ void test_redundant_audio_packet_accepts_v3_children() {
     require(child_count == 2, "redundant v3 packet should expose two children");
 }
 
+void test_write_audio_packet_v3_into_caller_buffer() {
+    std::array<unsigned char, 128> out{};
+    const std::array<unsigned char, 4> payload{0x10, 0x20, 0x30, 0x40};
+    size_t bytes_written = 0;
+
+    require(audio_packet::write_audio_packet_v3(
+                AudioCodec::Opus, 42, 48000, 120, 1, payload.data(),
+                static_cast<uint16_t>(payload.size()), 123456789LL,
+                out.data(), out.size(), bytes_written),
+            "write_audio_packet_v3 should fit in caller buffer");
+    require(bytes_written == audio_packet::v3_header_size() + payload.size(),
+            "V3 writer should report exact packet size");
+    require(audio_packet::validate_audio_packet_bytes(out.data(), bytes_written),
+            "V3 writer should produce a valid packet");
+
+    const auto parsed = audio_packet::parse_audio_header(out.data(), bytes_written);
+    require(parsed.valid, "V3 writer parsed header should be valid");
+    require(parsed.magic == AUDIO_V3_MAGIC, "V3 writer should preserve magic");
+    require(parsed.sequence == 42, "V3 writer should preserve sequence");
+    require(parsed.capture_server_time_ns == 123456789LL,
+            "V3 writer should preserve capture timestamp");
+    require(std::memcmp(audio_packet::audio_payload(out.data(), bytes_written),
+                        payload.data(), payload.size()) == 0,
+            "V3 writer should copy payload bytes");
+}
+
+void test_write_audio_packet_capacity_failure() {
+    std::array<unsigned char, 8> out{};
+    const std::array<unsigned char, 4> payload{0xAA, 0xBB, 0xCC, 0xDD};
+    size_t bytes_written = 99;
+
+    require(!audio_packet::write_audio_packet_v2(
+                AudioCodec::Opus, 7, 48000, 120, 1, payload.data(),
+                static_cast<uint16_t>(payload.size()),
+                out.data(), out.size(), bytes_written),
+            "V2 writer should fail when output buffer is too small");
+    require(bytes_written == 0, "failed writer should zero bytes_written");
+}
+
+void test_write_redundant_audio_packet_into_caller_buffer() {
+    std::array<unsigned char, 128> current{};
+    std::array<unsigned char, 128> previous{};
+    std::array<unsigned char, 256> redundant{};
+    const std::array<unsigned char, 3> payload{0x01, 0x02, 0x03};
+    size_t current_bytes = 0;
+    size_t previous_bytes = 0;
+    size_t redundant_bytes = 0;
+
+    require(audio_packet::write_audio_packet_v3(
+                AudioCodec::Opus, 11, 48000, 120, 1, payload.data(),
+                static_cast<uint16_t>(payload.size()), 1111,
+                current.data(), current.size(), current_bytes),
+            "current V3 should write");
+    require(audio_packet::write_audio_packet_v3(
+                AudioCodec::Opus, 10, 48000, 120, 1, payload.data(),
+                static_cast<uint16_t>(payload.size()), 1010,
+                previous.data(), previous.size(), previous_bytes),
+            "previous V3 should write");
+
+    const audio_packet::AudioPacketView views[] = {
+        {current.data(), current_bytes},
+        {previous.data(), previous_bytes},
+    };
+    require(audio_packet::write_redundant_audio_packet(
+                views, 2, redundant.data(), redundant.size(),
+                AUDIO_REDUNDANT_TARGET_BYTES, redundant_bytes),
+            "redundant writer should fit in caller buffer");
+    require(audio_packet::validate_redundant_audio_packet_bytes(
+                redundant.data(), redundant_bytes),
+            "redundant writer should produce a valid datagram");
+}
+
 }  // namespace
 
 int main() {
@@ -327,6 +401,9 @@ int main() {
     test_v3_validation_reuses_v2_shape_rules();
     test_v3_timestamp_packet_strips_to_v2();
     test_redundant_audio_packet_accepts_v3_children();
+    test_write_audio_packet_v3_into_caller_buffer();
+    test_write_audio_packet_capacity_failure();
+    test_write_redundant_audio_packet_into_caller_buffer();
 
     std::cout << "audio packet self-test passed\n";
     return 0;
