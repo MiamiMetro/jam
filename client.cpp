@@ -3358,6 +3358,31 @@ public:
                                "explicit depth clamps to protocol max");
     }
 
+    static bool run_opus_encode_buffer_smoke(std::string& failure) {
+        OpusEncoderWrapper encoder;
+        if (!encoder.create(opus_network_clock::SAMPLE_RATE, 1,
+                            OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+                            AudioStream::AudioConfig::DEFAULT_BITRATE,
+                            AudioStream::AudioConfig::DEFAULT_COMPLEXITY)) {
+            failure = "failed to create Opus encoder";
+            return false;
+        }
+
+        std::array<float, opus_network_clock::LOW_LATENCY_FRAME_COUNT> input{};
+        std::array<unsigned char, AUDIO_BUF_SIZE> output{};
+        uint16_t encoded_bytes = 0;
+        if (!encoder.encode(input.data(), static_cast<int>(input.size()),
+                            output.data(), output.size(), encoded_bytes)) {
+            failure = "caller-owned encode failed";
+            return false;
+        }
+        if (encoded_bytes == 0 || encoded_bytes > output.size()) {
+            failure = "caller-owned encode returned invalid size";
+            return false;
+        }
+        return true;
+    }
+
     static bool run_audio_v3_receive_smoke(std::string& failure) {
         auto stamp_sender = [](const std::shared_ptr<std::vector<unsigned char>>& packet,
                                uint32_t sender_id) {
@@ -7057,6 +7082,7 @@ struct ClientStartupOptions {
     bool audio_path_feedback_smoke = false;
     bool opus_playout_policy_smoke = false;
     bool opus_redundancy_policy_smoke = false;
+    bool opus_encode_buffer_smoke = false;
     bool audio_v3_receive_smoke = false;
     bool e2e_latency_metric_smoke = false;
     int baseline_snapshot_seconds = 0;
@@ -7159,6 +7185,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.opus_playout_policy_smoke = true;
         } else if (arg == "--opus-redundancy-policy-smoke") {
             options.opus_redundancy_policy_smoke = true;
+        } else if (arg == "--opus-encode-buffer-smoke") {
+            options.opus_encode_buffer_smoke = true;
         } else if (arg == "--audio-v3-receive-smoke") {
             options.audio_v3_receive_smoke = true;
         } else if (arg == "--e2e-latency-metric-smoke") {
@@ -7709,6 +7737,17 @@ int main(int argc, char** argv) {
                 return 2;
             }
             Log::info("Opus redundancy policy smoke passed");
+            log.flush();
+            return 0;
+        }
+        if (startup_options.opus_encode_buffer_smoke) {
+            std::string failure;
+            if (!Client::run_opus_encode_buffer_smoke(failure)) {
+                Log::error("Opus encode buffer smoke failed: {}", failure);
+                log.flush();
+                return 2;
+            }
+            Log::info("Opus encode buffer smoke passed");
             log.flush();
             return 0;
         }

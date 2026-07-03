@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include <opus.h>
@@ -91,28 +92,41 @@ public:
         sample_rate_ = 0;
     }
 
-    bool encode(const float* input, int frame_size, std::vector<unsigned char>& output) {
+    bool encode(const float* input, int frame_size, unsigned char* output,
+                size_t output_capacity, uint16_t& encoded_bytes) {
+        encoded_bytes = 0;
         if (encoder_ == nullptr) {
             Log::error("Opus encoder not initialized.");
-            output.clear();
+            return false;
+        }
+        if (output == nullptr || output_capacity == 0 ||
+            output_capacity > static_cast<size_t>(std::numeric_limits<opus_int32>::max())) {
+            Log::error("Invalid Opus output buffer.");
             return false;
         }
         if (!is_legal_frame_size(sample_rate_, frame_size)) {
             Log::error("Illegal Opus frame size: {} samples at {} Hz", frame_size, sample_rate_);
-            output.clear();
             return false;
         }
 
+        const int result = opus_encode_float(
+            encoder_, input, frame_size, output,
+            static_cast<opus_int32>(output_capacity));
+        if (result < 0) {
+            Log::error("Opus encoding failed: {}", opus_strerror(result));
+            return false;
+        }
+        encoded_bytes = static_cast<uint16_t>(result);
+        return true;
+    }
+
+    bool encode(const float* input, int frame_size, std::vector<unsigned char>& output) {
         output.resize(ENCODE_BUFFER_SIZE);
-        int encoded_bytes = opus_encode_float(encoder_, input, frame_size, output.data(),
-                                              static_cast<opus_int32>(output.size()));
-
-        if (encoded_bytes < 0) {
-            Log::error("Opus encoding failed: {}", opus_strerror(encoded_bytes));
+        uint16_t encoded_bytes = 0;
+        if (!encode(input, frame_size, output.data(), output.size(), encoded_bytes)) {
             output.clear();
             return false;
         }
-
         output.resize(encoded_bytes);
         return true;
     }
