@@ -1779,7 +1779,7 @@ private:
         opus_tx_accumulated_frames_ = 0;
         opus_tx_accumulator_capture_time_ = {};
         opus_tx_accumulator_reset_requested_.store(true, std::memory_order_release);
-        recent_opus_audio_packet_count_ = 0;
+        request_recent_opus_audio_packets_reset();
 
         participant_manager_.for_each([](uint32_t, ParticipantData& participant) {
             participant.opus_queue.clear();
@@ -1883,7 +1883,7 @@ private:
         audio_path_interval_received_.store(0, std::memory_order_relaxed);
         audio_path_interval_sequence_gaps_.store(0, std::memory_order_relaxed);
         audio_path_interval_gaps_.store(0, std::memory_order_relaxed);
-        recent_opus_audio_packet_count_ = 0;
+        request_recent_opus_audio_packets_reset();
 
         receive_generation_.fetch_add(1, std::memory_order_acq_rel);
         outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
@@ -2205,6 +2205,20 @@ private:
         }
     }
 
+    void request_recent_opus_audio_packets_reset() {
+        recent_opus_audio_packets_reset_requested_.store(true, std::memory_order_release);
+        wake_pcm_sender_thread();
+    }
+
+    bool consume_recent_opus_audio_packets_reset_request_on_sender_thread() {
+        if (!recent_opus_audio_packets_reset_requested_.exchange(
+                false, std::memory_order_acq_rel)) {
+            return false;
+        }
+        recent_opus_audio_packet_count_ = 0;
+        return true;
+    }
+
     class ScopedSenderThreadPriority {
     public:
         ScopedSenderThreadPriority() {
@@ -2242,6 +2256,8 @@ private:
         std::array<unsigned char, AUDIO_BUF_SIZE> encoded_data{};
 
         while (pcm_sender_running_.load(std::memory_order_acquire)) {
+            consume_recent_opus_audio_packets_reset_request_on_sender_thread();
+
             PcmSendFrame frame;
             if (pcm_send_queue_.try_dequeue(frame)) {
                 if (!join_state_.can_send_audio()) {
@@ -2298,6 +2314,7 @@ private:
                         continue;
                     }
 
+                    consume_recent_opus_audio_packets_reset_request_on_sender_thread();
                     TxPacketBuffer* send_packet =
                         maybe_wrap_opus_packet_with_redundancy(*packet, *redundant_packet);
                     if (send_packet == nullptr) {
@@ -3548,33 +3565,89 @@ public:
             return true;
         };
 
-        return expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                            opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1,
-                            "auto low latency depth") &&
-               expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                            opus_network_clock::FAST_FRAME_COUNT, 2,
-                            "auto fast depth") &&
-               expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                            opus_network_clock::DEFAULT_FRAME_COUNT, 2,
-                            "auto default depth") &&
-               expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                            opus_network_clock::STABLE_FRAME_COUNT, 3,
-                            "auto stable depth") &&
-               expect_children(0, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 1,
-                               "off sends plain packet") &&
-               expect_children(1, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
-                               "explicit one previous") &&
-               expect_children(2, opus_network_clock::DEFAULT_FRAME_COUNT, 8, 3,
-                               "explicit two previous") &&
-               expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
-                               opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
-                               "auto low latency child count") &&
-               expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
-                               opus_network_clock::STABLE_FRAME_COUNT, 8, 4,
-                               "auto stable child count") &&
-               expect_children(99, opus_network_clock::DEFAULT_FRAME_COUNT, 20,
-                               MAX_AUDIO_REDUNDANT_PACKETS,
-                               "explicit depth clamps to protocol max");
+        const bool policy_ok =
+            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                         opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1,
+                         "auto low latency depth") &&
+            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                         opus_network_clock::FAST_FRAME_COUNT, 2,
+                         "auto fast depth") &&
+            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                         opus_network_clock::DEFAULT_FRAME_COUNT, 2,
+                         "auto default depth") &&
+            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
+                         opus_network_clock::STABLE_FRAME_COUNT, 3,
+                         "auto stable depth") &&
+            expect_children(0, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 1,
+                            "off sends plain packet") &&
+            expect_children(1, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
+                            "explicit one previous") &&
+            expect_children(2, opus_network_clock::DEFAULT_FRAME_COUNT, 8, 3,
+                            "explicit two previous") &&
+            expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
+                            opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
+                            "auto low latency child count") &&
+            expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
+                            opus_network_clock::STABLE_FRAME_COUNT, 8, 4,
+                            "auto stable child count") &&
+            expect_children(99, opus_network_clock::DEFAULT_FRAME_COUNT, 20,
+                            MAX_AUDIO_REDUNDANT_PACKETS,
+                            "explicit depth clamps to protocol max");
+        if (!policy_ok) {
+            return false;
+        }
+
+        asio::io_context io_context;
+        PerformerJoinOptions join_options{};
+        Client client(io_context, "127.0.0.1", 9, join_options);
+
+        TxPacketBuffer packet{};
+        const std::array<unsigned char, 3> payload{0x31, 0x32, 0x33};
+        if (!audio_packet::write_audio_packet_v2(
+                AudioCodec::Opus, 1, opus_network_clock::SAMPLE_RATE,
+                opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1, payload.data(),
+                static_cast<uint16_t>(payload.size()), packet.data(), packet.capacity(),
+                packet.size)) {
+            failure = "failed to build reset request seed packet";
+            client.stop_connection();
+            return false;
+        }
+
+        client.remember_recent_opus_audio_packet(packet);
+        if (client.recent_opus_audio_packet_count_ != 1) {
+            failure = "seed packet should populate recent Opus history";
+            client.stop_connection();
+            return false;
+        }
+
+        client.request_recent_opus_audio_packets_reset();
+        if (!client.recent_opus_audio_packets_reset_requested_.load(
+                std::memory_order_acquire)) {
+            failure = "reset request flag should be visible before sender consumption";
+            client.stop_connection();
+            return false;
+        }
+
+        if (!client.consume_recent_opus_audio_packets_reset_request_on_sender_thread()) {
+            failure = "sender-owned reset consumer should observe pending request";
+            client.stop_connection();
+            return false;
+        }
+        if (client.recent_opus_audio_packet_count_ != 0 ||
+            client.recent_opus_audio_packets_reset_requested_.load(
+                std::memory_order_acquire)) {
+            failure = "sender-owned reset consumer should clear history and request";
+            client.stop_connection();
+            return false;
+        }
+        if (client.consume_recent_opus_audio_packets_reset_request_on_sender_thread()) {
+            failure = "reset request should only be consumed once";
+            client.stop_connection();
+            return false;
+        }
+
+        client.stop_connection();
+        return true;
     }
 
     static bool run_opus_encode_buffer_smoke(std::string& failure) {
@@ -4560,7 +4633,7 @@ private:
                 OpusSendFrame discarded_opus;
                 while (opus_send_queue_.try_dequeue(discarded_opus)) {
                 }
-                recent_opus_audio_packet_count_ = 0;
+                request_recent_opus_audio_packets_reset();
                 Log::warn("Server requested JOIN refresh; resending JOIN");
                 send_join();
                 break;
@@ -5974,6 +6047,7 @@ private:
     std::chrono::steady_clock::time_point      opus_tx_accumulator_capture_time_{};
     std::array<TxPacketBuffer, RECENT_OPUS_PACKET_SLOTS> recent_opus_audio_packets_{};
     size_t                                     recent_opus_audio_packet_count_ = 0;
+    std::atomic<bool>                         recent_opus_audio_packets_reset_requested_{false};
     std::atomic<bool>                         opus_tx_accumulator_reset_requested_{false};
     std::atomic<bool>                         pcm_sender_running_{false};
     std::thread                               pcm_sender_thread_;
