@@ -333,9 +333,11 @@ private:
                 Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
                           remote_endpoint_.port());
                 auto leaving_client = client_manager_.remove_client_with_info(remote_endpoint_);
-                if (leaving_client.has_value() &&
-                    leaving_client->role == ClientRole::Performer) {
-                    broadcast_participant_leave(leaving_client->client_id);
+                if (leaving_client.has_value()) {
+                    release_token_nonce_for_client(*leaving_client);
+                    if (leaving_client->role == ClientRole::Performer) {
+                        broadcast_participant_leave(leaving_client->client_id);
+                    }
                 }
                 break;
             }
@@ -377,7 +379,8 @@ private:
         cleanup_used_token_nonces();
         const std::string nonce_key = session_crypto::nonce_replay_key(token.claims);
         auto it = used_token_nonces_.find(nonce_key);
-        if (it != used_token_nonces_.end() && it->second.endpoint != endpoint) {
+        if (it != used_token_nonces_.end() && it->second.endpoint != endpoint &&
+            client_manager_.exists(it->second.endpoint)) {
             return false;
         }
 
@@ -389,6 +392,13 @@ private:
             token.claims.role,
         };
         return true;
+    }
+
+    void release_token_nonce_for_client(const ClientInfo& client) {
+        if (!client.has_session_key || client.token_nonce_key.empty()) {
+            return;
+        }
+        used_token_nonces_.erase(client.token_nonce_key);
     }
 
     void handle_join(std::size_t bytes, std::chrono::steady_clock::time_point now) {
@@ -2023,6 +2033,41 @@ int run_security_smoke() {
             300ms);
         require_smoke(!replay_join_acked,
                       "token nonce replay from another endpoint must not join");
+
+        CtrlHdr leave{};
+        leave.magic = CTRL_MAGIC;
+        leave.type = CtrlHdr::Cmd::LEAVE;
+        std::vector<unsigned char> leave_packet(sizeof(leave));
+        std::memcpy(leave_packet.data(), &leave, sizeof(leave));
+        send_smoke_packet(tx, server_endpoint, leave_packet);
+        require_smoke(receive_smoke_maybe(
+                          rx,
+                          [](const std::vector<unsigned char>& packet) {
+                              if (packet.size() < sizeof(CtrlHdr) ||
+                                  packet_magic(packet) != CTRL_MAGIC) {
+                                  return false;
+                              }
+                              CtrlHdr ctrl{};
+                              std::memcpy(&ctrl, packet.data(), sizeof(ctrl));
+                              return ctrl.type == CtrlHdr::Cmd::PARTICIPANT_LEAVE;
+                          },
+                          1000ms),
+                      "active client leave should be broadcast before token rejoin");
+
+        send_smoke_packet(replay, server_endpoint, replay_join);
+        const bool rejoin_acked = receive_smoke_maybe(
+            replay,
+            [](const std::vector<unsigned char>& packet) {
+                if (packet.size() < sizeof(CtrlHdr) || packet_magic(packet) != CTRL_MAGIC) {
+                    return false;
+                }
+                CtrlHdr ctrl{};
+                std::memcpy(&ctrl, packet.data(), sizeof(ctrl));
+                return ctrl.type == CtrlHdr::Cmd::JOIN_ACK;
+            },
+            1000ms);
+        require_smoke(rejoin_acked,
+                      "same join token should rejoin after original endpoint leaves");
 
         server_io.stop();
         server_thread.join();
