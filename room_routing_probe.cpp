@@ -2,8 +2,10 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <asio.hpp>
 #include <asio/ip/udp.hpp>
@@ -11,6 +13,7 @@
 #include "audio_packet.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "session_crypto.h"
 #include "udp_port.h"
 
 using asio::ip::udp;
@@ -26,7 +29,7 @@ void write_fixed(Bytes<N>& target, const std::string& value) {
 std::string make_token(const std::string& secret, const std::string& server_id,
                        const std::string& room, const std::string& user, int64_t ttl_ms,
                        const std::string& room_override, const std::string& user_override,
-                       bool malformed_token) {
+                       bool malformed_token, const std::string& role = "performer") {
     if (malformed_token) {
         return "not-a-valid-token";
     }
@@ -38,7 +41,7 @@ std::string make_token(const std::string& secret, const std::string& server_id,
     claims.server_id     = server_id;
     claims.room_id       = room_override.empty() ? room : room_override;
     claims.profile_id    = user_override.empty() ? user : user_override;
-    claims.role          = "performer";
+    claims.role          = role;
     claims.nonce         = performer_join_token::random_nonce();
     return performer_join_token::create(claims, secret);
 }
@@ -91,6 +94,78 @@ bool receive_any_audio(udp::socket& socket, std::chrono::milliseconds timeout) {
     }
 
     return false;
+}
+
+bool receive_any_audio(udp::socket& socket, std::chrono::milliseconds timeout,
+                       const std::optional<session_crypto::SessionKey>& key) {
+    if (!key.has_value()) {
+        return receive_any_audio(socket, timeout);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::array<unsigned char, 2048> buffer{};
+    std::array<unsigned char, 2048> plaintext{};
+    udp::endpoint sender;
+
+    socket.non_blocking(true);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::error_code ec;
+        const size_t bytes = socket.receive_from(asio::buffer(buffer), sender, 0, ec);
+        if (!ec && bytes >= sizeof(MsgHdr)) {
+            MsgHdr hdr{};
+            std::memcpy(&hdr, buffer.data(), sizeof(hdr));
+            if (hdr.magic == SECURE_AUDIO_MAGIC) {
+                uint64_t nonce = 0;
+                size_t plaintext_bytes = 0;
+                if (session_crypto::open_audio_packet(
+                        *key, buffer.data(), bytes, nonce, plaintext.data(),
+                        plaintext.size(), plaintext_bytes) &&
+                    plaintext_bytes >= sizeof(MsgHdr)) {
+                    MsgHdr inner{};
+                    std::memcpy(&inner, plaintext.data(), sizeof(inner));
+                    if (inner.magic == AUDIO_MAGIC || inner.magic == AUDIO_V2_MAGIC ||
+                        inner.magic == AUDIO_V3_MAGIC ||
+                        inner.magic == AUDIO_REDUNDANT_MAGIC) {
+                        return true;
+                    }
+                }
+            } else if (hdr.magic == AUDIO_MAGIC || hdr.magic == AUDIO_V2_MAGIC ||
+                       hdr.magic == AUDIO_V3_MAGIC || hdr.magic == AUDIO_REDUNDANT_MAGIC) {
+                return true;
+            }
+            continue;
+        }
+        if (!ec) {
+            continue;
+        }
+        if (ec != asio::error::would_block && ec != asio::error::try_again) {
+            std::cerr << "receive error: " << ec.message() << "\n";
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+
+    return false;
+}
+
+void send_audio(udp::socket& socket, const udp::endpoint& server,
+                const std::vector<unsigned char>& packet,
+                const std::optional<session_crypto::SessionKey>& key,
+                uint64_t& nonce) {
+    if (!key.has_value()) {
+        socket.send_to(asio::buffer(packet.data(), packet.size()), server);
+        return;
+    }
+
+    std::vector<unsigned char> secure(
+        SECURE_PACKET_HEADER_BYTES + packet.size() + SECURE_PACKET_TAG_BYTES);
+    size_t secure_bytes = 0;
+    if (!session_crypto::seal_audio_packet(*key, nonce++, packet.data(), packet.size(),
+                                           secure.data(), secure.size(), secure_bytes)) {
+        return;
+    }
+    secure.resize(secure_bytes);
+    socket.send_to(asio::buffer(secure.data(), secure.size()), server);
 }
 
 void send_metronome_sync(udp::socket& socket, const udp::endpoint& server) {
@@ -213,15 +288,31 @@ int main(int argc, char** argv) {
     udp::socket room_a_rejoin_sender(io, udp::endpoint(udp::v4(), 0));
     udp::socket room_a_listener(io, udp::endpoint(udp::v4(), 0));
 
-    send_join(room_a_sender, server, "room-a", "user-a1",
-                     make_token(secret, server_id, "room-a", "user-a1", ttl_ms,
-                                token_room_override, token_user_override, malformed_token));
-    send_join(room_a_receiver, server, "room-a", "user-a2",
-                     make_token(secret, server_id, "room-a", "user-a2", ttl_ms,
-                                token_room_override, token_user_override, malformed_token));
-    send_join(room_b_receiver, server, "room-b", "user-b1",
-                     make_token(secret, server_id, "room-b", "user-b1", ttl_ms,
-                                token_room_override, token_user_override, malformed_token));
+    const std::string room_a_sender_token =
+        make_token(secret, server_id, "room-a", "user-a1", ttl_ms,
+                   token_room_override, token_user_override, malformed_token);
+    const std::string room_a_receiver_token =
+        make_token(secret, server_id, "room-a", "user-a2", ttl_ms,
+                   token_room_override, token_user_override, malformed_token);
+    const std::string room_b_receiver_token =
+        make_token(secret, server_id, "room-b", "user-b1", ttl_ms,
+                   token_room_override, token_user_override, malformed_token);
+    const std::string listener_token =
+        make_token(secret, server_id, "room-a", "listener-a", ttl_ms,
+                   token_room_override, token_user_override, malformed_token, "listener");
+    const auto room_a_sender_key =
+        session_crypto::derive_key_from_join_token_string(room_a_sender_token);
+    const auto room_a_receiver_key =
+        session_crypto::derive_key_from_join_token_string(room_a_receiver_token);
+    const auto room_b_receiver_key =
+        session_crypto::derive_key_from_join_token_string(room_b_receiver_token);
+    const auto listener_key =
+        session_crypto::derive_key_from_join_token_string(listener_token);
+    uint64_t room_a_sender_nonce = 1;
+
+    send_join(room_a_sender, server, "room-a", "user-a1", room_a_sender_token);
+    send_join(room_a_receiver, server, "room-a", "user-a2", room_a_receiver_token);
+    send_join(room_b_receiver, server, "room-b", "user-b1", room_b_receiver_token);
     JoinHdr listener_join{};
     listener_join.magic = CTRL_MAGIC;
     listener_join.type = CtrlHdr::Cmd::JOIN;
@@ -230,17 +321,21 @@ int main(int argc, char** argv) {
     write_fixed(listener_join.room_handle, "room-a");
     write_fixed(listener_join.profile_id, "listener-a");
     write_fixed(listener_join.display_name, "listener-a");
+    write_fixed(listener_join.join_token, listener_token);
     room_a_listener.send_to(asio::buffer(&listener_join, sizeof(listener_join)), server);
     std::this_thread::sleep_for(50ms);
 
     std::array<unsigned char, 240> samples{};
     auto packet = audio_packet::create_audio_packet_v2(AudioCodec::PcmInt16, 1, 48000, 120, 1,
                                                        samples.data(), samples.size());
-    room_a_sender.send_to(asio::buffer(packet->data(), packet->size()), server);
+    send_audio(room_a_sender, server, *packet, room_a_sender_key, room_a_sender_nonce);
 
-    const bool same_room_received      = receive_any_audio(room_a_receiver, 500ms);
-    const bool different_room_received = receive_any_audio(room_b_receiver, 250ms);
-    const bool listener_received       = receive_any_audio(room_a_listener, 500ms);
+    const bool same_room_received =
+        receive_any_audio(room_a_receiver, 500ms, room_a_receiver_key);
+    const bool different_room_received =
+        receive_any_audio(room_b_receiver, 250ms, room_b_receiver_key);
+    const bool listener_received =
+        receive_any_audio(room_a_listener, 500ms, listener_key);
     const bool listener_announced =
         receive_participant_info_for_profile(room_a_receiver, "listener-a", 250ms);
 
@@ -248,16 +343,23 @@ int main(int argc, char** argv) {
     const bool same_room_metronome_received = receive_metronome_sync(room_a_receiver, 500ms);
     const bool different_room_metronome_received = receive_metronome_sync(room_b_receiver, 250ms);
 
-    send_join(room_a_rejoin_sender, server, "room-a", "user-a1",
-                     make_token(secret, server_id, "room-a", "user-a1", ttl_ms,
-                                token_room_override, token_user_override, malformed_token));
+    const std::string room_a_rejoin_token =
+        make_token(secret, server_id, "room-a", "user-a1", ttl_ms,
+                   token_room_override, token_user_override, malformed_token);
+    const auto room_a_rejoin_key =
+        session_crypto::derive_key_from_join_token_string(room_a_rejoin_token);
+    uint64_t room_a_rejoin_nonce = 1;
+    send_join(room_a_rejoin_sender, server, "room-a", "user-a1", room_a_rejoin_token);
     std::this_thread::sleep_for(50ms);
 
-    room_a_sender.send_to(asio::buffer(packet->data(), packet->size()), server);
-    const bool stale_duplicate_forwarded = receive_any_audio(room_a_receiver, 250ms);
+    send_audio(room_a_sender, server, *packet, room_a_sender_key, room_a_sender_nonce);
+    const bool stale_duplicate_forwarded =
+        receive_any_audio(room_a_receiver, 250ms, room_a_receiver_key);
 
-    room_a_rejoin_sender.send_to(asio::buffer(packet->data(), packet->size()), server);
-    const bool rejoined_sender_forwarded = receive_any_audio(room_a_receiver, 500ms);
+    send_audio(room_a_rejoin_sender, server, *packet, room_a_rejoin_key,
+               room_a_rejoin_nonce);
+    const bool rejoined_sender_forwarded =
+        receive_any_audio(room_a_receiver, 500ms, room_a_receiver_key);
 
     send_leave(room_a_sender, server);
     send_leave(room_a_rejoin_sender, server);

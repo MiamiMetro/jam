@@ -64,6 +64,7 @@
 #include "periodic_timer.h"
 #include "protocol.h"
 #include "recording_writer.h"
+#include "session_crypto.h"
 #include "wav_file_playback.h"
 #include "udp_port.h"
 
@@ -334,6 +335,7 @@ public:
             outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
         }
         join_state_.reset();
+        reset_session_security();
         reset_server_clock_and_ping_state();
         receive_generation_.fetch_add(1, std::memory_order_acq_rel);
         receiving_enabled_.store(true, std::memory_order_release);
@@ -358,11 +360,40 @@ public:
         join.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinHdr));
         std::memcpy(buf->data(), &join, sizeof(JoinHdr));
+        update_session_key_from_join_token();
         join_state_.mark_join_sent(std::chrono::steady_clock::now());
         send(buf->data(), buf->size(), buf);
         Log::info("Sent JOIN for room '{}' user '{}' token {}", performer_join_options_.room_id,
                   performer_join_options_.user_id,
                   performer_join_options_.join_token.empty() ? "missing" : "present");
+    }
+
+    void reset_session_security() {
+        session_key_.reset();
+        server_audio_replay_window_.reset();
+        secure_audio_send_nonce_.store(1, std::memory_order_release);
+    }
+
+    void update_session_key_from_join_token() {
+        if (performer_join_options_.join_token.empty()) {
+            reset_session_security();
+            return;
+        }
+
+        const auto derived =
+            session_crypto::derive_key_from_join_token_string(
+                performer_join_options_.join_token);
+        if (!derived.has_value()) {
+            reset_session_security();
+            Log::warn("Join token is not usable for secure audio key derivation");
+            return;
+        }
+
+        if (!session_key_.has_value() || *session_key_ != *derived) {
+            server_audio_replay_window_.reset();
+            secure_audio_send_nonce_.store(1, std::memory_order_release);
+        }
+        session_key_ = *derived;
     }
 
     // Stop connection (stops sending/receiving UDP packets)
@@ -1613,6 +1644,9 @@ public:
             handle_ping_message(bytes, state->buffer.data());
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
             handle_ctrl_message(bytes, state->buffer.data());
+        } else if (hdr.magic == SECURE_AUDIO_MAGIC &&
+                   bytes >= SECURE_PACKET_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
+            handle_secure_audio_message(bytes, state->buffer.data());
         } else if (hdr.magic == AUDIO_REDUNDANT_MAGIC &&
                    bytes >= sizeof(AudioRedundantHdr)) {
             handle_audio_message(bytes, state->buffer.data());
@@ -1713,6 +1747,19 @@ public:
     }
 
 private:
+    bool should_secure_audio_packet(const unsigned char* data, std::size_t len) const {
+        if (!session_key_.has_value() ||
+            !join_state_.server_supports(AUDIO_CAP_SECURE_AUDIO) ||
+            data == nullptr || len < sizeof(MsgHdr)) {
+            return false;
+        }
+
+        MsgHdr hdr{};
+        std::memcpy(&hdr, data, sizeof(hdr));
+        return hdr.magic == AUDIO_V2_MAGIC || hdr.magic == AUDIO_V3_MAGIC ||
+               hdr.magic == AUDIO_REDUNDANT_MAGIC;
+    }
+
     void send_audio_packet_sync(const unsigned char* data, std::size_t len) {
         if (data == nullptr || !validate_outbound_audio_packet(
                                    const_cast<unsigned char*>(data), len)) {
@@ -1723,6 +1770,22 @@ private:
         }
 
         const auto outbound = current_outbound_endpoint_snapshot();
+        const unsigned char* send_data = data;
+        std::size_t send_len = len;
+        std::array<unsigned char, 2048> secure_packet{};
+        size_t secure_bytes = 0;
+        if (should_secure_audio_packet(data, len)) {
+            const uint64_t nonce =
+                secure_audio_send_nonce_.fetch_add(1, std::memory_order_acq_rel);
+            if (!session_crypto::seal_audio_packet(
+                    *session_key_, nonce, data, len, secure_packet.data(),
+                    secure_packet.size(), secure_bytes)) {
+                outbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            send_data = secure_packet.data();
+            send_len = secure_bytes;
+        }
 
         std::error_code error_code;
         {
@@ -1732,11 +1795,12 @@ private:
                     outbound_generation_.load(std::memory_order_acquire)) {
                 return;
             }
-            socket_.send_to(asio::buffer(data, len), outbound.endpoint, 0, error_code);
+            socket_.send_to(asio::buffer(send_data, send_len), outbound.endpoint, 0,
+                            error_code);
         }
 
         if (!error_code) {
-            total_bytes_tx_.fetch_add(len, std::memory_order_relaxed);
+            total_bytes_tx_.fetch_add(send_len, std::memory_order_relaxed);
             return;
         }
         if (error_code != asio::error::would_block &&
@@ -4860,6 +4924,39 @@ private:
         // Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
     }
 
+    void handle_secure_audio_message(std::size_t bytes, const char* recv_data) {
+        if (!session_key_.has_value()) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        std::array<unsigned char, 2048> plaintext{};
+        uint64_t nonce = 0;
+        size_t plaintext_bytes = 0;
+        if (!session_crypto::open_audio_packet(
+                *session_key_, reinterpret_cast<const unsigned char*>(recv_data), bytes,
+                nonce, plaintext.data(), plaintext.size(), plaintext_bytes)) {
+            const uint64_t count =
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count % 100 == 0) {
+                Log::warn("Dropping secure audio with invalid auth tag (drops={})", count);
+            }
+            return;
+        }
+
+        if (!server_audio_replay_window_.accept(nonce)) {
+            const uint64_t count =
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count % 100 == 0) {
+                Log::warn("Dropping replayed secure audio nonce={} drops={}", nonce, count);
+            }
+            return;
+        }
+
+        handle_audio_message(plaintext_bytes,
+                             reinterpret_cast<const char*>(plaintext.data()));
+    }
+
     void handle_audio_message(std::size_t bytes, const char* recv_data,
                               bool count_duplicate_late = true) {
         MsgHdr msg_hdr{};
@@ -6019,6 +6116,9 @@ private:
     std::filesystem::path audio_preferences_path_;
     std::string           selected_audio_api_filter_ = "All";
     join_reliability::State join_state_{1s};
+    std::optional<session_crypto::SessionKey> session_key_;
+    session_crypto::ReplayWindow              server_audio_replay_window_;
+    std::atomic<uint64_t>                     secure_audio_send_nonce_{1};
 
     AudioStream              audio_;
     OpusEncoderWrapper       audio_encoder_;

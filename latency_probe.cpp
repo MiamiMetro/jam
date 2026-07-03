@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -27,6 +28,7 @@
 #include "participant_info.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "session_crypto.h"
 #include "udp_port.h"
 
 #ifdef _WIN32
@@ -171,6 +173,9 @@ public:
         : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
           room_(room), user_(user), join_token_(join_token) {
         configure_probe_socket(socket_);
+        if (!join_token_.empty()) {
+            session_key_ = session_crypto::derive_key_from_join_token_string(join_token_);
+        }
     }
 
     void start() {
@@ -284,6 +289,10 @@ private:
 
         MsgHdr hdr{};
         std::memcpy(&hdr, recv_buf_.data(), sizeof(hdr));
+        if (hdr.magic == SECURE_AUDIO_MAGIC) {
+            handle_secure_receive(bytes);
+            return;
+        }
         if (hdr.magic == AUDIO_REDUNDANT_MAGIC) {
             raw_audio_count_.fetch_add(1, std::memory_order_relaxed);
             redundant_audio_count_.fetch_add(1, std::memory_order_relaxed);
@@ -413,12 +422,38 @@ private:
         }
     }
 
+    void handle_secure_receive(std::size_t bytes) {
+        if (!session_key_.has_value()) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        std::array<unsigned char, PROBE_RECV_BUF_SIZE> plaintext{};
+        uint64_t nonce = 0;
+        size_t plaintext_bytes = 0;
+        if (!session_crypto::open_audio_packet(
+                *session_key_, reinterpret_cast<const unsigned char*>(recv_buf_.data()),
+                bytes, nonce, plaintext.data(), plaintext.size(), plaintext_bytes)) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!server_replay_window_.accept(nonce)) {
+            invalid_audio_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        std::memcpy(recv_buf_.data(), plaintext.data(), plaintext_bytes);
+        handle_receive(plaintext_bytes);
+    }
+
     udp::socket socket_;
     udp::endpoint server_endpoint_;
     udp::endpoint remote_endpoint_;
     std::string room_;
     std::string user_;
     std::string join_token_;
+    std::optional<session_crypto::SessionKey> session_key_;
+    session_crypto::ReplayWindow server_replay_window_;
     std::array<char, PROBE_RECV_BUF_SIZE> recv_buf_{};
     ParticipantOpusPacketQueue queue_;
     SequenceArrivalTracker sequence_tracker_;
@@ -442,6 +477,9 @@ public:
         : socket_(io_context, udp::endpoint(udp::v4(), 0)), server_endpoint_(server_endpoint),
           room_(room), user_(user), join_token_(join_token) {
         configure_probe_socket(socket_);
+        if (!join_token_.empty()) {
+            session_key_ = session_crypto::derive_key_from_join_token_string(join_token_);
+        }
     }
 
     void send_join() {
@@ -484,8 +522,23 @@ public:
         remember_recent_audio_packet(packet);
 
         std::error_code ec;
-        socket_.send_to(asio::buffer(wire_packet->data(), wire_packet->size()), server_endpoint_,
-                        0, ec);
+        if (session_key_.has_value()) {
+            std::vector<unsigned char> secure_packet(
+                SECURE_PACKET_HEADER_BYTES + wire_packet->size() + SECURE_PACKET_TAG_BYTES);
+            size_t secure_bytes = 0;
+            if (!session_crypto::seal_audio_packet(
+                    *session_key_, secure_audio_nonce_++, wire_packet->data(),
+                    wire_packet->size(), secure_packet.data(), secure_packet.size(),
+                    secure_bytes)) {
+                return false;
+            }
+            secure_packet.resize(secure_bytes);
+            socket_.send_to(asio::buffer(secure_packet.data(), secure_packet.size()),
+                            server_endpoint_, 0, ec);
+        } else {
+            socket_.send_to(asio::buffer(wire_packet->data(), wire_packet->size()),
+                            server_endpoint_, 0, ec);
+        }
         return !ec;
     }
 
@@ -526,6 +579,8 @@ private:
     std::string room_;
     std::string user_;
     std::string join_token_;
+    std::optional<session_crypto::SessionKey> session_key_;
+    uint64_t secure_audio_nonce_ = 1;
     std::vector<std::shared_ptr<std::vector<unsigned char>>> recent_audio_packets_;
 };
 
