@@ -18,6 +18,8 @@ public:
     std::vector<AudioApiInfo> get_apis();
     std::vector<AudioDeviceInfo> get_input_devices();
     std::vector<AudioDeviceInfo> get_output_devices();
+    std::vector<AudioDeviceInfo> get_input_device_stubs();
+    std::vector<AudioDeviceInfo> get_output_device_stubs();
     std::vector<AudioDeviceInfo> get_all_devices();
     AudioDeviceId get_default_input_device();
     AudioDeviceId get_default_output_device();

@@ -33,6 +33,8 @@ public:
     static bool is_device_valid(DeviceIndex device_index);
     static std::vector<DeviceInfo> get_input_devices();
     static std::vector<DeviceInfo> get_output_devices();
+    static std::vector<DeviceInfo> get_input_device_stubs();
+    static std::vector<DeviceInfo> get_output_device_stubs();
     static std::vector<ApiInfo> get_apis();
     static DeviceIndex get_default_input_device();
     static DeviceIndex get_default_output_device();

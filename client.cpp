@@ -322,7 +322,6 @@ public:
             set_output_device(selected_output_device_);
         }
 
-        AudioStream::print_all_devices();
         // Connect to server (audio stream will be started manually via UI)
         start_connection(server_address, server_port);
     }
@@ -2061,8 +2060,8 @@ private:
     }
 
     void apply_audio_device_preferences(const AudioDevicePreferences& preferences) {
-        const auto input_devices = AudioStream::get_input_devices();
-        const auto output_devices = AudioStream::get_output_devices();
+        const auto input_devices = AudioStream::get_input_device_stubs();
+        const auto output_devices = AudioStream::get_output_device_stubs();
 
         const auto preferred_input =
             find_preferred_audio_device(input_devices, preferences.input_device,
@@ -7285,7 +7284,6 @@ static void draw_bottom_bar(Client& client) {
     static std::vector<AudioStream::DeviceInfo> output_devices;
     static std::vector<AudioStream::ApiInfo>    available_apis;
     static int                                  selected_api        = -1;
-    static int                                  refresh_counter     = 0;
     static AudioStream::DeviceIndex             pending_input       = AudioStream::NO_DEVICE;
     static int                                  pending_input_channel = 0;
     static AudioStream::DeviceIndex             pending_output      = AudioStream::NO_DEVICE;
@@ -7293,10 +7291,14 @@ static void draw_bottom_bar(Client& client) {
     static int                                  pending_opus_frames_per_packet = 0;
     static bool                                 devices_initialized = false;
 
-    if (refresh_counter++ % 60 == 0 || !devices_initialized) {
-        input_devices  = AudioStream::get_input_devices();
-        output_devices = AudioStream::get_output_devices();
+    auto refresh_device_lists = [&]() {
+        input_devices  = AudioStream::get_input_device_stubs();
+        output_devices = AudioStream::get_output_device_stubs();
         available_apis = AudioStream::get_apis();
+    };
+
+    if (!devices_initialized) {
+        refresh_device_lists();
     }
 
     auto selected_api_name = [&]() -> std::string {
@@ -7324,6 +7326,10 @@ static void draw_bottom_bar(Client& client) {
     };
 
     auto max_input_channels_for = [&](AudioStream::DeviceIndex device_index) {
+        const auto active_device_info = client.get_device_info();
+        if (device_index == client.get_selected_input_device()) {
+            return std::max(active_device_info.input_channels, 1);
+        }
         for (const auto& dev: input_devices) {
             if (dev.index == device_index) {
                 return std::max(dev.max_input_channels, 1);
@@ -7439,9 +7445,19 @@ static void draw_bottom_bar(Client& client) {
                           dev.api_name.c_str(), dev.index);
             if (ImGui::Selectable(dev_label, dev.index == pending_input)) {
                 pending_input = dev.index;
+                if (const auto* info = AudioStream::get_device_info(dev.index)) {
+                    for (auto& cached: input_devices) {
+                        if (cached.index == dev.index) {
+                            cached.max_input_channels = info->max_input_channels;
+                            cached.sample_rates = info->sample_rates;
+                            cached.default_sample_rate = info->default_sample_rate;
+                            break;
+                        }
+                    }
+                }
                 pending_input_channel =
                     std::clamp(pending_input_channel, 0,
-                               std::max(dev.max_input_channels, 1) - 1);
+                               max_input_channels_for(pending_input) - 1);
             }
         }
         ImGui::EndCombo();
@@ -7659,6 +7675,14 @@ static void draw_bottom_bar(Client& client) {
     JamGui::ShowTooltipOnHover(
         "Manual audio path reset: restarts the local stream and clears local audio queues. "
         "It keeps the current UDP session joined.");
+
+    ImGui::SameLine();
+    if (ImGui::Button("REFRESH")) {
+        refresh_device_lists();
+        pending_input_channel =
+            std::clamp(pending_input_channel, 0, max_input_channels_for(pending_input) - 1);
+    }
+    JamGui::ShowTooltipOnHover("Refresh the audio device list");
 
     // Show error message if any
     const std::string& last_error = AudioStream::get_last_error();

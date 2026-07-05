@@ -123,6 +123,14 @@ std::vector<AudioDeviceInfo> JuceAudioBackend::get_output_devices() {
     return scan_devices(false);
 }
 
+std::vector<AudioDeviceInfo> JuceAudioBackend::get_input_device_stubs() {
+    return scan_device_stubs(true);
+}
+
+std::vector<AudioDeviceInfo> JuceAudioBackend::get_output_device_stubs() {
+    return scan_device_stubs(false);
+}
+
 std::vector<AudioDeviceInfo> JuceAudioBackend::get_all_devices() {
     auto devices = get_input_devices();
     auto outputs = get_output_devices();
@@ -132,15 +140,11 @@ std::vector<AudioDeviceInfo> JuceAudioBackend::get_all_devices() {
 
 AudioDeviceId JuceAudioBackend::get_default_input_device() {
     auto devices = scan_device_stubs(true);
-    auto outputs = scan_device_stubs(false);
-    devices.insert(devices.end(), outputs.begin(), outputs.end());
     return audio_backend::choose_default_input_device(devices);
 }
 
 AudioDeviceId JuceAudioBackend::get_default_output_device() {
-    auto devices = scan_device_stubs(true);
-    auto outputs = scan_device_stubs(false);
-    devices.insert(devices.end(), outputs.begin(), outputs.end());
+    auto devices = scan_device_stubs(false);
     return audio_backend::choose_default_output_device(devices);
 }
 

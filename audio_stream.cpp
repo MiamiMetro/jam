@@ -52,20 +52,16 @@ void AudioStream::print_all_devices() {
 }
 
 const AudioStream::DeviceInfo* AudioStream::get_device_info(DeviceIndex device_index) {
-    static thread_local std::vector<DeviceInfo> cached_devices;
-    cached_devices = to_stream_device_infos(shared_backend().get_all_devices());
-
-    auto it = std::find_if(cached_devices.begin(), cached_devices.end(),
-                           [&](const DeviceInfo& device) {
-                               return device.index == device_index;
-                           });
-    if (it == cached_devices.end()) {
+    static thread_local DeviceInfo cached_device;
+    AudioDeviceInfo backend_device;
+    if (!shared_backend().get_device_info(device_index, backend_device)) {
         shared_backend().set_last_error("Invalid device index");
         spdlog::error("Invalid device index: {}", device_index);
         return nullptr;
     }
 
-    return &(*it);
+    cached_device = to_stream_device_info(backend_device);
+    return &cached_device;
 }
 
 bool AudioStream::is_device_valid(DeviceIndex device_index) {
@@ -78,6 +74,14 @@ std::vector<AudioStream::DeviceInfo> AudioStream::get_input_devices() {
 
 std::vector<AudioStream::DeviceInfo> AudioStream::get_output_devices() {
     return to_stream_device_infos(shared_backend().get_output_devices());
+}
+
+std::vector<AudioStream::DeviceInfo> AudioStream::get_input_device_stubs() {
+    return to_stream_device_infos(shared_backend().get_input_device_stubs());
+}
+
+std::vector<AudioStream::DeviceInfo> AudioStream::get_output_device_stubs() {
+    return to_stream_device_infos(shared_backend().get_output_device_stubs());
 }
 
 std::vector<AudioStream::ApiInfo> AudioStream::get_apis() {
